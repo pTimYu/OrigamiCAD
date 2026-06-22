@@ -91,7 +91,82 @@ class TwoDDrawer:
         allowed = {"valley", "mountain", "side", "rigid", "construction"}
         if kind not in allowed:
             raise ValueError(f"Invalid line kind '{kind}'. Allowed: {allowed}")
-        
+
+    @staticmethod
+    def _is_crease_kind(kind: LineKind) -> bool:
+        return kind in {"valley", "mountain"}
+
+    @staticmethod
+    def _canonical_line_key(start: str, end: str) -> Tuple[str, str]:
+        """
+        Return a direction-independent key for a line.
+
+        Example:
+            ("p0", "p1") and ("p1", "p0") both become ("p0", "p1").
+        """
+        return tuple(sorted((start, end)))
+
+    @staticmethod
+    def _canonical_surface_key(vertices: List[str]) -> Tuple[str, ...]:
+        """
+        Return an order-independent key for a surface.
+
+        Example:
+            ["p0", "p1", "p2"] and ["p2", "p0", "p1"]
+            are treated as the same surface.
+        """
+        return tuple(sorted(vertices))
+
+    def _resolve_overlapped_line_kind(
+        self,
+        existing_kind: LineKind,
+        new_kind: LineKind,
+    ) -> LineKind:
+        """
+        Decide the final line kind when a new line overlaps an existing line.
+
+        Rules:
+            1. Same kind -> keep it.
+            2. Existing construction -> replace by new kind.
+            3. New construction -> keep existing kind.
+            4. Valley vs mountain conflict -> raise error.
+            5. Crease beats non-crease.
+            6. Non-crease vs non-crease -> keep existing kind.
+        """
+        if existing_kind == new_kind:
+            return existing_kind
+
+        # Construction has the lowest priority.
+        if existing_kind == "construction":
+            return new_kind
+
+        if new_kind == "construction":
+            return existing_kind
+
+        existing_is_crease = self._is_crease_kind(existing_kind)
+        new_is_crease = self._is_crease_kind(new_kind)
+
+        # Valley/mountain conflict.
+        if existing_is_crease and new_is_crease and existing_kind != new_kind:
+            raise ValueError(
+                f"Conflicting crease assignment: existing line is "
+                f"'{existing_kind}', but new line is '{new_kind}'."
+            )
+
+        # Crease type has higher priority than side/rigid/construction.
+        if existing_is_crease and not new_is_crease:
+            return existing_kind
+
+        if new_is_crease and not existing_is_crease:
+            return new_kind
+
+        # Example: side vs rigid. Neither is a crease, so keep existing.
+        return existing_kind
+
+    # ------------------------------------------------------------
+    # Find existing objects
+    # ------------------------------------------------------------
+
     def find_point_by_coordinate(
         self,
         x: float,
@@ -117,6 +192,45 @@ class TwoDDrawer:
 
             if distance <= tol:
                 return pid
+
+        return None
+
+    def find_line_by_points(self, start: str, end: str) -> Optional[str]:
+        """
+        Find an existing line with the same two endpoints.
+
+        The direction does not matter:
+            start-end is considered the same as end-start.
+
+        Returns:
+            Existing line ID if found; otherwise None.
+        """
+        target_key = self._canonical_line_key(start, end)
+
+        for lid, line in self.lines.items():
+            line_key = self._canonical_line_key(line.start, line.end)
+
+            if line_key == target_key:
+                return lid
+
+        return None
+
+    def find_surface_by_vertices(self, vertices: List[str]) -> Optional[str]:
+        """
+        Find an existing surface with the same vertex set.
+
+        The vertex order does not matter.
+
+        Returns:
+            Existing surface ID if found; otherwise None.
+        """
+        target_key = self._canonical_surface_key(vertices)
+
+        for sid, surface in self.surfaces.items():
+            surface_key = self._canonical_surface_key(surface.vertices)
+
+            if surface_key == target_key:
+                return sid
 
         return None
 
@@ -178,6 +292,9 @@ class TwoDDrawer:
         """
         Add one line segment.
 
+        If the same geometric line already exists, the line is merged instead
+        of creating a duplicate.
+
         Args:
             start: start point ID.
             end: end point ID.
@@ -199,6 +316,18 @@ class TwoDDrawer:
         if start == end:
             raise ValueError("A line cannot start and end at the same point.")
 
+        existing_line_id = self.find_line_by_points(start, end)
+
+        if existing_line_id is not None:
+            existing_line = self.lines[existing_line_id]
+            resolved_kind = self._resolve_overlapped_line_kind(
+                existing_line.kind,
+                kind,
+            )
+
+            existing_line.kind = resolved_kind
+            return existing_line_id
+
         if line_id is None:
             line_id = self._new_line_id()
 
@@ -218,6 +347,9 @@ class TwoDDrawer:
         """
         Add one polygonal rigid panel.
 
+        If the same surface already exists, the surface is merged instead
+        of creating a duplicate.
+
         Args:
             vertices:
                 Ordered point IDs. Prefer counterclockwise order.
@@ -234,10 +366,23 @@ class TwoDDrawer:
         if len(vertices) < 3:
             raise ValueError("A surface requires at least 3 vertices.")
 
+        if len(set(vertices)) != len(vertices):
+            raise ValueError(
+                f"Surface vertices contain duplicates: {vertices}"
+            )
+
         for pid in vertices:
             self._check_point_exists(pid)
 
         self._check_line_kind(boundary_kind)
+
+        existing_surface_id = self.find_surface_by_vertices(vertices)
+
+        if existing_surface_id is not None:
+            if auto_boundary:
+                self._add_boundary_lines(vertices, boundary_kind)
+
+            return existing_surface_id
 
         if surface_id is None:
             surface_id = self._new_surface_id()
@@ -248,15 +393,28 @@ class TwoDDrawer:
         self.surfaces[surface_id] = Surface2D(surface_id, list(vertices))
 
         if auto_boundary:
-            n = len(vertices)
-            for i in range(n):
-                self.add_line(
-                    vertices[i],
-                    vertices[(i + 1) % n],
-                    kind=boundary_kind,
-                )
+            self._add_boundary_lines(vertices, boundary_kind)
 
         return surface_id
+
+    def _add_boundary_lines(
+        self,
+        vertices: List[str],
+        boundary_kind: LineKind = "side",
+    ) -> None:
+        """
+        Add boundary lines around a polygonal surface.
+
+        Existing overlapped lines are automatically merged by add_line().
+        """
+        n = len(vertices)
+
+        for i in range(n):
+            self.add_line(
+                vertices[i],
+                vertices[(i + 1) % n],
+                kind=boundary_kind,
+            )
 
     # ------------------------------------------------------------
     # Convenience geometry
@@ -399,6 +557,7 @@ class TwoDDrawer:
         return {
             "metadata": {
                 "unit": self.unit,
+                "point_tol": self.point_tol,
             },
             "points": {
                 pid: [p.x, p.y]
@@ -457,7 +616,7 @@ class TwoDDrawer:
 
             # Every surface is a rigid physical panel
             ax.fill(xs, ys, alpha=0.15)
-            ax.plot(xs_closed, ys_closed, linewidth=1.0)
+            ax.plot(xs_closed, ys_closed, color="black", linewidth=0.8)
 
             if show_surface_ids:
                 cx = sum(xs) / len(xs)
@@ -480,7 +639,7 @@ class TwoDDrawer:
         # Draw points
         if show_points:
             for point in self.points.values():
-                ax.scatter(point.x, point.y, s=20)
+                ax.scatter(point.x, point.y, s=20, color="black")
 
                 if show_point_ids:
                     ax.text(
