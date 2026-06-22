@@ -138,3 +138,7 @@ conda-meta/
 
 # Local project files
 *.local
+
+
+######## Meta-data File ########
+*.json
