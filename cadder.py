@@ -6,16 +6,21 @@ import numpy as np
 from scipy.optimize import least_squares
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from itertools import combinations
 
 ConstraintKind = Literal[
     "bar_length",
     "fixed_coordinate",
     "fixed_point",
     "parallel_lines",
+    "parallel_surfaces",
     "dihedral_angle",
+    "dihedral_cos",
+    "dihedral_signed_increment",
     "coplanar_points",
+    "horizontal_surface",
+    "surface_z_value",
 ]
-
 
 @dataclass
 class Point3D:
@@ -62,6 +67,8 @@ class Cadder:
         self.surfaces: dict = {}
         self.constraints: Dict[str, Constraint] = {}
 
+        self.hex_units = []
+
         self._constraint_count = 0
 
     # ------------------------------------------------------------
@@ -82,6 +89,8 @@ class Cadder:
 
         model.lines = drawer.to_dict()["lines"]
         model.surfaces = drawer.to_dict()["surfaces"]
+
+        model.hex_units = getattr(drawer, "hex_units", [])
 
         return model
 
@@ -387,7 +396,7 @@ class Cadder:
         )
 
         return constraint_id
-    
+
     def add_fixed_coordinate_constraint(
         self,
         point_id: str,
@@ -736,7 +745,417 @@ class Cadder:
                     p4,
                     constraint_id=f"coplanar_{surface_id}_{p4}",
                 )
-                
+
+    def add_fixed_surface_constraint(self, surface_id: str) -> List[str]:
+        """
+        Fix one surface as the reference panel.
+
+        This removes global rigid-body motion by fixing three non-collinear
+        points on the surface:
+
+            p0: x, y, z fixed
+            p1: y, z fixed
+            p2: z fixed
+
+        Total scalar constraints:
+            6
+        """
+        p0, p1, p2 = self._non_collinear_triplet_from_surface(surface_id)
+
+        cids = []
+
+        cids.append(self.add_fixed_coordinate_constraint(p0, "x"))
+        cids.append(self.add_fixed_coordinate_constraint(p0, "y"))
+        cids.append(self.add_fixed_coordinate_constraint(p0, "z"))
+
+        cids.append(self.add_fixed_coordinate_constraint(p1, "y"))
+        cids.append(self.add_fixed_coordinate_constraint(p1, "z"))
+
+        cids.append(self.add_fixed_coordinate_constraint(p2, "z"))
+
+        return cids
+
+    def add_parallel_surface_constraint(
+        self,
+        surface1_id: str,
+        surface2_id: str,
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Constrain two surfaces to be parallel.
+
+        Residual:
+            cross(n1, n2) = 0
+
+        This gives 3 residual components, but rank is usually 2.
+        """
+        self.surface_normal(surface1_id)
+        self.surface_normal(surface2_id)
+
+        if constraint_id is None:
+            constraint_id = f"parallel_surface_{surface1_id}_{surface2_id}"
+
+        if constraint_id in self.constraints:
+            raise ValueError(f"Constraint '{constraint_id}' already exists.")
+
+        self.constraints[constraint_id] = Constraint(
+            id=constraint_id,
+            kind="parallel_surfaces",
+            data={
+                "surface1": surface1_id,
+                "surface2": surface2_id,
+            },
+        )
+
+        return constraint_id
+
+    def add_parallel_triangle_surface_constraints(
+        self,
+        reference_surface_id: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Make all triangular surfaces parallel to one reference triangle surface.
+        """
+        triangle_ids = [
+            sid for sid in self.surfaces.keys()
+            if len(self._surface_vertices(sid)) == 3
+        ]
+
+        if len(triangle_ids) < 2:
+            return []
+
+        if reference_surface_id is None:
+            reference_surface_id = triangle_ids[0]
+
+        if reference_surface_id not in triangle_ids:
+            raise ValueError(
+                f"Reference surface '{reference_surface_id}' is not a triangle surface."
+            )
+
+        cids = []
+
+        for sid in triangle_ids:
+            if sid == reference_surface_id:
+                continue
+
+            cid = self.add_parallel_surface_constraint(
+                reference_surface_id,
+                sid,
+                constraint_id=f"parallel_triangles_{reference_surface_id}_{sid}",
+            )
+            cids.append(cid)
+
+        return cids
+
+    def add_mountain_valley_dihedral_constraints(
+        self,
+        target_dihedral: float = 110.0,
+        unit: Literal["rad", "deg"] = "deg",
+        valley_sign: int = +1,
+        only_triangle_quad: bool = True,
+    ) -> List[str]:
+        """
+        Add dihedral constraints to all mountain/valley crease lines.
+
+        Interpretation:
+            target_dihedral = unsigned obtuse dihedral angle between panels.
+
+        Example:
+            target_dihedral = 110 deg
+
+        Since flat state is treated as 180 deg, the folding increment is:
+
+            fold_amount = 180 deg - 110 deg = 70 deg
+
+        Valley and mountain creases receive opposite signed increments.
+
+        Args:
+            target_dihedral:
+                Desired obtuse dihedral angle.
+            unit:
+                'deg' or 'rad'.
+            valley_sign:
+                +1 means valley uses positive signed rotation.
+                -1 flips the convention.
+            only_triangle_quad:
+                If True, only apply to crease edges shared by one triangle
+                and one quadrilateral surface.
+        """
+        theta = self._angle_to_rad(target_dihedral, unit=unit)
+
+        if not (0.0 < theta < np.pi):
+            raise ValueError("target_dihedral must be between 0 and 180 degrees.")
+
+        fold_amount = np.pi - theta
+
+        if valley_sign not in {+1, -1}:
+            raise ValueError("valley_sign must be +1 or -1.")
+
+        cids = []
+
+        for line_id in self.lines.keys():
+            edge_start, edge_end, kind = self._line_info(line_id)
+
+            if kind not in {"valley", "mountain"}:
+                continue
+
+            if only_triangle_quad:
+                pairs = self.find_triangle_quad_pairs_adjacent_to_edge(
+                    edge_start,
+                    edge_end,
+                )
+            else:
+                adjacent = self.find_surfaces_adjacent_to_edge(
+                    edge_start,
+                    edge_end,
+                )
+
+                if len(adjacent) != 2:
+                    continue
+
+                pairs = [(adjacent[0], adjacent[1])]
+
+            if len(pairs) == 0:
+                continue
+
+            crease_sign = valley_sign if kind == "valley" else -valley_sign
+
+            for pair_index, (tri_id, quad_id) in enumerate(pairs):
+                tri_vertices = self._surface_vertices(tri_id)
+                quad_vertices = self._surface_vertices(quad_id)
+
+                triangle_point = self._first_non_edge_vertex(
+                    tri_vertices,
+                    edge_start,
+                    edge_end,
+                )
+
+                quad_point = self._first_non_edge_vertex(
+                    quad_vertices,
+                    edge_start,
+                    edge_end,
+                )
+
+                current_angle = self.signed_dihedral_angle(
+                    edge_start=edge_start,
+                    edge_end=edge_end,
+                    point_left=triangle_point,
+                    point_right=quad_point,
+                    unit="rad",
+                )
+
+                target_angle = current_angle + crease_sign * fold_amount
+                target_angle = self._wrap_to_pi(target_angle)
+
+                cid = self.add_dihedral_angle_constraint(
+                    edge_start=edge_start,
+                    edge_end=edge_end,
+                    point_left=triangle_point,
+                    point_right=quad_point,
+                    target_angle=target_angle,
+                    unit="rad",
+                    constraint_id=(
+                        f"dihedral_{line_id}_{tri_id}_{quad_id}_{pair_index}"
+                    ),
+                )
+
+                cids.append(cid)
+
+        return cids
+
+    def add_horizontal_surface_constraint(
+        self,
+        surface_id: str,
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Constrain a surface to be horizontal.
+
+        For vertices v0, v1, v2, ...
+        residuals are:
+
+            z1 - z0 = 0
+            z2 - z0 = 0
+            ...
+
+        This keeps the surface parallel to the xy-plane, but does not fix
+        its height.
+        """
+        vertices = self._surface_vertices(surface_id)
+
+        if len(vertices) < 3:
+            raise ValueError(f"Surface '{surface_id}' has fewer than 3 vertices.")
+
+        if constraint_id is None:
+            constraint_id = f"horizontal_{surface_id}"
+
+        if constraint_id in self.constraints:
+            return constraint_id
+
+        self.constraints[constraint_id] = Constraint(
+            id=constraint_id,
+            kind="horizontal_surface",
+            data={
+                "surface": surface_id,
+            },
+        )
+
+        return constraint_id
+
+    def add_surface_z_value_constraint(
+        self,
+        surface_id: str,
+        z_value: float = 0.0,
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Fix all vertices of a surface to a given z value.
+
+        This is stronger than horizontal_surface.
+
+        For your current interpretation:
+            valley triangle -> z = 0
+            mountain triangle -> horizontal only, z not fixed
+        """
+        vertices = self._surface_vertices(surface_id)
+
+        if len(vertices) < 3:
+            raise ValueError(f"Surface '{surface_id}' has fewer than 3 vertices.")
+
+        if constraint_id is None:
+            constraint_id = f"z_value_{surface_id}"
+
+        if constraint_id in self.constraints:
+            return constraint_id
+
+        self.constraints[constraint_id] = Constraint(
+            id=constraint_id,
+            kind="surface_z_value",
+            data={
+                "surface": surface_id,
+                "z_value": float(z_value),
+            },
+        )
+
+        return constraint_id
+
+    def add_dihedral_cos_constraint(
+        self,
+        edge_start: str,
+        edge_end: str,
+        point_left: str,
+        point_right: str,
+        target_angle: float,
+        unit: Literal["rad", "deg"] = "deg",
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Constrain the dihedral angle magnitude.
+
+        Residual:
+            cos(current_angle) - cos(target_angle) = 0
+
+        Example:
+            target_angle = 110 deg
+        """
+        for pid in [edge_start, edge_end, point_left, point_right]:
+            if pid not in self.points:
+                raise ValueError(f"Point '{pid}' does not exist.")
+
+        if unit == "deg":
+            target_angle_rad = float(np.deg2rad(target_angle))
+        elif unit == "rad":
+            target_angle_rad = float(target_angle)
+        else:
+            raise ValueError("unit must be 'deg' or 'rad'.")
+
+        if not (0.0 < target_angle_rad < np.pi):
+            raise ValueError("target_angle must be between 0 and 180 degrees.")
+
+        if constraint_id is None:
+            constraint_id = self._new_constraint_id()
+
+        if constraint_id in self.constraints:
+            return constraint_id
+
+        self.constraints[constraint_id] = Constraint(
+            id=constraint_id,
+            kind="dihedral_cos",
+            data={
+                "edge_start": edge_start,
+                "edge_end": edge_end,
+                "point_left": point_left,
+                "point_right": point_right,
+                "target_cos": float(np.cos(target_angle_rad)),
+            },
+        )
+
+        return constraint_id
+
+    def add_dihedral_signed_increment_constraint(
+        self,
+        edge_start: str,
+        edge_end: str,
+        point_left: str,
+        point_right: str,
+        target_increment: float,
+        unit: Literal["rad", "deg"] = "rad",
+        constraint_id: Optional[str] = None,
+        sign: int = +1,
+        crease_kind: Optional[str] = None,
+    ) -> str:
+        """
+        Add a signed dihedral increment constraint.
+
+        The constraint stores the current signed dihedral angle as the
+        reference flat/initial angle.
+
+        Residual:
+            wrap_to_pi((current_angle - initial_angle) - target_increment) = 0
+
+        This is better than cos(dihedral) because it can distinguish the
+        mountain/valley branch.
+        """
+        for pid in [edge_start, edge_end, point_left, point_right]:
+            if pid not in self.points:
+                raise ValueError(f"Point '{pid}' does not exist.")
+
+        if edge_start == edge_end:
+            raise ValueError("Dihedral edge cannot have zero length.")
+
+        target_increment_rad = self._angle_to_rad(target_increment, unit=unit)
+
+        initial_angle = self.signed_dihedral_angle(
+            edge_start=edge_start,
+            edge_end=edge_end,
+            point_left=point_left,
+            point_right=point_right,
+            unit="rad",
+        )
+
+        if constraint_id is None:
+            constraint_id = self._new_constraint_id()
+
+        if constraint_id in self.constraints:
+            return constraint_id
+
+        self.constraints[constraint_id] = Constraint(
+            id=constraint_id,
+            kind="dihedral_signed_increment",
+            data={
+                "edge_start": edge_start,
+                "edge_end": edge_end,
+                "point_left": point_left,
+                "point_right": point_right,
+                "initial_angle": float(initial_angle),
+                "target_increment": float(target_increment_rad),
+                "sign": int(sign),
+                "crease_kind": crease_kind,
+            },
+        )
+
+        return constraint_id
+
     # ------------------------------------------------------------
     # Automatic constraints from geometry
     # ------------------------------------------------------------
@@ -858,9 +1277,9 @@ class Cadder:
                     self._residual_fixed_coordinate(constraint.data)
                 )
 
-            elif constraint.kind == "parallel_lines":
+            elif constraint.kind == "parallel_surfaces":
                 residuals.extend(
-                    self._residual_parallel_lines(constraint.data)
+                    self._residual_parallel_surfaces(constraint.data)
                 )
 
             elif constraint.kind == "dihedral_angle":
@@ -868,14 +1287,39 @@ class Cadder:
                     self._residual_dihedral_angle(constraint.data)
                 )
 
+            elif constraint.kind == "fixed_point":
+                raise NotImplementedError(
+                    "fixed_point is implemented as three fixed_coordinate constraints."
+                )
+
+            elif constraint.kind == "parallel_lines":
+                residuals.extend(
+                    self._residual_parallel_lines(constraint.data)
+                )
+
             elif constraint.kind == "coplanar_points":
                 residuals.append(
                     self._residual_coplanar_points(constraint.data)
                 )
 
-            elif constraint.kind == "fixed_point":
-                raise NotImplementedError(
-                    "fixed_point is implemented as three fixed_coordinate constraints."
+            elif constraint.kind == "horizontal_surface":
+                residuals.extend(
+                    self._residual_horizontal_surface(constraint.data)
+                )
+
+            elif constraint.kind == "surface_z_value":
+                residuals.extend(
+                    self._residual_surface_z_value(constraint.data)
+                )
+
+            elif constraint.kind == "dihedral_cos":
+                residuals.append(
+                    self._residual_dihedral_cos(constraint.data)
+                )
+
+            elif constraint.kind == "dihedral_signed_increment":
+                residuals.append(
+                    self._residual_dihedral_signed_increment(constraint.data)
                 )
 
             else:
@@ -957,6 +1401,66 @@ class Cadder:
 
         return float(numerator / denominator)
 
+    def _residual_parallel_surfaces(self, data: dict) -> np.ndarray:
+        n1 = self.surface_normal(data["surface1"])
+        n2 = self.surface_normal(data["surface2"])
+
+        return np.cross(n1, n2)
+
+    def _residual_horizontal_surface(self, data: dict) -> np.ndarray:
+        surface_id = data["surface"]
+        vertices = self._surface_vertices(surface_id)
+
+        z0 = self.point_array(vertices[0])[2]
+
+        residuals = []
+
+        for pid in vertices[1:]:
+            zi = self.point_array(pid)[2]
+            residuals.append(zi - z0)
+
+        return np.array(residuals, dtype=float)
+
+    def _residual_surface_z_value(self, data: dict) -> np.ndarray:
+        surface_id = data["surface"]
+        z_value = data["z_value"]
+
+        vertices = self._surface_vertices(surface_id)
+
+        residuals = []
+
+        for pid in vertices:
+            zi = self.point_array(pid)[2]
+            residuals.append(zi - z_value)
+
+        return np.array(residuals, dtype=float)
+
+    def _residual_dihedral_cos(self, data: dict) -> float:
+        current_cos = self.dihedral_cos(
+            edge_start=data["edge_start"],
+            edge_end=data["edge_end"],
+            point_left=data["point_left"],
+            point_right=data["point_right"],
+        )
+
+        return float(current_cos - data["target_cos"])
+
+    def _residual_dihedral_signed_increment(self, data: dict) -> float:
+        current_angle = self.signed_dihedral_angle(
+            edge_start=data["edge_start"],
+            edge_end=data["edge_end"],
+            point_left=data["point_left"],
+            point_right=data["point_right"],
+            unit="rad",
+        )
+
+        initial_angle = data["initial_angle"]
+        target_increment = data["target_increment"]
+
+        actual_increment = self._wrap_to_pi(current_angle - initial_angle)
+
+        return self._wrap_to_pi(actual_increment - target_increment)
+
     # ------------------------------------------------------------
     # Jacobian and mobility
     # ------------------------------------------------------------
@@ -1028,6 +1532,7 @@ class Cadder:
         """
         Print basic constraint information.
         """
+        residuals = self.residual_vector()
         J = self.numerical_jacobian()
         rank = np.linalg.matrix_rank(J, tol=tol)
         mobility = self.num_variables() - rank
@@ -1036,7 +1541,8 @@ class Cadder:
         print("------------------")
         print(f"Points:              {self.num_points()}")
         print(f"Variables:           {self.num_variables()}")
-        print(f"Scalar constraints:  {len(self.constraints)}")
+        print(f"Constraint objects:  {len(self.constraints)}")
+        print(f"Scalar residuals:    {residuals.size}")
         print(f"Jacobian rank:       {rank}")
         print(f"Mobility:            {mobility}")
 
@@ -1114,8 +1620,10 @@ class Cadder:
         residual_norm = float(np.linalg.norm(residuals))
         max_abs_residual = float(np.max(np.abs(residuals))) if residuals.size else 0.0
 
-        J = self.numerical_jacobian(result.x)
-        rank = int(np.linalg.matrix_rank(J, tol=rank_tol))
+        # SciPy already computed this Jacobian while solving. Recomputing it
+        # coordinate-by-coordinate made every continuation step need hundreds
+        # of redundant residual evaluations.
+        rank = int(np.linalg.matrix_rank(result.jac, tol=rank_tol))
         mobility = self.num_variables() - rank
 
         if update_model:
@@ -1383,15 +1891,151 @@ class Cadder:
         except AttributeError:
             pass
 
+    def add_simple_hexagon_dihedral_constraints_from_metadata(
+        self,
+        target_dihedral: float = 110.0,
+        unit: Literal["rad", "deg"] = "deg",
+        valley_sign: int = +1,
+    ) -> dict:
+        """
+        Add signed dihedral increment constraints from explicit simple-hexagon
+        unit metadata.
+
+        This replaces the old cosine-based dihedral constraint.
+
+        target_dihedral:
+            The obtuse dihedral angle, e.g. 110 deg.
+
+        Since flat state is treated as 180 deg, the fold increment is:
+
+            fold_amount = 180 deg - target_dihedral
+
+        Valley and mountain creases get opposite signs.
+        """
+        if not self.hex_units:
+            raise ValueError(
+                "No hex-unit metadata found. Make sure simple_hexagon.py stores "
+                "pattern.hex_units before creating the Cadder model."
+            )
+
+        if valley_sign not in {+1, -1}:
+            raise ValueError("valley_sign must be +1 or -1.")
+
+        theta = self._angle_to_rad(target_dihedral, unit=unit)
+
+        if not (0.0 < theta < np.pi):
+            raise ValueError("target_dihedral must be between 0 and 180 degrees.")
+
+        fold_amount = np.pi - theta
+
+        added = []
+        skipped = []
+        duplicate = []
+
+        used_keys = set()
+
+        for unit_data in self.hex_units:
+            unit_count = unit_data.get("count", "unknown")
+
+            for crease_data in unit_data.get("local_creases", []):
+                edge_start, edge_end = crease_data["edge"]
+                tri_id = crease_data["triangle"]
+                quad_id = crease_data["quad"]
+                crease_kind = crease_data["kind"]
+                local_index = crease_data["local_index"]
+                side = crease_data["side"]
+
+                if tri_id not in self.surfaces:
+                    skipped.append((unit_count, local_index, side, "missing triangle", tri_id))
+                    continue
+
+                if quad_id not in self.surfaces:
+                    skipped.append((unit_count, local_index, side, "missing quad", quad_id))
+                    continue
+
+                if edge_start not in self.points or edge_end not in self.points:
+                    skipped.append((unit_count, local_index, side, "missing edge points"))
+                    continue
+
+                key = (
+                    tuple(sorted((edge_start, edge_end))),
+                    tri_id,
+                    quad_id,
+                )
+
+                if key in used_keys:
+                    duplicate.append((unit_count, local_index, side, tri_id, quad_id))
+                    continue
+
+                used_keys.add(key)
+
+                tri_vertices = self._surface_vertices(tri_id)
+                quad_vertices = self._surface_vertices(quad_id)
+
+                triangle_point = self._first_non_edge_vertex(
+                    tri_vertices,
+                    edge_start,
+                    edge_end,
+                )
+
+                quad_point = self._first_non_edge_vertex(
+                    quad_vertices,
+                    edge_start,
+                    edge_end,
+                )
+
+                # A signed angle changes sign when the crease direction is
+                # reversed.  The metadata stores both creases as mid -> side,
+                # which puts the triangle on opposite sides of those two
+                # directed edges.  Normalize the direction so the triangle is
+                # always on the right in the original flat XY pattern.
+                edge_start, edge_end = self._orient_flat_crease_triangle_right(
+                    edge_start,
+                    edge_end,
+                    triangle_point,
+                )
+
+                if crease_kind == "valley":
+                    sign = valley_sign
+                elif crease_kind == "mountain":
+                    sign = -valley_sign
+                else:
+                    skipped.append((unit_count, local_index, side, "not mountain/valley", crease_kind))
+                    continue
+
+                target_increment = sign * fold_amount
+
+                cid = self.add_dihedral_signed_increment_constraint(
+                    edge_start=edge_start,
+                    edge_end=edge_end,
+                    point_left=triangle_point,
+                    point_right=quad_point,
+                    target_increment=target_increment,
+                    unit="rad",
+                    sign=sign,
+                    crease_kind=crease_kind,
+                    constraint_id=(
+                        f"dihedral_signed_u{unit_count}_i{local_index}_{side}"
+                    ),
+                )
+
+                added.append(cid)
+
+        return {
+            "num_added": len(added),
+            "num_skipped": len(skipped),
+            "num_duplicate": len(duplicate),
+            "added": added,
+            "skipped": skipped,
+            "duplicate": duplicate,
+        }
+
     # ------------------------------------------------------------
     # Geometry helpers
     # ------------------------------------------------------------
 
     @staticmethod
     def _angle_to_rad(angle: float, unit: Literal["rad", "deg"] = "rad") -> float:
-        """
-        Convert angle to radians.
-        """
         if unit == "rad":
             return float(angle)
 
@@ -1401,15 +2045,15 @@ class Cadder:
         raise ValueError("unit must be 'rad' or 'deg'.")
 
     @staticmethod
-    def _rad_to_angle(angle_rad: float, unit: Literal["rad", "deg"] = "rad") -> float:
-        """
-        Convert radians to requested unit.
-        """
+    def _rad_to_angle(
+        angle: float,
+        unit: Literal["rad", "deg"] = "rad",
+    ) -> float:
         if unit == "rad":
-            return float(angle_rad)
+            return float(angle)
 
         if unit == "deg":
-            return float(np.rad2deg(angle_rad))
+            return float(np.rad2deg(angle))
 
         raise ValueError("unit must be 'rad' or 'deg'.")
 
@@ -1417,18 +2061,15 @@ class Cadder:
     def _wrap_to_pi(angle: float) -> float:
         """
         Wrap angle to (-pi, pi].
-
-        This prevents angle residuals from jumping by 2*pi.
         """
         return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
 
     @staticmethod
-    def _unit_vector(v: np.ndarray, name: str = "vector", eps: float = 1e-12) -> np.ndarray:
-        """
-        Return normalized vector.
-
-        Raises an error if the vector is too small.
-        """
+    def _unit_vector(
+        v: np.ndarray,
+        name: str = "vector",
+        eps: float = 1e-12,
+    ) -> np.ndarray:
         norm = float(np.linalg.norm(v))
 
         if norm < eps:
@@ -1436,12 +2077,113 @@ class Cadder:
 
         return v / norm
 
+    def _orient_flat_crease_triangle_right(
+        self,
+        edge_start: str,
+        edge_end: str,
+        triangle_point: str,
+        eps: float = 1e-12,
+    ) -> Tuple[str, str]:
+        """Orient a flat crease with the triangle on its right-hand side."""
+        a = self.point_array(edge_start)
+        b = self.point_array(edge_end)
+        c = self.point_array(triangle_point)
+        edge = b[:2] - a[:2]
+        toward_triangle = c[:2] - a[:2]
+        signed_area = float(
+            edge[0] * toward_triangle[1]
+            - edge[1] * toward_triangle[0]
+        )
+
+        if abs(signed_area) < eps:
+            raise ValueError(
+                f"Cannot orient crease {edge_start}-{edge_end}: the triangle "
+                "point is collinear in the flat XY pattern."
+            )
+
+        if signed_area > 0.0:
+            return edge_end, edge_start
+
+        return edge_start, edge_end
+
+    def _surface_vertices(self, surface_id: str) -> List[str]:
+        """
+        Return vertex IDs of a surface.
+
+        This supports both dictionary-style surfaces and dataclass-style surfaces.
+        """
+        if surface_id not in self.surfaces:
+            raise ValueError(f"Surface '{surface_id}' does not exist.")
+
+        surface = self.surfaces[surface_id]
+
+        if isinstance(surface, dict):
+            return list(surface["vertices"])
+
+        return list(surface.vertices)
+
+    def _line_info(self, line_id: str) -> Tuple[str, str, str]:
+        """
+        Return start, end, kind of a line.
+        """
+        if line_id not in self.lines:
+            raise ValueError(f"Line '{line_id}' does not exist.")
+
+        line = self.lines[line_id]
+
+        if isinstance(line, dict):
+            return line["start"], line["end"], line["kind"]
+
+        return line.start, line.end, line.kind
+
+    def _non_collinear_triplet_from_surface(
+        self,
+        surface_id: str,
+        eps: float = 1e-9,
+    ) -> Tuple[str, str, str]:
+        """
+        Pick three non-collinear points from a surface.
+        """
+        vertices = self._surface_vertices(surface_id)
+
+        if len(vertices) < 3:
+            raise ValueError(f"Surface '{surface_id}' has fewer than 3 vertices.")
+
+        for p1, p2, p3 in combinations(vertices, 3):
+            x1 = self.point_array(p1)
+            x2 = self.point_array(p2)
+            x3 = self.point_array(p3)
+
+            area_vector = np.cross(x2 - x1, x3 - x1)
+
+            if np.linalg.norm(area_vector) > eps:
+                return p1, p2, p3
+
+        raise ValueError(f"Surface '{surface_id}' is degenerate or collinear.")
+
+    def surface_normal(self, surface_id: str) -> np.ndarray:
+        """
+        Return unit normal vector of a surface.
+
+        The normal direction depends on vertex ordering, but parallel constraints
+        only use cross(n1, n2) = 0, so sign is not important there.
+        """
+        p1, p2, p3 = self._non_collinear_triplet_from_surface(surface_id)
+
+        x1 = self.point_array(p1)
+        x2 = self.point_array(p2)
+        x3 = self.point_array(p3)
+
+        normal = np.cross(x2 - x1, x3 - x1)
+
+        return self._unit_vector(normal, name=f"surface normal of {surface_id}")
+
     @staticmethod
     def _surface_has_edge(vertices: List[str], p1: str, p2: str) -> bool:
         """
-        Check whether a surface contains the edge p1-p2.
+        Check whether a surface contains edge p1-p2.
 
-        The edge is treated as direction-independent.
+        The edge is direction-independent.
         """
         n = len(vertices)
 
@@ -1457,7 +2199,7 @@ class Cadder:
     @staticmethod
     def _first_non_edge_vertex(vertices: List[str], p1: str, p2: str) -> str:
         """
-        Return the first vertex in a surface that is not one of the edge vertices.
+        Return one vertex in the surface that is not on the edge p1-p2.
         """
         for pid in vertices:
             if pid not in {p1, p2}:
@@ -1470,17 +2212,540 @@ class Cadder:
 
     def find_surfaces_adjacent_to_edge(self, p1: str, p2: str) -> List[str]:
         """
-        Find surfaces that contain the edge p1-p2.
-
-        Returns:
-            List of surface IDs.
+        Find all surfaces containing edge p1-p2.
         """
         adjacent = []
 
-        for surface_id, surface in self.surfaces.items():
-            vertices = surface["vertices"]
+        for surface_id in self.surfaces.keys():
+            vertices = self._surface_vertices(surface_id)
 
             if self._surface_has_edge(vertices, p1, p2):
                 adjacent.append(surface_id)
 
         return adjacent
+
+    def find_triangle_quad_pairs_adjacent_to_edge(
+        self,
+        p1: str,
+        p2: str,
+    ) -> List[Tuple[str, str]]:
+        """
+        Find triangle-parallelogram surface pairs adjacent to edge p1-p2.
+
+        Returns:
+            List of (triangle_surface_id, quad_surface_id).
+        """
+        adjacent = self.find_surfaces_adjacent_to_edge(p1, p2)
+
+        triangle_surfaces = [
+            sid for sid in adjacent
+            if len(self._surface_vertices(sid)) == 3
+        ]
+
+        quad_surfaces = [
+            sid for sid in adjacent
+            if len(self._surface_vertices(sid)) == 4
+        ]
+
+        pairs = []
+
+        for tri_id in triangle_surfaces:
+            for quad_id in quad_surfaces:
+                pairs.append((tri_id, quad_id))
+
+        return pairs
+
+    # ------------------------------------------------------------
+    # Case-specific Constraints
+    # ------------------------------------------------------------
+
+    def add_simple_hexagon_kinematic_constraints(
+        self,
+        target_dihedral: float = 110.0,
+        unit: Literal["rad", "deg"] = "deg",
+        fixed_triangle_surface_id: Optional[str] = None,
+        valley_z: float = 0.0,
+        strict_unique_edges: bool = False,
+    ) -> dict:
+        """
+        Add the corrected simple-hexagon constraint set.
+
+        Constraints:
+            1. every panel is rigid
+            2. first triangle panel is fixed
+            3. every triangle panel is horizontal
+            4. every valley triangle is fixed to z = valley_z
+            5. every unique triangle-quad crease has target dihedral magnitude
+
+        Notes:
+            Mountain triangles are not fixed to z = 0.
+            They are only constrained to remain horizontal.
+        """
+        # 1. Make every panel rigid.
+        self.add_panel_rigidity_constraints_from_surfaces()
+
+        # 2. Find triangle surfaces.
+        triangle_ids = [
+            sid for sid in self.surfaces.keys()
+            if len(self._surface_vertices(sid)) == 3
+        ]
+
+        if len(triangle_ids) == 0:
+            raise ValueError("No triangle surfaces found.")
+
+        valley_triangle_ids = [
+            sid for sid in triangle_ids
+            if self.triangle_crease_kind(sid) == "valley"
+        ]
+
+        if fixed_triangle_surface_id is None:
+            fixed_triangle_surface_id = (
+                valley_triangle_ids[0]
+                if valley_triangle_ids
+                else triangle_ids[0]
+            )
+
+        if fixed_triangle_surface_id not in triangle_ids:
+            raise ValueError(
+                f"Fixed surface '{fixed_triangle_surface_id}' is not a triangle."
+            )
+
+        fixed_kind = self.triangle_crease_kind(fixed_triangle_surface_id)
+        if valley_triangle_ids and fixed_kind != "valley":
+            raise ValueError(
+                f"Fixed surface '{fixed_triangle_surface_id}' is {fixed_kind}, "
+                "but valley panels are pinned to valley_z. Choose a valley "
+                f"triangle such as '{valley_triangle_ids[0]}' so the folded "
+                "branch is not forced back toward the flat state."
+            )
+
+        # 3. Fix one triangle to remove global rigid-body motion.
+        self.add_fixed_surface_constraint(fixed_triangle_surface_id)
+
+        # 4. Keep all triangle panels horizontal.
+        for tri_id in triangle_ids:
+            self.add_horizontal_surface_constraint(
+                tri_id,
+                constraint_id=f"horizontal_{tri_id}",
+            )
+
+        # 5. Valley triangles stay on the horizon.
+        for tri_id in triangle_ids:
+            kind = self.triangle_crease_kind(tri_id)
+
+            if kind == "valley":
+                self.add_surface_z_value_constraint(
+                    tri_id,
+                    z_value=valley_z,
+                    constraint_id=f"valley_z_{tri_id}",
+                )
+
+        # 6. Add dihedral constraints from explicit unit-chain metadata.
+        dihedral_info = self.add_simple_hexagon_dihedral_constraints_from_metadata(
+            target_dihedral=target_dihedral,
+            unit=unit,
+        )
+
+        dihedral_cids = dihedral_info["added"]
+        skipped_edges = dihedral_info["skipped"]
+
+        if strict_unique_edges and (
+            skipped_edges or dihedral_info["duplicate"]
+        ):
+            raise ValueError(
+                "Simple-hexagon crease metadata is not unique: "
+                f"{len(skipped_edges)} skipped and "
+                f"{dihedral_info['num_duplicate']} duplicate entries."
+            )
+
+        return {
+            "fixed_triangle": fixed_triangle_surface_id,
+            "num_dihedral_constraints": len(dihedral_cids),
+            "num_skipped_crease_edges": len(skipped_edges),
+            "num_duplicate_dihedral_constraints": dihedral_info["num_duplicate"],
+            "skipped_crease_edges": skipped_edges,
+            "duplicate_dihedral_constraints": dihedral_info["duplicate"],
+        }
+
+
+    # ------------------------------------------------------------
+    # Case-specific Helper
+    # ------------------------------------------------------------
+
+    # Simple-hexagon helper methods
+    def find_line_by_points(self, p1: str, p2: str) -> Optional[str]:
+        """
+        Find a line with endpoints p1 and p2.
+
+        Direction does not matter.
+        """
+        target = {p1, p2}
+
+        for line_id in self.lines.keys():
+            start, end, _ = self._line_info(line_id)
+
+            if {start, end} == target:
+                return line_id
+
+        return None
+
+    def triangle_crease_kind(self, surface_id: str) -> Optional[str]:
+        """
+        Classify a triangular surface by its incident crease type.
+
+        Expected for your simple hexagon:
+            each triangle has two crease edges;
+            both should be valley or both should be mountain.
+
+        Returns:
+            "valley", "mountain", or None.
+        """
+        vertices = self._surface_vertices(surface_id)
+
+        if len(vertices) != 3:
+            raise ValueError(f"Surface '{surface_id}' is not a triangle.")
+
+        crease_kinds = []
+
+        for i in range(3):
+            a = vertices[i]
+            b = vertices[(i + 1) % 3]
+
+            line_id = self.find_line_by_points(a, b)
+
+            if line_id is None:
+                continue
+
+            _, _, kind = self._line_info(line_id)
+
+            if kind in {"valley", "mountain"}:
+                crease_kinds.append(kind)
+
+        if len(crease_kinds) == 0:
+            return None
+
+        unique_kinds = set(crease_kinds)
+
+        if len(unique_kinds) == 1:
+            return crease_kinds[0]
+
+        raise ValueError(
+            f"Triangle surface '{surface_id}' has mixed crease kinds: "
+            f"{crease_kinds}."
+        )
+
+    def find_unique_triangle_quad_pair_adjacent_to_edge(
+        self,
+        p1: str,
+        p2: str,
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Find exactly one triangle and one quad adjacent to edge p1-p2.
+
+        Returns:
+            (triangle_surface_id, quad_surface_id)
+
+        If the edge is ambiguous because more than one triangle or more than
+        one quad is adjacent, return None.
+        """
+        adjacent = self.find_surfaces_adjacent_to_edge(p1, p2)
+
+        triangle_ids = [
+            sid for sid in adjacent
+            if len(self._surface_vertices(sid)) == 3
+        ]
+
+        quad_ids = [
+            sid for sid in adjacent
+            if len(self._surface_vertices(sid)) == 4
+        ]
+
+        if len(triangle_ids) == 1 and len(quad_ids) == 1:
+            return triangle_ids[0], quad_ids[0]
+
+        return None
+
+    def dihedral_cos(
+        self,
+        edge_start: str,
+        edge_end: str,
+        point_left: str,
+        point_right: str,
+    ) -> float:
+        """
+        Compute cosine of the dihedral angle.
+
+        This enforces the obtuse angle magnitude, e.g. 110 degrees,
+        without relying on signed angle convention.
+
+        This is more stable for the first implementation.
+        """
+        a = self.point_array(edge_start)
+        b = self.point_array(edge_end)
+        c = self.point_array(point_left)
+        d = self.point_array(point_right)
+
+        axis = self._unit_vector(b - a, name="dihedral axis")
+
+        u = c - a
+        v = d - a
+
+        u_perp = u - np.dot(u, axis) * axis
+        v_perp = v - np.dot(v, axis) * axis
+
+        u_hat = self._unit_vector(u_perp, name="projected left vector")
+        v_hat = self._unit_vector(v_perp, name="projected right vector")
+
+        return float(np.dot(u_hat, v_hat))
+
+    def simple_hexagon_initial_guess(
+        self,
+        mountain_height: float = 5.0,
+        valley_height: float = 0.0,
+    ) -> np.ndarray:
+        """
+        Create an initial guess for the simple hexagon folding branch.
+
+        Valley triangles are initialized on z = valley_height.
+        Mountain triangles are initialized on z = mountain_height.
+
+        This does not add constraints. It only creates X0 for the solver.
+        """
+        X0 = self.get_coordinate_vector().copy()
+        point_ids = self.point_ids()
+        point_to_index = {pid: i for i, pid in enumerate(point_ids)}
+
+        proposed_z = {}
+
+        triangle_ids = [
+            sid for sid in self.surfaces.keys()
+            if len(self._surface_vertices(sid)) == 3
+        ]
+
+        for surface_id in triangle_ids:
+            kind = self.triangle_crease_kind(surface_id)
+
+            if kind == "valley":
+                z_target = valley_height
+            elif kind == "mountain":
+                z_target = mountain_height
+            else:
+                continue
+
+            for pid in self._surface_vertices(surface_id):
+                if pid in proposed_z:
+                    if abs(proposed_z[pid] - z_target) > 1e-9:
+                        raise ValueError(
+                            f"Point '{pid}' is shared by triangle panels that "
+                            f"request different initial heights: "
+                            f"{proposed_z[pid]} and {z_target}. "
+                            f"This indicates a branch/overlap conflict."
+                        )
+
+                proposed_z[pid] = z_target
+
+        for pid, z in proposed_z.items():
+            i = point_to_index[pid]
+            X0[3 * i + 2] = z
+
+        return X0
+
+    def print_simple_hexagon_metadata_summary(self) -> None:
+        """
+        Print simple-hexagon metadata coverage.
+        """
+        print("Simple hexagon metadata summary")
+        print("-------------------------------")
+
+        if not self.hex_units:
+            print("No hex-unit metadata found.")
+            return
+
+        total_local_creases = 0
+        total_triangles = 0
+        total_quads = 0
+
+        for unit_data in self.hex_units:
+            unit_count = unit_data.get("count", "unknown")
+            n_tri = len(unit_data.get("triangles", []))
+            n_quad = len(unit_data.get("parallelograms", []))
+            n_creases = len(unit_data.get("local_creases", []))
+
+            total_triangles += n_tri
+            total_quads += n_quad
+            total_local_creases += n_creases
+
+            print(
+                f"Unit {unit_count}: "
+                f"triangles={n_tri}, quads={n_quad}, local creases={n_creases}"
+            )
+
+        print("")
+        print(f"Total units:         {len(self.hex_units)}")
+        print(f"Total triangles:     {total_triangles}")
+        print(f"Total quads:         {total_quads}")
+        print(f"Total local creases: {total_local_creases}")
+
+    def update_simple_hexagon_dihedral_target(
+        self,
+        target_dihedral: float,
+        unit: Literal["rad", "deg"] = "deg",
+    ) -> None:
+        """
+        Update all simple-hexagon signed dihedral increment constraints.
+
+        This is used for continuation:
+            175 deg -> 165 deg -> ... -> 110 deg
+        """
+        theta = self._angle_to_rad(target_dihedral, unit=unit)
+
+        if not (0.0 < theta < np.pi):
+            raise ValueError("target_dihedral must be between 0 and 180 degrees.")
+
+        fold_amount = np.pi - theta
+
+        for constraint in self.constraints.values():
+            if constraint.kind != "dihedral_signed_increment":
+                continue
+
+            sign = constraint.data["sign"]
+            constraint.data["target_increment"] = float(sign * fold_amount)
+
+    def solve_simple_hexagon_continuation(
+        self,
+        final_dihedral: float = 110.0,
+        start_dihedral: float = 175.0,
+        steps: int = 14,
+        unit: Literal["rad", "deg"] = "deg",
+        X0: Optional[np.ndarray] = None,
+        max_nfev_per_step: int = 5000,
+        tol: float = 1e-10,
+        residual_warning_tol: float = 1e-5,
+        verbose: bool = True,
+    ) -> SolveReport:
+        """
+        Solve the simple hexagon folding path by continuation.
+
+        Instead of jumping directly from flat to 110 deg, solve:
+
+            175 -> 170 -> 165 -> ... -> 110
+
+        This is much more robust for origami kinematics.
+        """
+        if steps < 2:
+            raise ValueError("steps must be at least 2.")
+
+        if unit == "deg":
+            targets = np.linspace(start_dihedral, final_dihedral, steps)
+        elif unit == "rad":
+            targets = np.linspace(start_dihedral, final_dihedral, steps)
+        else:
+            raise ValueError("unit must be 'deg' or 'rad'.")
+
+        if X0 is None:
+            X = self.get_coordinate_vector()
+        else:
+            X = np.asarray(X0, dtype=float)
+
+        last_report = None
+
+        for k, theta in enumerate(targets):
+            self.update_simple_hexagon_dihedral_target(theta, unit=unit)
+
+            report = self.solve(
+                X0=X,
+                update_model=True,
+                max_nfev=max_nfev_per_step,
+                tol=tol,
+            )
+
+            X = report.x.copy()
+            last_report = report
+
+            if verbose:
+                print(
+                    f"[step {k + 1:02d}/{steps}] "
+                    f"target_dihedral={theta:.3f} {unit}, "
+                    f"max_residual={report.max_abs_residual:.3e}, "
+                    f"success={report.success}"
+                )
+
+            if report.max_abs_residual > residual_warning_tol:
+                if verbose:
+                    print(
+                        "  warning: residual is still large at this step; "
+                        "continuing anyway."
+                    )
+
+        return last_report
+
+    def print_dihedral_signed_status(
+        self,
+        max_items: int = 20,
+        unit: Literal["rad", "deg"] = "deg",
+    ) -> None:
+        """
+        Print physical dihedral angles and signed fold increments.
+        """
+        rows = []
+
+        for cid, constraint in self.constraints.items():
+            if constraint.kind != "dihedral_signed_increment":
+                continue
+
+            data = constraint.data
+
+            current_angle = self.signed_dihedral_angle(
+                edge_start=data["edge_start"],
+                edge_end=data["edge_end"],
+                point_left=data["point_left"],
+                point_right=data["point_right"],
+                unit="rad",
+            )
+
+            initial_angle = data["initial_angle"]
+            target_increment = data["target_increment"]
+            actual_increment = self._wrap_to_pi(current_angle - initial_angle)
+            residual = self._wrap_to_pi(actual_increment - target_increment)
+            actual_dihedral = abs(current_angle)
+            target_dihedral = np.pi - abs(target_increment)
+
+            if unit == "deg":
+                dihedral_display = np.rad2deg(actual_dihedral)
+                target_display = np.rad2deg(target_dihedral)
+                fold_display = np.rad2deg(actual_increment)
+                residual_display = np.rad2deg(residual)
+            else:
+                dihedral_display = actual_dihedral
+                target_display = target_dihedral
+                fold_display = actual_increment
+                residual_display = residual
+
+            rows.append(
+                (
+                    abs(residual),
+                    cid,
+                    data.get("crease_kind"),
+                    dihedral_display,
+                    target_display,
+                    fold_display,
+                    residual_display,
+                )
+            )
+
+        rows.sort(reverse=True, key=lambda x: x[0])
+
+        print("Dihedral status")
+        print("----------------")
+        print(
+            f"{'constraint':45s} {'kind':10s} "
+            f"{'dihedral':>12s} {'target':>12s} "
+            f"{'signed fold':>12s} {'error':>12s}"
+        )
+
+        for _, cid, kind, dihedral, target, fold, residual in rows[:max_items]:
+            print(
+                f"{cid:45s} {str(kind):10s} "
+                f"{dihedral:12.4f} {target:12.4f} "
+                f"{fold:12.4f} {residual:12.4f}"
+            )
