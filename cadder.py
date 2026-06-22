@@ -11,6 +11,9 @@ ConstraintKind = Literal[
     "bar_length",
     "fixed_coordinate",
     "fixed_point",
+    "parallel_lines",
+    "dihedral_angle",
+    "coplanar_points",
 ]
 
 
@@ -177,6 +180,112 @@ class Cadder:
 
         p = self.points[point_id]
         return np.array([p.x, p.y, p.z], dtype=float)
+
+    # ------------------------------------------------------------
+    # Dihedral Angle Calculation
+    # ------------------------------------------------------------
+
+    def signed_dihedral_angle(
+        self,
+        edge_start: str,
+        edge_end: str,
+        point_left: str,
+        point_right: str,
+        unit: Literal["rad", "deg"] = "rad",
+    ) -> float:
+        """
+        Compute signed angle between two panel-side vectors around a crease axis.
+
+        The crease axis is:
+            edge_start -> edge_end
+
+        point_left:
+            A point on the first panel, not on the crease.
+
+        point_right:
+            A point on the second panel, not on the crease.
+
+        Convention:
+            The returned angle is the signed rotation from the projected
+            left-panel vector to the projected right-panel vector around
+            the crease axis.
+
+        Important:
+            For a flat 2D crease pattern, this value may be close to +180 deg
+            or -180 deg depending on vertex ordering and which side the two
+            panels lie on.
+        """
+        a = self.point_array(edge_start)
+        b = self.point_array(edge_end)
+        c = self.point_array(point_left)
+        d = self.point_array(point_right)
+
+        axis = self._unit_vector(b - a, name="dihedral axis")
+
+        u = c - a
+        v = d - a
+
+        # Project both vectors onto the plane perpendicular to the crease axis.
+        u_perp = u - np.dot(u, axis) * axis
+        v_perp = v - np.dot(v, axis) * axis
+
+        u_hat = self._unit_vector(u_perp, name="projected left vector")
+        v_hat = self._unit_vector(v_perp, name="projected right vector")
+
+        sin_angle = np.dot(axis, np.cross(u_hat, v_hat))
+        cos_angle = np.dot(u_hat, v_hat)
+
+        angle_rad = float(np.arctan2(sin_angle, cos_angle))
+
+        return self._rad_to_angle(angle_rad, unit=unit)
+
+    def signed_dihedral_angle_from_line(
+        self,
+        line_id: str,
+        unit: Literal["rad", "deg"] = "rad",
+    ) -> float:
+        """
+        Compute signed dihedral angle for a line shared by exactly two surfaces.
+        """
+        if line_id not in self.lines:
+            raise ValueError(f"Line '{line_id}' does not exist.")
+
+        line = self.lines[line_id]
+        edge_start = line["start"]
+        edge_end = line["end"]
+
+        adjacent_surfaces = self.find_surfaces_adjacent_to_edge(
+            edge_start,
+            edge_end,
+        )
+
+        if len(adjacent_surfaces) != 2:
+            raise ValueError(
+                f"Line '{line_id}' must be shared by exactly two surfaces "
+                f"to define a dihedral angle. Found {len(adjacent_surfaces)}."
+            )
+
+        s1, s2 = adjacent_surfaces
+
+        point_left = self._first_non_edge_vertex(
+            self.surfaces[s1]["vertices"],
+            edge_start,
+            edge_end,
+        )
+
+        point_right = self._first_non_edge_vertex(
+            self.surfaces[s2]["vertices"],
+            edge_start,
+            edge_end,
+        )
+
+        return self.signed_dihedral_angle(
+            edge_start=edge_start,
+            edge_end=edge_end,
+            point_left=point_left,
+            point_right=point_right,
+            unit=unit,
+        )
 
     # ------------------------------------------------------------
     # Constraint creation
@@ -353,6 +462,281 @@ class Cadder:
 
         return cids
 
+    def add_parallel_line_constraint(
+        self,
+        p1: str,
+        p2: str,
+        p3: str,
+        p4: str,
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Constrain line p1-p2 to be parallel to line p3-p4.
+
+        Residual:
+            cross(unit(p2 - p1), unit(p4 - p3)) = 0
+
+        This gives 3 scalar residuals, but only rank 2 independently.
+        That is fine because rank detection uses the Jacobian.
+        """
+        for pid in [p1, p2, p3, p4]:
+            if pid not in self.points:
+                raise ValueError(f"Point '{pid}' does not exist.")
+
+        if p1 == p2 or p3 == p4:
+            raise ValueError("Parallel-line constraint cannot use zero-length lines.")
+
+        if constraint_id is None:
+            constraint_id = self._new_constraint_id()
+
+        if constraint_id in self.constraints:
+            raise ValueError(f"Constraint '{constraint_id}' already exists.")
+
+        self.constraints[constraint_id] = Constraint(
+            id=constraint_id,
+            kind="parallel_lines",
+            data={
+                "p1": p1,
+                "p2": p2,
+                "p3": p3,
+                "p4": p4,
+            },
+        )
+
+        return constraint_id
+
+    def add_dihedral_angle_constraint(
+        self,
+        edge_start: str,
+        edge_end: str,
+        point_left: str,
+        point_right: str,
+        target_angle: float,
+        unit: Literal["rad", "deg"] = "rad",
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Add a signed dihedral-angle constraint.
+
+        Args:
+            edge_start, edge_end:
+                Two points defining the crease axis.
+
+            point_left:
+                A point on the first panel, not on the crease.
+
+            point_right:
+                A point on the second panel, not on the crease.
+
+            target_angle:
+                Target signed angle. Use unit='deg' for degrees.
+
+        Residual:
+            wrap_to_pi(current_angle - target_angle) = 0
+        """
+        for pid in [edge_start, edge_end, point_left, point_right]:
+            if pid not in self.points:
+                raise ValueError(f"Point '{pid}' does not exist.")
+
+        if edge_start == edge_end:
+            raise ValueError("Dihedral edge cannot have zero length.")
+
+        if point_left in {edge_start, edge_end}:
+            raise ValueError("point_left must not be on the crease edge.")
+
+        if point_right in {edge_start, edge_end}:
+            raise ValueError("point_right must not be on the crease edge.")
+
+        target_angle_rad = self._angle_to_rad(target_angle, unit=unit)
+
+        if constraint_id is None:
+            constraint_id = self._new_constraint_id()
+
+        if constraint_id in self.constraints:
+            raise ValueError(f"Constraint '{constraint_id}' already exists.")
+
+        self.constraints[constraint_id] = Constraint(
+            id=constraint_id,
+            kind="dihedral_angle",
+            data={
+                "edge_start": edge_start,
+                "edge_end": edge_end,
+                "point_left": point_left,
+                "point_right": point_right,
+                "target_angle": target_angle_rad,
+            },
+        )
+
+        return constraint_id
+
+    def add_dihedral_angle_constraint_from_line(
+        self,
+        line_id: str,
+        target_angle: float,
+        unit: Literal["rad", "deg"] = "rad",
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Add a dihedral-angle constraint using a line shared by two surfaces.
+
+        The line must be an actual edge of exactly two surfaces.
+        """
+        if line_id not in self.lines:
+            raise ValueError(f"Line '{line_id}' does not exist.")
+
+        line = self.lines[line_id]
+        edge_start = line["start"]
+        edge_end = line["end"]
+
+        adjacent_surfaces = self.find_surfaces_adjacent_to_edge(
+            edge_start,
+            edge_end,
+        )
+
+        if len(adjacent_surfaces) != 2:
+            raise ValueError(
+                f"Line '{line_id}' must be shared by exactly two surfaces "
+                f"to define a dihedral angle. Found {len(adjacent_surfaces)}."
+            )
+
+        s1, s2 = adjacent_surfaces
+
+        point_left = self._first_non_edge_vertex(
+            self.surfaces[s1]["vertices"],
+            edge_start,
+            edge_end,
+        )
+
+        point_right = self._first_non_edge_vertex(
+            self.surfaces[s2]["vertices"],
+            edge_start,
+            edge_end,
+        )
+
+        if constraint_id is None:
+            constraint_id = f"dihedral_{line_id}"
+
+        return self.add_dihedral_angle_constraint(
+            edge_start=edge_start,
+            edge_end=edge_end,
+            point_left=point_left,
+            point_right=point_right,
+            target_angle=target_angle,
+            unit=unit,
+            constraint_id=constraint_id,
+        )
+
+    def add_dihedral_increment_constraint_from_line(
+        self,
+        line_id: str,
+        angle_increment: float,
+        unit: Literal["rad", "deg"] = "rad",
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Add a dihedral-angle constraint by incrementing the current angle.
+
+        This is usually more convenient than specifying an absolute angle.
+
+        Example:
+            add_dihedral_increment_constraint_from_line(
+                "crease_v0",
+                30,
+                unit="deg",
+            )
+
+        means:
+            current dihedral angle + 30 deg
+        """
+        current_angle = self.signed_dihedral_angle_from_line(
+            line_id,
+            unit="rad",
+        )
+
+        angle_increment_rad = self._angle_to_rad(angle_increment, unit=unit)
+
+        target_angle = current_angle + angle_increment_rad
+        target_angle = self._wrap_to_pi(target_angle)
+
+        if constraint_id is None:
+            constraint_id = f"dihedral_increment_{line_id}"
+
+        return self.add_dihedral_angle_constraint_from_line(
+            line_id=line_id,
+            target_angle=target_angle,
+            unit="rad",
+            constraint_id=constraint_id,
+        )
+
+    def add_coplanar_points_constraint(
+        self,
+        p1: str,
+        p2: str,
+        p3: str,
+        p4: str,
+        constraint_id: Optional[str] = None,
+    ) -> str:
+        """
+        Constrain four points to be coplanar.
+
+        Residual:
+            normalized scalar triple product = 0
+
+        This is useful for enforcing quad-panel planarity if you do not use
+        full pairwise bar constraints inside a surface.
+        """
+        for pid in [p1, p2, p3, p4]:
+            if pid not in self.points:
+                raise ValueError(f"Point '{pid}' does not exist.")
+
+        if constraint_id is None:
+            constraint_id = self._new_constraint_id()
+
+        if constraint_id in self.constraints:
+            raise ValueError(f"Constraint '{constraint_id}' already exists.")
+
+        self.constraints[constraint_id] = Constraint(
+            id=constraint_id,
+            kind="coplanar_points",
+            data={
+                "p1": p1,
+                "p2": p2,
+                "p3": p3,
+                "p4": p4,
+            },
+        )
+
+        return constraint_id
+
+    def add_coplanarity_constraints_from_surfaces(self) -> None:
+        """
+        Add coplanarity constraints for surfaces with 4 or more vertices.
+
+        For a quad:
+            one coplanarity constraint is added.
+
+        For n > 4:
+            constraints are added relative to the first three vertices.
+        """
+        for surface_id, surface in self.surfaces.items():
+            vertices = surface["vertices"]
+
+            if len(vertices) < 4:
+                continue
+
+            p1, p2, p3 = vertices[0], vertices[1], vertices[2]
+
+            for k in range(3, len(vertices)):
+                p4 = vertices[k]
+
+                self.add_coplanar_points_constraint(
+                    p1,
+                    p2,
+                    p3,
+                    p4,
+                    constraint_id=f"coplanar_{surface_id}_{p4}",
+                )
+                
     # ------------------------------------------------------------
     # Automatic constraints from geometry
     # ------------------------------------------------------------
@@ -474,6 +858,21 @@ class Cadder:
                     self._residual_fixed_coordinate(constraint.data)
                 )
 
+            elif constraint.kind == "parallel_lines":
+                residuals.extend(
+                    self._residual_parallel_lines(constraint.data)
+                )
+
+            elif constraint.kind == "dihedral_angle":
+                residuals.append(
+                    self._residual_dihedral_angle(constraint.data)
+                )
+
+            elif constraint.kind == "coplanar_points":
+                residuals.append(
+                    self._residual_coplanar_points(constraint.data)
+                )
+
             elif constraint.kind == "fixed_point":
                 raise NotImplementedError(
                     "fixed_point is implemented as three fixed_coordinate constraints."
@@ -508,6 +907,55 @@ class Cadder:
         }
 
         return float(point[axis_map[axis]] - value)
+
+    def _residual_parallel_lines(self, data: dict) -> np.ndarray:
+        p1 = self.point_array(data["p1"])
+        p2 = self.point_array(data["p2"])
+        p3 = self.point_array(data["p3"])
+        p4 = self.point_array(data["p4"])
+
+        u = self._unit_vector(p2 - p1, name="first parallel line")
+        v = self._unit_vector(p4 - p3, name="second parallel line")
+
+        return np.cross(u, v)
+
+    def _residual_dihedral_angle(self, data: dict) -> float:
+        current_angle = self.signed_dihedral_angle(
+            edge_start=data["edge_start"],
+            edge_end=data["edge_end"],
+            point_left=data["point_left"],
+            point_right=data["point_right"],
+            unit="rad",
+        )
+
+        target_angle = data["target_angle"]
+
+        return self._wrap_to_pi(current_angle - target_angle)
+
+    def _residual_coplanar_points(self, data: dict) -> float:
+        p1 = self.point_array(data["p1"])
+        p2 = self.point_array(data["p2"])
+        p3 = self.point_array(data["p3"])
+        p4 = self.point_array(data["p4"])
+
+        a = p2 - p1
+        b = p3 - p1
+        c = p4 - p1
+
+        numerator = float(np.dot(np.cross(a, b), c))
+
+        denominator = (
+            np.linalg.norm(a)
+            * np.linalg.norm(b)
+            * np.linalg.norm(c)
+        )
+
+        if denominator < 1e-12:
+            raise ValueError(
+                "Coplanar constraint has near-degenerate point configuration."
+            )
+
+        return float(numerator / denominator)
 
     # ------------------------------------------------------------
     # Jacobian and mobility
@@ -934,3 +1382,105 @@ class Cadder:
             ax.set_box_aspect((1, 1, 1))
         except AttributeError:
             pass
+
+    # ------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------
+
+    @staticmethod
+    def _angle_to_rad(angle: float, unit: Literal["rad", "deg"] = "rad") -> float:
+        """
+        Convert angle to radians.
+        """
+        if unit == "rad":
+            return float(angle)
+
+        if unit == "deg":
+            return float(np.deg2rad(angle))
+
+        raise ValueError("unit must be 'rad' or 'deg'.")
+
+    @staticmethod
+    def _rad_to_angle(angle_rad: float, unit: Literal["rad", "deg"] = "rad") -> float:
+        """
+        Convert radians to requested unit.
+        """
+        if unit == "rad":
+            return float(angle_rad)
+
+        if unit == "deg":
+            return float(np.rad2deg(angle_rad))
+
+        raise ValueError("unit must be 'rad' or 'deg'.")
+
+    @staticmethod
+    def _wrap_to_pi(angle: float) -> float:
+        """
+        Wrap angle to (-pi, pi].
+
+        This prevents angle residuals from jumping by 2*pi.
+        """
+        return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+    @staticmethod
+    def _unit_vector(v: np.ndarray, name: str = "vector", eps: float = 1e-12) -> np.ndarray:
+        """
+        Return normalized vector.
+
+        Raises an error if the vector is too small.
+        """
+        norm = float(np.linalg.norm(v))
+
+        if norm < eps:
+            raise ValueError(f"{name} has near-zero length.")
+
+        return v / norm
+
+    @staticmethod
+    def _surface_has_edge(vertices: List[str], p1: str, p2: str) -> bool:
+        """
+        Check whether a surface contains the edge p1-p2.
+
+        The edge is treated as direction-independent.
+        """
+        n = len(vertices)
+
+        for i in range(n):
+            a = vertices[i]
+            b = vertices[(i + 1) % n]
+
+            if {a, b} == {p1, p2}:
+                return True
+
+        return False
+
+    @staticmethod
+    def _first_non_edge_vertex(vertices: List[str], p1: str, p2: str) -> str:
+        """
+        Return the first vertex in a surface that is not one of the edge vertices.
+        """
+        for pid in vertices:
+            if pid not in {p1, p2}:
+                return pid
+
+        raise ValueError(
+            f"Surface {vertices} does not contain a non-edge vertex "
+            f"relative to edge {p1}-{p2}."
+        )
+
+    def find_surfaces_adjacent_to_edge(self, p1: str, p2: str) -> List[str]:
+        """
+        Find surfaces that contain the edge p1-p2.
+
+        Returns:
+            List of surface IDs.
+        """
+        adjacent = []
+
+        for surface_id, surface in self.surfaces.items():
+            vertices = surface["vertices"]
+
+            if self._surface_has_edge(vertices, p1, p2):
+                adjacent.append(surface_id)
+
+        return adjacent
