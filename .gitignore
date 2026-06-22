@@ -142,3 +142,8 @@ conda-meta/
 
 ######## Meta-data File ########
 *.json
+
+
+######## CAD File ########
+*.step
+*.stl

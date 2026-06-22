@@ -61,7 +61,8 @@ class Cadder:
     It does not yet solve a folded configuration.
     """
 
-    def __init__(self):
+    def __init__(self, unit: str = "mm"):
+        self.unit = str(unit)
         self.points: Dict[str, Point3D] = {}
         self.lines: dict = {}
         self.surfaces: dict = {}
@@ -82,7 +83,7 @@ class Cadder:
 
         2D points are lifted into 3D by setting z = 0.
         """
-        model = cls()
+        model = cls(unit=getattr(drawer, "unit", "mm"))
 
         for pid, point in drawer.points.items():
             model.add_point(pid, point.x, point.y, 0.0)
@@ -99,7 +100,7 @@ class Cadder:
         """
         Build a Cadder model from direct 3D metadata.
         """
-        model = cls()
+        model = cls(unit=metadata.get("metadata", {}).get("unit", "mm"))
 
         for pid, coords in metadata["points"].items():
             if len(coords) != 3:
@@ -111,6 +112,7 @@ class Cadder:
 
         model.lines = metadata.get("lines", {})
         model.surfaces = metadata.get("surfaces", {})
+        model.hex_units = metadata.get("hex_units", [])
 
         return model
 
@@ -1695,6 +1697,40 @@ class Cadder:
             print("Status:             underconstrained / mechanism remains")
         else:
             print("Status:             overconstrained or inconsistent")
+
+    # ------------------------------------------------------------
+    # File export
+    # ------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        """Return the current 3D geometry as JSON-friendly metadata."""
+        from cad_export import model_to_dict
+
+        return model_to_dict(self)
+
+    def save_json(self, filename: str) -> None:
+        """Save points, lines, surfaces, and units as 3D JSON metadata."""
+        from cad_export import save_json
+
+        save_json(self, filename)
+
+    def save_stl(self, filename: str, thickness: float = 0.0) -> None:
+        """Save panel geometry as an ASCII STL mesh."""
+        from cad_export import save_stl
+
+        save_stl(self, filename, thickness=thickness)
+
+    def save_step(self, filename: str, thickness: float = 0.0) -> None:
+        """Save panel geometry as a faceted STEP surface or solid model."""
+        from cad_export import save_step
+
+        save_step(self, filename, thickness=thickness)
+
+    def save_cad(self, filename: str, thickness: float = 0.0) -> None:
+        """Export based on a .json, .stl, .step, or .stp extension."""
+        from cad_export import save_cad
+
+        save_cad(self, filename, thickness=thickness)
 
     # ------------------------------------------------------------
     # Visualization
