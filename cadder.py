@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Literal, Tuple
 import numpy as np
-
+from scipy.optimize import least_squares
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 ConstraintKind = Literal[
     "bar_length",
@@ -26,6 +28,17 @@ class Constraint:
     kind: ConstraintKind
     data: dict
 
+@dataclass
+class SolveReport:
+    success: bool
+    message: str
+    nfev: int
+    cost: float
+    residual_norm: float
+    max_abs_residual: float
+    rank: int
+    mobility: int
+    x: np.ndarray
 
 class Cadder:
     """
@@ -174,26 +187,79 @@ class Cadder:
         self._constraint_count += 1
         return cid
 
+    @staticmethod
+    def _canonical_point_pair(p1: str, p2: str) -> Tuple[str, str]:
+        """
+        Direction-independent key for a point pair.
+        """
+        return tuple(sorted((p1, p2)))
+
+    def find_bar_length_constraint(self, p1: str, p2: str) -> Optional[str]:
+        """
+        Find an existing bar-length constraint between two points.
+
+        Direction does not matter.
+        """
+        target_pair = self._canonical_point_pair(p1, p2)
+
+        for cid, constraint in self.constraints.items():
+            if constraint.kind != "bar_length":
+                continue
+
+            data = constraint.data
+            pair = self._canonical_point_pair(data["p1"], data["p2"])
+
+            if pair == target_pair:
+                return cid
+
+        return None
+
     def add_bar_length_constraint(
         self,
         p1: str,
         p2: str,
         length: Optional[float] = None,
         constraint_id: Optional[str] = None,
+        merge_if_duplicate: bool = True,
+        length_tol: float = 1e-9,
     ) -> str:
         """
         Add distance-preservation constraint between two points.
 
         Residual:
-            ||x2 - x1||^2 - L^2 = 0
+            ||x2 - x1|| - L = 0
 
         If length is None, the current distance is used as the reference length.
+
+        If the same bar constraint already exists, it is merged.
         """
+        if p1 == p2:
+            raise ValueError("A bar-length constraint cannot use the same point twice.")
+
         x1 = self.point_array(p1)
         x2 = self.point_array(p2)
 
         if length is None:
             length = float(np.linalg.norm(x2 - x1))
+
+        if length <= 0:
+            raise ValueError(
+                f"Bar length between '{p1}' and '{p2}' must be positive."
+            )
+
+        existing_cid = self.find_bar_length_constraint(p1, p2)
+
+        if existing_cid is not None:
+            existing_length = self.constraints[existing_cid].data["length"]
+
+            if abs(existing_length - length) > length_tol:
+                raise ValueError(
+                    f"Conflicting bar length for points '{p1}' and '{p2}'. "
+                    f"Existing length = {existing_length}, new length = {length}."
+                )
+
+            if merge_if_duplicate:
+                return existing_cid
 
         if constraint_id is None:
             constraint_id = self._new_constraint_id()
@@ -212,7 +278,7 @@ class Cadder:
         )
 
         return constraint_id
-
+    
     def add_fixed_coordinate_constraint(
         self,
         point_id: str,
@@ -348,6 +414,36 @@ class Cadder:
 
         self.add_fixed_coordinate_constraint(p2, "z")
 
+    def add_panel_rigidity_constraints_from_surfaces(self) -> None:
+        """
+        Add bar-length constraints inside each surface to make every panel rigid.
+
+        For a triangle:
+            all 3 pairwise distances are fixed.
+
+        For a quadrilateral:
+            all 6 pairwise distances are fixed.
+
+        This is simple and robust for the first version.
+        Duplicate bars are automatically merged by add_bar_length_constraint().
+        """
+        for surface_id, surface in self.surfaces.items():
+            vertices = surface["vertices"]
+
+            n = len(vertices)
+
+            for i in range(n):
+                for j in range(i + 1, n):
+                    p1 = vertices[i]
+                    p2 = vertices[j]
+
+                    self.add_bar_length_constraint(
+                        p1,
+                        p2,
+                        constraint_id=f"panel_{surface_id}_{p1}_{p2}",
+                        merge_if_duplicate=True,
+                    )
+
     # ------------------------------------------------------------
     # Residual evaluation
     # ------------------------------------------------------------
@@ -398,7 +494,7 @@ class Cadder:
         p2 = self.point_array(data["p2"])
         length = data["length"]
 
-        return float(np.dot(p2 - p1, p2 - p1) - length**2)
+        return float(np.linalg.norm(p2 - p1) - length)
 
     def _residual_fixed_coordinate(self, data: dict) -> float:
         point = self.point_array(data["point"])
@@ -502,3 +598,339 @@ class Cadder:
             print("Status:              underconstrained / mechanism remains")
         else:
             print("Status:              overconstrained or inconsistent")
+
+    # ------------------------------------------------------------
+    # Solver
+    # ------------------------------------------------------------
+
+    def solve(
+        self,
+        X0: Optional[np.ndarray] = None,
+        update_model: bool = True,
+        tol: float = 1e-10,
+        rank_tol: float = 1e-8,
+        max_nfev: int = 2000,
+        verbose: int = 0,
+    ) -> SolveReport:
+        """
+        Solve the nonlinear constraint system.
+
+        The solver finds X such that:
+
+            residual_vector(X) ≈ 0
+
+        Args:
+            X0:
+                Initial guess. If None, use current model coordinates.
+            update_model:
+                If True, update self.points using the solved coordinates.
+            tol:
+                Tolerance passed to scipy least_squares.
+            rank_tol:
+                Tolerance for Jacobian rank estimation.
+            max_nfev:
+                Maximum number of function evaluations.
+            verbose:
+                scipy least_squares verbosity.
+                0 -> silent
+                1 -> final report
+                2 -> iteration report
+
+        Returns:
+            SolveReport
+        """
+        if len(self.constraints) == 0:
+            raise ValueError("No constraints have been added.")
+
+        if X0 is None:
+            X0 = self.get_coordinate_vector()
+
+        X0 = np.asarray(X0, dtype=float)
+
+        if X0.size != self.num_variables():
+            raise ValueError(
+                f"Expected X0 size {self.num_variables()}, but got {X0.size}."
+            )
+
+        result = least_squares(
+            fun=lambda X: self.residual_vector(X),
+            x0=X0,
+            xtol=tol,
+            ftol=tol,
+            gtol=tol,
+            max_nfev=max_nfev,
+            verbose=verbose,
+        )
+
+        residuals = self.residual_vector(result.x)
+        residual_norm = float(np.linalg.norm(residuals))
+        max_abs_residual = float(np.max(np.abs(residuals))) if residuals.size else 0.0
+
+        J = self.numerical_jacobian(result.x)
+        rank = int(np.linalg.matrix_rank(J, tol=rank_tol))
+        mobility = self.num_variables() - rank
+
+        if update_model:
+            self.set_coordinate_vector(result.x)
+
+        return SolveReport(
+            success=bool(result.success),
+            message=str(result.message),
+            nfev=int(result.nfev),
+            cost=float(result.cost),
+            residual_norm=residual_norm,
+            max_abs_residual=max_abs_residual,
+            rank=rank,
+            mobility=mobility,
+            x=result.x.copy(),
+        )
+
+    def solve_from_perturbed_state(
+        self,
+        perturbation_scale: float = 1e-3,
+        seed: Optional[int] = None,
+        update_model: bool = True,
+        **solve_kwargs,
+    ) -> SolveReport:
+        """
+        Solve after applying a small random perturbation to the current coordinates.
+
+        This is useful for testing whether the constraints pull the system back
+        to a valid configuration.
+
+        Args:
+            perturbation_scale:
+                Size of random coordinate perturbation.
+            seed:
+                Random seed.
+            update_model:
+                Whether to update the model after solving.
+            solve_kwargs:
+                Extra arguments passed to solve().
+        """
+        rng = np.random.default_rng(seed)
+        X = self.get_coordinate_vector()
+        X0 = X + perturbation_scale * rng.standard_normal(X.shape)
+
+        return self.solve(
+            X0=X0,
+            update_model=update_model,
+            **solve_kwargs,
+        )
+
+    def print_solve_report(self, report: SolveReport) -> None:
+        """
+        Print a readable solver report.
+        """
+        print("Solve report")
+        print("------------")
+        print(f"Success:            {report.success}")
+        print(f"Message:            {report.message}")
+        print(f"Function evals:     {report.nfev}")
+        print(f"Cost:               {report.cost}")
+        print(f"Residual norm:      {report.residual_norm}")
+        print(f"Max abs residual:   {report.max_abs_residual}")
+        print(f"Jacobian rank:      {report.rank}")
+        print(f"Mobility:           {report.mobility}")
+
+        if report.mobility == 0:
+            print("Status:             locally unique")
+        elif report.mobility > 0:
+            print("Status:             underconstrained / mechanism remains")
+        else:
+            print("Status:             overconstrained or inconsistent")
+
+    # ------------------------------------------------------------
+    # Visualization
+    # ------------------------------------------------------------
+
+    def draw(
+        self,
+        show_points: bool = True,
+        show_point_ids: bool = True,
+        show_line_ids: bool = False,
+        show_surface_ids: bool = False,
+        show_surfaces: bool = True,
+        equal_axis: bool = True,
+        figsize: Tuple[float, float] = (8, 7),
+        view: Tuple[float, float] = (25, -60),
+    ) -> None:
+        """
+        Draw the current 3D configuration using matplotlib.
+
+        Args:
+            show_points:
+                If True, draw point markers.
+            show_point_ids:
+                If True, show point IDs.
+            show_line_ids:
+                If True, show line IDs.
+            show_surface_ids:
+                If True, show surface IDs.
+            show_surfaces:
+                If True, draw translucent panel surfaces.
+            equal_axis:
+                If True, use equal scaling for x, y, z.
+            figsize:
+                Matplotlib figure size.
+            view:
+                3D view angle as (elevation, azimuth).
+        """
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111, projection="3d")
+
+        # Draw surfaces first
+        if show_surfaces:
+            for surface_id, surface in self.surfaces.items():
+                vertices = surface["vertices"]
+
+                coords = [
+                    self.point_array(pid)
+                    for pid in vertices
+                ]
+
+                poly = Poly3DCollection(
+                    [coords],
+                    alpha=0.18,
+                    facecolor="lightgray",
+                    edgecolor="black",
+                    linewidth=0.8,
+                )
+                ax.add_collection3d(poly)
+
+                if show_surface_ids:
+                    center = np.mean(np.array(coords), axis=0)
+                    ax.text(
+                        center[0],
+                        center[1],
+                        center[2],
+                        surface_id,
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                    )
+
+        # Draw lines
+        for line_id, line in self.lines.items():
+            p0 = self.point_array(line["start"])
+            p1 = self.point_array(line["end"])
+
+            style = self._line_style_3d(line["kind"])
+
+            ax.plot(
+                [p0[0], p1[0]],
+                [p0[1], p1[1]],
+                [p0[2], p1[2]],
+                **style,
+            )
+
+            if show_line_ids:
+                mid = 0.5 * (p0 + p1)
+                ax.text(
+                    mid[0],
+                    mid[1],
+                    mid[2],
+                    line_id,
+                    fontsize=8,
+                )
+
+        # Draw points
+        if show_points:
+            for point_id, point in self.points.items():
+                ax.scatter(
+                    point.x,
+                    point.y,
+                    point.z,
+                    s=25,
+                    color="black",
+                )
+
+                if show_point_ids:
+                    ax.text(
+                        point.x,
+                        point.y,
+                        point.z,
+                        f" {point_id}",
+                        fontsize=8,
+                    )
+
+        if equal_axis:
+            self._set_axes_equal_3d(ax)
+
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+
+        ax.view_init(elev=view[0], azim=view[1])
+        ax.grid(True, alpha=0.3)
+
+        plt.show()
+
+    @staticmethod
+    def _line_style_3d(kind: str) -> dict:
+        """
+        Visual convention:
+            valley       -> blue dashed
+            mountain     -> red dash-dot
+            side         -> black solid thick
+            rigid        -> black solid thin
+            construction -> gray dotted
+        """
+        if kind == "valley":
+            return {"color": "blue", "linestyle": "--", "linewidth": 1.8}
+
+        if kind == "mountain":
+            return {"color": "red", "linestyle": "-.", "linewidth": 1.8}
+
+        if kind == "side":
+            return {"color": "black", "linestyle": "-", "linewidth": 2.2}
+
+        if kind == "rigid":
+            return {"color": "black", "linestyle": "-", "linewidth": 1.0}
+
+        if kind == "construction":
+            return {"color": "gray", "linestyle": ":", "linewidth": 1.0}
+
+        raise ValueError(f"Unknown line kind: {kind}")
+
+    def _set_axes_equal_3d(self, ax) -> None:
+        """
+        Make x, y, z axes have equal scale.
+
+        Matplotlib 3D plots do not use equal axis scaling by default.
+        This helper prevents geometric distortion.
+        """
+        xs = [p.x for p in self.points.values()]
+        ys = [p.y for p in self.points.values()]
+        zs = [p.z for p in self.points.values()]
+
+        if not xs:
+            return
+
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        z_min, z_max = min(zs), max(zs)
+
+        x_mid = 0.5 * (x_min + x_max)
+        y_mid = 0.5 * (y_min + y_max)
+        z_mid = 0.5 * (z_min + z_max)
+
+        max_range = max(
+            x_max - x_min,
+            y_max - y_min,
+            z_max - z_min,
+        )
+
+        if max_range == 0:
+            max_range = 1.0
+
+        radius = 0.5 * max_range
+
+        ax.set_xlim(x_mid - radius, x_mid + radius)
+        ax.set_ylim(y_mid - radius, y_mid + radius)
+        ax.set_zlim(z_mid - radius, z_mid + radius)
+
+        try:
+            ax.set_box_aspect((1, 1, 1))
+        except AttributeError:
+            pass
