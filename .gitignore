@@ -138,6 +138,8 @@ conda-meta/
 
 # Local project files
 *.local
+examples/output/*
+!examples/output/.gitkeep
 
 
 ######## Meta-data File ########

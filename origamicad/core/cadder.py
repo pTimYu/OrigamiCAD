@@ -6,8 +6,8 @@ import numpy as np
 from scipy.optimize import least_squares
 from itertools import combinations
 
-from cadder_simple_hexagon import SimpleHexagonMixin
-from cadder_visualization import CadVisualizationMixin
+from .simple_hexagon_mixin import SimpleHexagonMixin
+from .visualization import CadVisualizationMixin
 
 ConstraintKind = Literal[
     "bar_length",
@@ -1677,31 +1677,31 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
 
     def to_dict(self) -> dict:
         """Return the current 3D geometry as JSON-friendly metadata."""
-        from cad_export import model_to_dict
+        from ..io.cad_export import model_to_dict
 
         return model_to_dict(self)
 
     def save_json(self, filename: str) -> None:
         """Save points, lines, surfaces, and units as 3D JSON metadata."""
-        from cad_export import save_json
+        from ..io.cad_export import save_json
 
         save_json(self, filename)
 
     def save_stl(self, filename: str, thickness: float = 0.0) -> None:
         """Save panel geometry as an ASCII STL mesh."""
-        from cad_export import save_stl
+        from ..io.cad_export import save_stl
 
         save_stl(self, filename, thickness=thickness)
 
     def save_step(self, filename: str, thickness: float = 0.0) -> None:
         """Save panel geometry as a faceted STEP surface or solid model."""
-        from cad_export import save_step
+        from ..io.cad_export import save_step
 
         save_step(self, filename, thickness=thickness)
 
     def save_cad(self, filename: str, thickness: float = 0.0) -> None:
         """Export based on a .json, .stl, .step, or .stp extension."""
-        from cad_export import save_cad
+        from ..io.cad_export import save_cad
 
         save_cad(self, filename, thickness=thickness)
 

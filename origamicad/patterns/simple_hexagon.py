@@ -1,4 +1,4 @@
-from two_d_drawer import TwoDDrawer
+from ..core.two_d_drawer import TwoDDrawer
 import numpy as np
 
 def hex_unit_chain(pattern, start_point=(0, 0), l=15, count=1):

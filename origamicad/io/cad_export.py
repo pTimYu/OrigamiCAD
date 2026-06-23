@@ -1,4 +1,4 @@
-"""File exporters used by :class:`cadder.Cadder`.
+"""File exporters used by :class:`origamicad.Cadder`.
 
 The exporters intentionally depend only on NumPy and the Python standard
 library.  STL is written as a triangle mesh.  STEP is written as faceted BREP

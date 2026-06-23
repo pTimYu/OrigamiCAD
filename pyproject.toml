@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "origamicad"
+version = "0.1.0"
+description = "2D crease-pattern drawing, origami kinematics, and CAD export helpers."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+include = ["origamicad*"]
