@@ -1,3 +1,3 @@
 """Reusable crease-pattern generators."""
 
-__all__ = ["simple_hexagon"]
+__all__ = ["hexagon_packaging"]
