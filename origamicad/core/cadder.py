@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Literal, Tuple
 import numpy as np
@@ -116,6 +117,51 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
         model.hex_units = metadata.get("hex_units", [])
 
         return model
+
+    def to_2d_drawer(self, point_tol: float = 1e-9):
+        """
+        Project the current 3D structure to the x-y plane as a TwoDDrawer.
+
+        The projection keeps the same point, line, and surface IDs. Points are
+        copied directly instead of merged, so overlapping projected points from
+        different heights remain distinct.
+        """
+        from .two_d_drawer import Line2D, Point2D, Surface2D, TwoDDrawer
+
+        drawer = TwoDDrawer(unit=self.unit, point_tol=point_tol)
+
+        for point_id, point in self.points.items():
+            drawer.points[point_id] = Point2D(
+                id=point_id,
+                x=float(point.x),
+                y=float(point.y),
+            )
+
+        for line_id in self.lines:
+            start, end, kind = self._line_info(line_id)
+            drawer.lines[line_id] = Line2D(
+                id=line_id,
+                start=start,
+                end=end,
+                kind=kind,
+            )
+
+        for surface_id in self.surfaces:
+            drawer.surfaces[surface_id] = Surface2D(
+                id=surface_id,
+                vertices=self._surface_vertices(surface_id),
+            )
+
+        drawer.hex_units = copy.deepcopy(self.hex_units)
+        drawer._point_count = len(drawer.points)
+        drawer._line_count = len(drawer.lines)
+        drawer._surface_count = len(drawer.surfaces)
+
+        return drawer
+
+    def project_to_xy(self, point_tol: float = 1e-9):
+        """Alias for to_2d_drawer()."""
+        return self.to_2d_drawer(point_tol=point_tol)
 
     # ------------------------------------------------------------
     # Basic data handling
@@ -1704,6 +1750,28 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
         from ..io.cad_export import save_cad
 
         save_cad(self, filename, thickness=thickness)
+
+    def save_xy_dxf(
+        self,
+        filename: str,
+        include_creases: bool = True,
+        crease_style: Literal["solid", "dashed"] = "dashed",
+        include_construction: bool = False,
+        include_rigid: bool = True,
+        include_side: bool = True,
+        point_tol: float = 1e-9,
+    ):
+        """
+        Project the current 3D structure to x-y and save it as DXF.
+        """
+        return self.to_2d_drawer(point_tol=point_tol).save_dxf(
+            filename,
+            include_creases=include_creases,
+            crease_style=crease_style,
+            include_construction=include_construction,
+            include_rigid=include_rigid,
+            include_side=include_side,
+        )
 
     # ------------------------------------------------------------
     # Geometry helpers

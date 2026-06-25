@@ -1,14 +1,21 @@
-"""Example: solve and export a simple-hexagon origami structure.
+"""Example: solve, project, and export a simple-hexagon origami structure.
 
 Run from the project root:
 
     python -m examples.simple_hexagon
 
-Generated JSON/STEP files are written to ``examples/output/`` and ignored by
-git through `.gitignore`.
+You can also run this file directly from an IDE.
+
+Generated JSON/DXF/STEP files are written to ``examples/output/`` and ignored
+by git through `.gitignore`.
 """
 
 from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import Cadder
 from origamicad.patterns.simple_hexagon import pattern
@@ -37,7 +44,7 @@ def main() -> None:
     )
 
     report = model.solve_simple_hexagon_continuation(
-        final_dihedral=150.0,
+        final_dihedral=135.0,
         start_dihedral=175.0,
         steps=4,
         unit="deg",
@@ -55,12 +62,30 @@ def main() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     json_path = OUTPUT_DIR / "simple_hexagon_3d.json"
     step_path = OUTPUT_DIR / "simple_hexagon.step"
+    projected_json_path = OUTPUT_DIR / "simple_hexagon_projected_2d.json"
+    projected_dxf_path = OUTPUT_DIR / "simple_hexagon_projected.dxf"
 
     model.save_json(json_path)
     model.save_step(step_path, thickness=0.0)
 
+    projected = model.to_2d_drawer()
+    projected.save_json(projected_json_path)
+    projected.save_dxf(
+        projected_dxf_path,
+        include_creases=True,
+        crease_style="dashed",
+    )
+
     print(f"Saved {json_path}")
     print(f"Saved {step_path}")
+    print(f"Saved {projected_json_path}")
+    print(f"Saved {projected_dxf_path}")
+
+    # If you only want cut boundaries without crease lines:
+    # projected.save_dxf(
+    #     OUTPUT_DIR / "simple_hexagon_cut_only.dxf",
+    #     include_creases=False,
+    # )
 
     # Uncomment for an interactive 3D preview.
     # model.draw(

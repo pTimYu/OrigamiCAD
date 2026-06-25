@@ -60,6 +60,61 @@ class TwoDDrawer:
         self._line_count = 0
         self._surface_count = 0
 
+    @classmethod
+    def from_metadata(cls, metadata: dict) -> "TwoDDrawer":
+        """
+        Build a 2D drawer from metadata produced by to_dict() or save_json().
+        """
+        info = metadata.get("metadata", {})
+        drawer = cls(
+            unit=info.get("unit", "mm"),
+            point_tol=info.get("point_tol", 1e-9),
+        )
+
+        for point_id, coords in metadata.get("points", {}).items():
+            if len(coords) < 2:
+                raise ValueError(
+                    f"Point '{point_id}' must contain at least [x, y]."
+                )
+            drawer.points[point_id] = Point2D(
+                point_id,
+                float(coords[0]),
+                float(coords[1]),
+            )
+
+        for line_id, line in metadata.get("lines", {}).items():
+            kind = line.get("kind", "side")
+            drawer._check_line_kind(kind)
+            drawer._check_point_exists(line["start"])
+            drawer._check_point_exists(line["end"])
+            drawer.lines[line_id] = Line2D(
+                line_id,
+                line["start"],
+                line["end"],
+                kind,
+            )
+
+        for surface_id, surface in metadata.get("surfaces", {}).items():
+            vertices = list(surface["vertices"])
+            for point_id in vertices:
+                drawer._check_point_exists(point_id)
+            drawer.surfaces[surface_id] = Surface2D(surface_id, vertices)
+
+        drawer.hex_units = metadata.get("hex_units", [])
+        drawer._point_count = len(drawer.points)
+        drawer._line_count = len(drawer.lines)
+        drawer._surface_count = len(drawer.surfaces)
+
+        return drawer
+
+    @classmethod
+    def from_json(cls, filename: str) -> "TwoDDrawer":
+        """
+        Load 2D metadata from JSON and build a TwoDDrawer.
+        """
+        with open(filename, "r", encoding="utf-8") as file:
+            return cls.from_metadata(json.load(file))
+
     # ------------------------------------------------------------
     # ID helpers
     # ------------------------------------------------------------
@@ -554,7 +609,7 @@ class TwoDDrawer:
         """
         Convert the pattern into a JSON-friendly dictionary.
         """
-        return {
+        data = {
             "metadata": {
                 "unit": self.unit,
                 "point_tol": self.point_tol,
@@ -579,12 +634,67 @@ class TwoDDrawer:
             },
         }
 
+        if hasattr(self, "hex_units"):
+            data["hex_units"] = self.hex_units
+
+        return data
+
     def save_json(self, filename: str) -> None:
         """
         Save the current pattern as a JSON file.
         """
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
+
+    def to_dxf_string(
+        self,
+        include_creases: bool = True,
+        crease_style: Literal["solid", "dashed"] = "dashed",
+        include_construction: bool = False,
+        include_rigid: bool = True,
+        include_side: bool = True,
+    ) -> str:
+        """
+        Convert the current 2D metadata to an ASCII DXF string.
+        """
+        from ..io.dxf_export import dxf_string_from_metadata
+
+        return dxf_string_from_metadata(
+            self.to_dict(),
+            include_creases=include_creases,
+            crease_style=crease_style,
+            include_construction=include_construction,
+            include_rigid=include_rigid,
+            include_side=include_side,
+        )
+
+    def save_dxf(
+        self,
+        filename: str,
+        include_creases: bool = True,
+        crease_style: Literal["solid", "dashed"] = "dashed",
+        include_construction: bool = False,
+        include_rigid: bool = True,
+        include_side: bool = True,
+    ):
+        """
+        Save the current 2D pattern as a DXF file.
+
+        Crease lines are exported on valley/mountain crease layers. Use
+        crease_style="dashed" for dashed laser-cutting crease lines, or
+        include_creases=False to export only cut/rigid geometry.
+        """
+        from ..io.dxf_export import save_dxf
+
+        return save_dxf(
+            self.to_dict(),
+            filename,
+            include_creases=include_creases,
+            crease_style=crease_style,
+            include_construction=include_construction,
+            include_rigid=include_rigid,
+            include_side=include_side,
+        )
 
     # ------------------------------------------------------------
     # Drawing

@@ -149,3 +149,4 @@ examples/output/*
 ######## CAD File ########
 *.step
 *.stl
+*.dxf
