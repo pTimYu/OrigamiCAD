@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Literal
 import json
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D as MplLine2D
 import math
 
 
@@ -708,9 +709,20 @@ class TwoDDrawer:
         show_surface_ids: bool = False,
         equal_axis: bool = True,
         figsize: Tuple[float, float] = (7, 7),
+        save_fig: bool = False,
+        save_path: str = "pattern.png",
+        dpi: int = 300,
     ) -> None:
         """
         Draw the 2D pattern using matplotlib.
+
+        Args:
+            save_fig:
+                If True, save the figure with plt.savefig().
+            save_path:
+                Output path used when save_fig is True.
+            dpi:
+                Image resolution used when save_fig is True.
         """
         fig, ax = plt.subplots(figsize=figsize)
 
@@ -767,6 +779,11 @@ class TwoDDrawer:
         ax.set_xlabel(f"x [{self.unit}]")
         ax.set_ylabel(f"y [{self.unit}]")
         ax.grid(True, alpha=0.3)
+        self._add_line_legend(ax)
+
+        if save_fig:
+            plt.savefig(save_path, dpi=dpi)
+
         plt.show()
 
     @staticmethod
@@ -795,3 +812,31 @@ class TwoDDrawer:
             return {"color": "gray", "linestyle": ":", "linewidth": 1.0}
 
         raise ValueError(f"Unknown line kind: {kind}")
+
+    def _add_line_legend(self, ax) -> None:
+        """
+        Add a legend for the line kinds present in the pattern.
+        """
+        labels = {
+            "side": "Side",
+            "valley": "Valley crease",
+            "mountain": "Mountain crease",
+            "rigid": "Rigid line",
+            "construction": "Construction line",
+        }
+        kind_order: Tuple[LineKind, ...] = (
+            "side",
+            "valley",
+            "mountain",
+            "rigid",
+            "construction",
+        )
+        present_kinds = {line.kind for line in self.lines.values()}
+        handles = [
+            MplLine2D([0], [0], label=labels[kind], **self._line_style(kind))
+            for kind in kind_order
+            if kind in present_kinds
+        ]
+
+        if handles:
+            ax.legend(handles=handles, loc="best")

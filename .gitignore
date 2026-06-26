@@ -150,3 +150,6 @@ examples/output/*
 *.step
 *.stl
 *.dxf
+
+######## Other ########
+test/

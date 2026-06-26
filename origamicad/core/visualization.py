@@ -4,6 +4,7 @@ from typing import Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D as MplLine2D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
@@ -20,6 +21,9 @@ class CadVisualizationMixin:
         equal_axis: bool = True,
         figsize: Tuple[float, float] = (8, 7),
         view: Tuple[float, float] = (25, -60),
+        save_fig: bool = False,
+        save_path: str = "model.png",
+        dpi: int = 300,
     ) -> None:
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection="3d")
@@ -70,6 +74,11 @@ class CadVisualizationMixin:
         ax.set_zlabel("z")
         ax.view_init(elev=view[0], azim=view[1])
         ax.grid(True, alpha=0.3)
+        self._add_line_legend_3d(ax)
+
+        if save_fig:
+            plt.savefig(save_path, dpi=dpi)
+
         plt.show()
 
     @staticmethod
@@ -86,6 +95,25 @@ class CadVisualizationMixin:
             return styles[kind]
         except KeyError:
             raise ValueError(f"Unknown line kind: {kind}") from None
+
+    def _add_line_legend_3d(self, ax) -> None:
+        labels = {
+            "side": "Side",
+            "valley": "Valley crease",
+            "mountain": "Mountain crease",
+            "rigid": "Rigid line",
+            "construction": "Construction line",
+        }
+        kind_order = ("side", "valley", "mountain", "rigid", "construction")
+        present_kinds = {line["kind"] for line in self.lines.values()}
+        handles = [
+            MplLine2D([0], [0], label=labels[kind], **self._line_style_3d(kind))
+            for kind in kind_order
+            if kind in present_kinds
+        ]
+
+        if handles:
+            ax.legend(handles=handles, loc="best")
 
     def _set_axes_equal_3d(self, ax) -> None:
         coords = np.array([[p.x, p.y, p.z] for p in self.points.values()], dtype=float)
