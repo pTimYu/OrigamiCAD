@@ -703,12 +703,12 @@ class TwoDDrawer:
 
     def draw(
         self,
-        show_points: bool = True,
-        show_point_ids: bool = True,
+        show_points: bool = False,
+        show_point_ids: bool = False,
         show_line_ids: bool = False,
         show_surface_ids: bool = False,
         equal_axis: bool = True,
-        figsize: Tuple[float, float] = (7, 7),
+        figsize: Tuple[float, float] = (10, 10),
         save_fig: bool = False,
         save_path: str = "pattern.png",
         dpi: int = 300,

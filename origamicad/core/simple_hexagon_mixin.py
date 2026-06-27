@@ -324,7 +324,7 @@ class SimpleHexagonMixin:
         max_nfev_per_step: int = 5000,
         tol: float = 1e-10,
         residual_warning_tol: float = 1e-5,
-        verbose: bool = True,
+        verbose: bool = False,
     ):
         if steps < 2:
             raise ValueError("steps must be at least 2.")
@@ -359,6 +359,83 @@ class SimpleHexagonMixin:
                     )
 
         return last_report
+
+    def solve_simple_hexagon_kinematics(
+        self,
+        final_dihedral: float = 110.0,
+        start_dihedral: float = 175.0,
+        steps: int = 14,
+        unit: Literal["rad", "deg"] = "deg",
+        fixed_triangle_surface_id: Optional[str] = None,
+        valley_z: float = 0.0,
+        strict_unique_edges: bool = False,
+        mountain_height: float = 5.0,
+        valley_height: float = 0.0,
+        X0: Optional[np.ndarray] = None,
+        max_nfev_per_step: int = 5000,
+        tol: float = 1e-10,
+        residual_warning_tol: float = 1e-5,
+        verbose: bool = False,
+        print_metadata_summary: bool = False,
+        print_constraint_info: bool = False,
+        print_solve_report: bool = False,
+        print_dihedral_status: bool = False,
+        print_residual_warning: bool = False,
+        dihedral_status_max_items: int = 20,
+    ) -> dict:
+        """
+        Set up and solve a simple-hexagon model in one front-layer call.
+
+        The same start_dihedral is used to initialize the dihedral constraints
+        and to start continuation, so the setup target and solver start target
+        cannot drift apart accidentally.
+        """
+        if print_metadata_summary:
+            self.print_simple_hexagon_metadata_summary()
+
+        constraint_info = self.add_simple_hexagon_kinematic_constraints(
+            target_dihedral=start_dihedral,
+            unit=unit,
+            fixed_triangle_surface_id=fixed_triangle_surface_id,
+            valley_z=valley_z,
+            strict_unique_edges=strict_unique_edges,
+        )
+
+        if print_constraint_info:
+            print(constraint_info)
+
+        if X0 is None:
+            X0 = self.simple_hexagon_initial_guess(
+                mountain_height=mountain_height,
+                valley_height=valley_height,
+            )
+
+        report = self.solve_simple_hexagon_continuation(
+            final_dihedral=final_dihedral,
+            start_dihedral=start_dihedral,
+            steps=steps,
+            unit=unit,
+            X0=X0,
+            max_nfev_per_step=max_nfev_per_step,
+            tol=tol,
+            residual_warning_tol=residual_warning_tol,
+            verbose=verbose,
+        )
+
+        if print_solve_report:
+            self.print_solve_report(report)
+        if print_dihedral_status:
+            self.print_dihedral_signed_status(
+                max_items=dihedral_status_max_items,
+                unit=unit,
+            )
+        if print_residual_warning and report.max_abs_residual > residual_warning_tol:
+            print("WARNING: constraints are not sufficiently satisfied.")
+
+        return {
+            "constraint_info": constraint_info,
+            "report": report,
+        }
 
     def print_dihedral_signed_status(
         self,
