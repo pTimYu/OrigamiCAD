@@ -13,11 +13,11 @@ class CadVisualizationMixin:
 
     def draw(
         self,
-        show_points: bool = True,
-        show_point_ids: bool = True,
+        show_points: bool = False,
+        show_point_ids: bool = False,
         show_line_ids: bool = False,
         show_surface_ids: bool = False,
-        show_surfaces: bool = True,
+        show_surfaces: bool = False,
         equal_axis: bool = True,
         figsize: Tuple[float, float] = (8, 7),
         view: Tuple[float, float] = (25, -60),

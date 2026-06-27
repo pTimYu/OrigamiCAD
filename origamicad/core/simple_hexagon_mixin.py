@@ -341,6 +341,7 @@ class SimpleHexagonMixin:
                 update_model=True,
                 max_nfev=max_nfev_per_step,
                 tol=tol,
+                compute_rank=(k == steps - 1),
             )
             X = report.x.copy()
             last_report = report
@@ -375,7 +376,7 @@ class SimpleHexagonMixin:
         max_nfev_per_step: int = 5000,
         tol: float = 1e-10,
         residual_warning_tol: float = 1e-5,
-        verbose: bool = False,
+        verbose: bool = True,
         print_metadata_summary: bool = False,
         print_constraint_info: bool = False,
         print_solve_report: bool = False,

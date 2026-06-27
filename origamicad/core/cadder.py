@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Literal, Tuple
 import numpy as np
 from scipy.optimize import least_squares
+from scipy.sparse import csr_matrix
 from itertools import combinations
 
 from .simple_hexagon_mixin import SimpleHexagonMixin
@@ -59,8 +60,6 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
         2. storing constraints
         3. evaluating constraint residuals
         4. estimating local mobility by Jacobian rank
-
-    It does not yet solve a folded configuration.
     """
 
     def __init__(self, unit: str = "mm"):
@@ -1518,6 +1517,124 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
 
         return J
 
+    def constraint_jacobian_sparsity(self) -> csr_matrix:
+        """
+        Return the structural sparsity of the constraint Jacobian.
+
+        Each scalar residual only depends on a small subset of point
+        coordinates. Supplying this pattern to scipy.optimize.least_squares
+        lets SciPy use sparse finite differences instead of perturbing every
+        coordinate independently.
+        """
+        point_to_index = {pid: i for i, pid in enumerate(self.point_ids())}
+        n_vars = self.num_variables()
+        row_indices = []
+        col_indices = []
+        row = 0
+
+        def point_columns(point_ids: List[str], axes=(0, 1, 2)) -> list[int]:
+            cols = []
+            seen = set()
+
+            for pid in point_ids:
+                point_index = point_to_index[pid]
+                for axis in axes:
+                    col = 3 * point_index + axis
+                    if col not in seen:
+                        seen.add(col)
+                        cols.append(col)
+
+            return cols
+
+        def mark(rows: int, cols: list[int]) -> None:
+            nonlocal row
+
+            for local_row in range(rows):
+                for col in cols:
+                    row_indices.append(row + local_row)
+                    col_indices.append(col)
+
+            row += rows
+
+        def mark_horizontal_surface(surface_id: str) -> None:
+            nonlocal row
+            vertices = self._surface_vertices(surface_id)
+            z0_col = 3 * point_to_index[vertices[0]] + 2
+
+            for pid in vertices[1:]:
+                zi_col = 3 * point_to_index[pid] + 2
+                row_indices.extend([row, row])
+                col_indices.extend([z0_col, zi_col])
+                row += 1
+
+        def mark_surface_z_value(surface_id: str) -> None:
+            nonlocal row
+            vertices = self._surface_vertices(surface_id)
+
+            for pid in vertices:
+                row_indices.append(row)
+                col_indices.append(3 * point_to_index[pid] + 2)
+                row += 1
+
+        for constraint in self.constraints.values():
+            data = constraint.data
+
+            if constraint.kind == "fixed_point":
+                raise NotImplementedError(
+                    "fixed_point is implemented as three fixed_coordinate constraints."
+                )
+
+            if constraint.kind == "bar_length":
+                mark(1, point_columns([data["p1"], data["p2"]]))
+            elif constraint.kind == "fixed_coordinate":
+                axis = {"x": 0, "y": 1, "z": 2}[data["axis"]]
+                mark(1, point_columns([data["point"]], axes=(axis,)))
+            elif constraint.kind == "parallel_lines":
+                mark(
+                    3,
+                    point_columns([data["p1"], data["p2"], data["p3"], data["p4"]]),
+                )
+            elif constraint.kind in {
+                "dihedral_angle",
+                "dihedral_cos",
+                "dihedral_signed_increment",
+            }:
+                mark(
+                    1,
+                    point_columns(
+                        [
+                            data["edge_start"],
+                            data["edge_end"],
+                            data["point_left"],
+                            data["point_right"],
+                        ]
+                    ),
+                )
+            elif constraint.kind == "coplanar_points":
+                mark(
+                    1,
+                    point_columns([data["p1"], data["p2"], data["p3"], data["p4"]]),
+                )
+            elif constraint.kind == "parallel_surfaces":
+                vertices = (
+                    self._surface_vertices(data["surface1"])
+                    + self._surface_vertices(data["surface2"])
+                )
+                mark(3, point_columns(vertices))
+            elif constraint.kind == "horizontal_surface":
+                mark_horizontal_surface(data["surface"])
+            elif constraint.kind == "surface_z_value":
+                mark_surface_z_value(data["surface"])
+            else:
+                raise ValueError(f"Unknown constraint kind '{constraint.kind}'.")
+
+        data = np.ones(len(row_indices), dtype=bool)
+        return csr_matrix(
+            (data, (row_indices, col_indices)),
+            shape=(row, n_vars),
+            dtype=bool,
+        )
+
     def constraint_rank(
         self,
         tol: float = 1e-8,
@@ -1586,6 +1703,8 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
         rank_tol: float = 1e-8,
         max_nfev: int = 2000,
         verbose: int = 0,
+        use_jac_sparsity: bool = True,
+        compute_rank: bool = True,
     ) -> SolveReport:
         """
         Solve the nonlinear constraint system.
@@ -1610,6 +1729,14 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
                 0 -> silent
                 1 -> final report
                 2 -> iteration report
+            use_jac_sparsity:
+                If True, pass the constraint Jacobian sparsity pattern to
+                scipy. This usually accelerates large origami patterns because
+                each residual depends on only a few point coordinates.
+            compute_rank:
+                If False, skip Jacobian rank/mobility calculation in the
+                returned report. This is useful for intermediate continuation
+                steps where only the final rank is needed.
 
         Returns:
             SolveReport
@@ -1627,6 +1754,10 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
                 f"Expected X0 size {self.num_variables()}, but got {X0.size}."
             )
 
+        least_squares_kwargs = {}
+        if use_jac_sparsity:
+            least_squares_kwargs["jac_sparsity"] = self.constraint_jacobian_sparsity()
+
         result = least_squares(
             fun=lambda X: self.residual_vector(X),
             x0=X0,
@@ -1635,17 +1766,23 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
             gtol=tol,
             max_nfev=max_nfev,
             verbose=verbose,
+            **least_squares_kwargs,
         )
 
         residuals = self.residual_vector(result.x)
         residual_norm = float(np.linalg.norm(residuals))
         max_abs_residual = float(np.max(np.abs(residuals))) if residuals.size else 0.0
 
-        # SciPy already computed this Jacobian while solving. Recomputing it
-        # coordinate-by-coordinate made every continuation step need hundreds
-        # of redundant residual evaluations.
-        rank = int(np.linalg.matrix_rank(result.jac, tol=rank_tol))
-        mobility = self.num_variables() - rank
+        if compute_rank:
+            # SciPy already computed this Jacobian while solving. Recomputing it
+            # coordinate-by-coordinate made every continuation step need hundreds
+            # of redundant residual evaluations.
+            jacobian = result.jac.toarray() if hasattr(result.jac, "toarray") else result.jac
+            rank = int(np.linalg.matrix_rank(jacobian, tol=rank_tol))
+            mobility = self.num_variables() - rank
+        else:
+            rank = -1
+            mobility = -1
 
         if update_model:
             self.set_coordinate_vector(result.x)
