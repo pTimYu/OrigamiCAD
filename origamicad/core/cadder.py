@@ -1897,6 +1897,7 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
         include_rigid: bool = True,
         include_side: bool = True,
         point_tol: float = 1e-9,
+        profile: Literal["standard", "solidworks"] = "standard",
     ):
         """
         Project the current 3D structure to x-y and save it as DXF.
@@ -1908,6 +1909,7 @@ class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
             include_construction=include_construction,
             include_rigid=include_rigid,
             include_side=include_side,
+            profile=profile,
         )
 
     # ------------------------------------------------------------

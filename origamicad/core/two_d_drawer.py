@@ -654,6 +654,7 @@ class TwoDDrawer:
         include_construction: bool = False,
         include_rigid: bool = True,
         include_side: bool = True,
+        profile: Literal["standard", "solidworks"] = "standard",
     ) -> str:
         """
         Convert the current 2D metadata to an ASCII DXF string.
@@ -667,6 +668,7 @@ class TwoDDrawer:
             include_construction=include_construction,
             include_rigid=include_rigid,
             include_side=include_side,
+            profile=profile,
         )
 
     def save_dxf(
@@ -677,13 +679,16 @@ class TwoDDrawer:
         include_construction: bool = False,
         include_rigid: bool = True,
         include_side: bool = True,
+        profile: Literal["standard", "solidworks"] = "standard",
     ):
         """
         Save the current 2D pattern as a DXF file.
 
         Crease lines are exported on valley/mountain crease layers. Use
         crease_style="dashed" for dashed laser-cutting crease lines, or
-        include_creases=False to export only cut/rigid geometry.
+        include_creases=False to export only cut/rigid geometry. Use
+        profile="solidworks" for an R12-style inch-coordinate DXF that
+        SolidWorks/eDrawings imports at the same physical size.
         """
         from ..io.dxf_export import save_dxf
 
@@ -695,6 +700,7 @@ class TwoDDrawer:
             include_construction=include_construction,
             include_rigid=include_rigid,
             include_side=include_side,
+            profile=profile,
         )
 
     # ------------------------------------------------------------
