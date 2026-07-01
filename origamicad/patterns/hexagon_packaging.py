@@ -42,10 +42,6 @@ class HexUnit(TypedDict):
     local_creases: list[LocalCrease]
 
 
-def _mirror_x(coords: list[Coordinate], axis_x: float) -> list[Coordinate]:
-    return [(2.0 * axis_x - x, y) for x, y in coords]
-
-
 def hex_unit_chain(
     pattern: TwoDDrawer,
     start_point: Coordinate = (0.0, 0.0),
@@ -59,7 +55,7 @@ def hex_unit_chain(
         pattern:
             TwoDDrawer object.
         start_point:
-            Top-left point of the mirrored inner hexagonal void footprint.
+            Top-left point of the inner hexagonal void.
         l:
             Side length of the inner hexagonal void.
         count:
@@ -84,7 +80,6 @@ def hex_unit_chain(
         (x0, y0 - 2 * h),
         (x0 - 0.5 * l, y0 - h),
     ]
-    mid_coords = _mirror_x(mid_coords, axis_x=x0 + 0.5 * l)
 
     mid_ids: list[PointID] = []
     for i, (x, y) in enumerate(mid_coords):
@@ -117,7 +112,6 @@ def hex_unit_chain(
         (x0 - l, y0 - 2 * h),
         (x0 - 1.5 * l, y0 - h),
     ]
-    side_coords = _mirror_x(side_coords, axis_x=x0 + 0.5 * l)
 
     side_ids: list[PointID] = []
     for i, (x, y) in enumerate(side_coords):
@@ -336,7 +330,7 @@ def hexagon_packaging(
 
     units: list[HexUnit] = []
     for row in range(num_rows):
-        unit_x = float(x0) - 0.5 * l * row
+        unit_x = float(x0) + 0.5 * l * row
         unit_y = float(y0) - 3.0 * h * row
 
         for col in range(num_cols):
@@ -351,10 +345,10 @@ def hexagon_packaging(
                 )
 
             if col % 2 == 0:
-                unit_x -= 2.5 * l
+                unit_x += 2.5 * l
                 unit_y -= h
             else:
-                unit_x -= 2.0 * l
+                unit_x += 2.0 * l
                 unit_y += 2.0 * h
 
     pattern.hex_units = units
@@ -392,12 +386,12 @@ def draw_hex_two_loops(
 
     # Second loop: six surrounding unit chains
     second_loop_start_points: list[Coordinate] = [
-        (x0 + 0.5 * l, y0 + 3 * h),
-        (x0 - 2.0 * l, y0 + 2 * h),
-        (x0 - 2.5 * l, y0 - 1 * h),
-        (x0 - 0.5 * l, y0 - 3 * h),
-        (x0 + 2.0 * l, y0 - 2 * h),
-        (x0 + 2.5 * l, y0 + 1 * h),
+        (x0 - 0.5 * l, y0 + 3 * h),
+        (x0 + 2.0 * l, y0 + 2 * h),
+        (x0 + 2.5 * l, y0 - 1 * h),
+        (x0 + 0.5 * l, y0 - 3 * h),
+        (x0 - 2.0 * l, y0 - 2 * h),
+        (x0 - 2.5 * l, y0 + 1 * h),
     ]
 
     for count, sp in enumerate(second_loop_start_points, start=1):
