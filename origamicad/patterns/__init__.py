@@ -1,5 +1,15 @@
-"""Reusable crease-pattern generators and pattern-specific solvers."""
+"""Reusable crease-pattern generators and pattern-specific operations."""
 
-from .hexagon import build_packaging, solve_kinematics
+from .hexagon import (
+    analytical_layer_height,
+    build_packaging,
+    solve_kinematics,
+    stack_layers,
+)
 
-__all__ = ["build_packaging", "solve_kinematics"]
+__all__ = [
+    "analytical_layer_height",
+    "build_packaging",
+    "solve_kinematics",
+    "stack_layers",
+]
