@@ -8,7 +8,6 @@ from scipy.optimize import least_squares
 from scipy.sparse import csr_matrix
 from itertools import combinations
 
-from .simple_hexagon_mixin import SimpleHexagonMixin
 from .visualization import CadVisualizationMixin
 
 ConstraintKind = Literal[
@@ -51,7 +50,7 @@ class SolveReport:
     mobility: int
     x: np.ndarray
 
-class Cadder(CadVisualizationMixin, SimpleHexagonMixin):
+class Cadder(CadVisualizationMixin):
     """
     Constraint-based kinematic model for origami/cellular structures.
 

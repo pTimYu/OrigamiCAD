@@ -1,3 +1,5 @@
-"""Reusable crease-pattern generators."""
+"""Reusable crease-pattern generators and pattern-specific solvers."""
 
-__all__ = ["hexagon_packaging"]
+from .hexagon import build_packaging, solve_kinematics
+
+__all__ = ["build_packaging", "solve_kinematics"]

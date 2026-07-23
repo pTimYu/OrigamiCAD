@@ -1,13 +1,10 @@
-"""Example: solve, project, and export a simple-hexagon origami structure.
+"""Generate and draw the two-loop hexagon crease pattern.
 
 Run from the project root:
 
-    python -m examples.simple_hexagon
+    python -m examples.simple_hexagon_example_2d
 
 You can also run this file directly from an IDE.
-
-Generated JSON/DXF/STEP files are written to ``examples/output/`` and ignored
-by git through `.gitignore`.
 """
 
 from pathlib import Path
@@ -18,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import TwoDDrawer
-from origamicad.patterns.hexagon_packaging import draw_hex_two_loops
+from origamicad.patterns.hexagon import draw_hex_two_loops
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 

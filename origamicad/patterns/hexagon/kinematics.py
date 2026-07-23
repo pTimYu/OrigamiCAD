@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from typing import Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
 
 import numpy as np
 
+if TYPE_CHECKING:
+    from ...core.cadder import Cadder, SolveReport
 
-class SimpleHexagonMixin:
-    """Simple-hexagon specific setup, continuation, and diagnostics."""
+
+class _HexagonKinematics:
+    """Pattern-specific kinematic operations for a hexagon model."""
+
+    def __init__(self, model: Cadder):
+        self._model = model
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate generic geometry and solver operations to the Cadder."""
+        return getattr(self._model, name)
 
     def _triangle_surface_ids(self) -> list[str]:
         return [
@@ -14,7 +24,7 @@ class SimpleHexagonMixin:
             if len(self._surface_vertices(sid)) == 3
         ]
 
-    def add_simple_hexagon_dihedral_constraints_from_metadata(
+    def _add_dihedral_constraints_from_metadata(
         self,
         target_dihedral: float = 110.0,
         unit: Literal["rad", "deg"] = "deg",
@@ -22,8 +32,8 @@ class SimpleHexagonMixin:
     ) -> dict:
         if not self.hex_units:
             raise ValueError(
-                "No hex-unit metadata found. Make sure simple_hexagon.py stores "
-                "pattern.hex_units before creating the Cadder model."
+                "No hex-unit metadata found. Build the pattern with "
+                "build_packaging() before creating the Cadder model."
             )
 
         if valley_sign not in {+1, -1}:
@@ -111,7 +121,7 @@ class SimpleHexagonMixin:
             "duplicate": duplicate,
         }
 
-    def add_simple_hexagon_kinematic_constraints(
+    def _add_kinematic_constraints(
         self,
         target_dihedral: float = 110.0,
         unit: Literal["rad", "deg"] = "deg",
@@ -127,7 +137,7 @@ class SimpleHexagonMixin:
 
         valley_triangle_ids = [
             sid for sid in triangle_ids
-            if self.triangle_crease_kind(sid) == "valley"
+            if self._triangle_crease_kind(sid) == "valley"
         ]
 
         fixed_triangle_surface_id = fixed_triangle_surface_id or (
@@ -138,7 +148,7 @@ class SimpleHexagonMixin:
                 f"Fixed surface '{fixed_triangle_surface_id}' is not a triangle."
             )
 
-        fixed_kind = self.triangle_crease_kind(fixed_triangle_surface_id)
+        fixed_kind = self._triangle_crease_kind(fixed_triangle_surface_id)
         if valley_triangle_ids and fixed_kind != "valley":
             raise ValueError(
                 f"Fixed surface '{fixed_triangle_surface_id}' is {fixed_kind}, "
@@ -153,14 +163,14 @@ class SimpleHexagonMixin:
                 tri_id,
                 constraint_id=f"horizontal_{tri_id}",
             )
-            if self.triangle_crease_kind(tri_id) == "valley":
+            if self._triangle_crease_kind(tri_id) == "valley":
                 self.add_surface_z_value_constraint(
                     tri_id,
                     z_value=valley_z,
                     constraint_id=f"valley_z_{tri_id}",
                 )
 
-        dihedral_info = self.add_simple_hexagon_dihedral_constraints_from_metadata(
+        dihedral_info = self._add_dihedral_constraints_from_metadata(
             target_dihedral=target_dihedral,
             unit=unit,
         )
@@ -183,7 +193,7 @@ class SimpleHexagonMixin:
             "duplicate_dihedral_constraints": dihedral_info["duplicate"],
         }
 
-    def find_line_by_points(self, p1: str, p2: str) -> Optional[str]:
+    def _find_line_by_points(self, p1: str, p2: str) -> Optional[str]:
         target = {p1, p2}
 
         for line_id in self.lines:
@@ -193,7 +203,7 @@ class SimpleHexagonMixin:
 
         return None
 
-    def triangle_crease_kind(self, surface_id: str) -> Optional[str]:
+    def _triangle_crease_kind(self, surface_id: str) -> Optional[str]:
         vertices = self._surface_vertices(surface_id)
         if len(vertices) != 3:
             raise ValueError(f"Surface '{surface_id}' is not a triangle.")
@@ -201,7 +211,7 @@ class SimpleHexagonMixin:
         crease_kinds = []
         for i, a in enumerate(vertices):
             b = vertices[(i + 1) % 3]
-            line_id = self.find_line_by_points(a, b)
+            line_id = self._find_line_by_points(a, b)
             if line_id is None:
                 continue
 
@@ -220,7 +230,7 @@ class SimpleHexagonMixin:
             f"{crease_kinds}."
         )
 
-    def find_unique_triangle_quad_pair_adjacent_to_edge(
+    def _find_unique_triangle_quad_pair_adjacent_to_edge(
         self,
         p1: str,
         p2: str,
@@ -239,7 +249,7 @@ class SimpleHexagonMixin:
             return triangle_ids[0], quad_ids[0]
         return None
 
-    def simple_hexagon_initial_guess(
+    def _initial_guess(
         self,
         mountain_height: float = 5.0,
         valley_height: float = 0.0,
@@ -249,7 +259,7 @@ class SimpleHexagonMixin:
         proposed_z = {}
 
         for surface_id in self._triangle_surface_ids():
-            kind = self.triangle_crease_kind(surface_id)
+            kind = self._triangle_crease_kind(surface_id)
             if kind not in {"valley", "mountain"}:
                 continue
 
@@ -268,9 +278,9 @@ class SimpleHexagonMixin:
 
         return X0
 
-    def print_simple_hexagon_metadata_summary(self) -> None:
-        print("Simple hexagon metadata summary")
-        print("-------------------------------")
+    def _print_metadata_summary(self) -> None:
+        print("Hexagon metadata summary")
+        print("------------------------")
 
         if not self.hex_units:
             print("No hex-unit metadata found.")
@@ -298,7 +308,7 @@ class SimpleHexagonMixin:
         print(f"Total quads:         {totals['quads']}")
         print(f"Total local creases: {totals['creases']}")
 
-    def update_simple_hexagon_dihedral_target(
+    def _update_dihedral_target(
         self,
         target_dihedral: float,
         unit: Literal["rad", "deg"] = "deg",
@@ -314,7 +324,7 @@ class SimpleHexagonMixin:
                     constraint.data["sign"] * fold_amount
                 )
 
-    def solve_simple_hexagon_continuation(
+    def _solve_continuation(
         self,
         final_dihedral: float = 110.0,
         start_dihedral: float = 175.0,
@@ -335,7 +345,7 @@ class SimpleHexagonMixin:
         last_report = None
 
         for k, theta in enumerate(np.linspace(start_dihedral, final_dihedral, steps)):
-            self.update_simple_hexagon_dihedral_target(theta, unit=unit)
+            self._update_dihedral_target(theta, unit=unit)
             report = self.solve(
                 X0=X,
                 update_model=True,
@@ -361,7 +371,7 @@ class SimpleHexagonMixin:
 
         return last_report
 
-    def solve_simple_hexagon_kinematics(
+    def solve_kinematics(
         self,
         final_dihedral: float = 110.0,
         start_dihedral: float = 175.0,
@@ -392,9 +402,9 @@ class SimpleHexagonMixin:
         cannot drift apart accidentally.
         """
         if print_metadata_summary:
-            self.print_simple_hexagon_metadata_summary()
+            self._print_metadata_summary()
 
-        constraint_info = self.add_simple_hexagon_kinematic_constraints(
+        constraint_info = self._add_kinematic_constraints(
             target_dihedral=start_dihedral,
             unit=unit,
             fixed_triangle_surface_id=fixed_triangle_surface_id,
@@ -406,12 +416,12 @@ class SimpleHexagonMixin:
             print(constraint_info)
 
         if X0 is None:
-            X0 = self.simple_hexagon_initial_guess(
+            X0 = self._initial_guess(
                 mountain_height=mountain_height,
                 valley_height=valley_height,
             )
 
-        report = self.solve_simple_hexagon_continuation(
+        report = self._solve_continuation(
             final_dihedral=final_dihedral,
             start_dihedral=start_dihedral,
             steps=steps,
@@ -426,7 +436,7 @@ class SimpleHexagonMixin:
         if print_solve_report:
             self.print_solve_report(report)
         if print_dihedral_status:
-            self.print_dihedral_signed_status(
+            self._print_dihedral_status(
                 max_items=dihedral_status_max_items,
                 unit=unit,
             )
@@ -438,7 +448,7 @@ class SimpleHexagonMixin:
             "report": report,
         }
 
-    def print_dihedral_signed_status(
+    def _print_dihedral_status(
         self,
         max_items: int = 20,
         unit: Literal["rad", "deg"] = "deg",
@@ -496,3 +506,55 @@ class SimpleHexagonMixin:
                 f"{dihedral:12.4f} {target:12.4f} "
                 f"{fold:12.4f} {residual:12.4f}"
             )
+
+
+def solve_kinematics(
+    model: Cadder,
+    final_dihedral: float = 110.0,
+    start_dihedral: float = 175.0,
+    steps: int = 14,
+    unit: Literal["rad", "deg"] = "deg",
+    fixed_triangle_surface_id: Optional[str] = None,
+    valley_z: float = 0.0,
+    strict_unique_edges: bool = False,
+    mountain_height: float = 5.0,
+    valley_height: float = 0.0,
+    X0: Optional[np.ndarray] = None,
+    max_nfev_per_step: int = 5000,
+    tol: float = 1e-10,
+    residual_warning_tol: float = 1e-5,
+    verbose: bool = True,
+    print_metadata_summary: bool = False,
+    print_constraint_info: bool = False,
+    print_solve_report: bool = False,
+    print_dihedral_status: bool = False,
+    print_residual_warning: bool = False,
+    dihedral_status_max_items: int = 20,
+) -> dict:
+    """Add hexagon constraints and solve a generated pattern in 3D."""
+    return _HexagonKinematics(model).solve_kinematics(
+        final_dihedral=final_dihedral,
+        start_dihedral=start_dihedral,
+        steps=steps,
+        unit=unit,
+        fixed_triangle_surface_id=fixed_triangle_surface_id,
+        valley_z=valley_z,
+        strict_unique_edges=strict_unique_edges,
+        mountain_height=mountain_height,
+        valley_height=valley_height,
+        X0=X0,
+        max_nfev_per_step=max_nfev_per_step,
+        tol=tol,
+        residual_warning_tol=residual_warning_tol,
+        verbose=verbose,
+        print_metadata_summary=print_metadata_summary,
+        print_constraint_info=print_constraint_info,
+        print_solve_report=print_solve_report,
+        print_dihedral_status=print_dihedral_status,
+        print_residual_warning=print_residual_warning,
+        dihedral_status_max_items=dihedral_status_max_items,
+    )
+
+
+# Compatibility name for code that imported the old solver operation directly.
+solve_simple_hexagon_kinematics = solve_kinematics

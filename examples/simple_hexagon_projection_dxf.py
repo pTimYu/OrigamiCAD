@@ -6,7 +6,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import Cadder, TwoDDrawer
-from origamicad.patterns.hexagon_packaging import draw_hex_two_loops
+from origamicad.patterns.hexagon import draw_hex_two_loops, solve_kinematics
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -23,7 +23,8 @@ def main() -> None:
 
     model = Cadder.from_drawer(pattern)
 
-    model.solve_simple_hexagon_kinematics(
+    solve_kinematics(
+        model,
         final_dihedral=150.0,
         start_dihedral=175.0,
         steps=4,

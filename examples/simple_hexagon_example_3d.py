@@ -1,8 +1,8 @@
-"""Interactive simple-hexagon example.
+"""Generate and solve the two-loop hexagon pattern in 3D.
 
 Run from the project root:
 
-    python -m examples.interactive_simple_hexagon
+    python -m examples.simple_hexagon_example_3d
 
 You can also run this file directly from an IDE.
 """
@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import Cadder, TwoDDrawer
-from origamicad.patterns.hexagon_packaging import draw_hex_two_loops
+from origamicad.patterns.hexagon import draw_hex_two_loops, solve_kinematics
 from origamicad.io.cad_export import save_cad
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -24,14 +24,15 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
     draw_hex_two_loops(
-    pattern,
-    start_point=(0, 0),
-    l=15,
+        pattern,
+        start_point=(0, 0),
+        l=15,
     )
 
     model = Cadder.from_drawer(pattern)
 
-    model.solve_simple_hexagon_kinematics(
+    solve_kinematics(
+        model,
         final_dihedral=135.0,
         start_dihedral=175.0,
         steps=4,

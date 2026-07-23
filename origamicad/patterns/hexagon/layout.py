@@ -1,45 +1,17 @@
 from __future__ import annotations
 
-from typing import Literal, TypeAlias, TypedDict
-
 import numpy as np
 
-from origamicad.core.two_d_drawer import TwoDDrawer
-
-
-Coordinate: TypeAlias = tuple[float, float]
-PointID: TypeAlias = str
-SurfaceID: TypeAlias = str
-CreaseKind: TypeAlias = Literal["mountain", "valley"]
-CreaseSide: TypeAlias = Literal["previous_quad", "current_quad"]
-
-
-class TriangleKind(TypedDict):
-    surface: SurfaceID
-    kind: CreaseKind
-    local_index: int
-    unit: int
-
-
-class LocalCrease(TypedDict):
-    unit: int
-    local_index: int
-    edge: list[PointID]
-    triangle: SurfaceID
-    quad: SurfaceID
-    kind: CreaseKind
-    side: CreaseSide
-
-
-class HexUnit(TypedDict):
-    count: int
-    mid: list[PointID]
-    side: list[PointID]
-    triangles: list[SurfaceID]
-    parallelograms: list[SurfaceID]
-    surfaces: list[SurfaceID]
-    triangle_kinds: list[TriangleKind]
-    local_creases: list[LocalCrease]
+from ...core.two_d_drawer import TwoDDrawer
+from .metadata import (
+    Coordinate,
+    CreaseKind,
+    HexUnit,
+    LocalCrease,
+    PointID,
+    SurfaceID,
+    TriangleKind,
+)
 
 
 def hex_unit_chain(
@@ -359,6 +331,11 @@ def hexagon_packaging(
 
     pattern.hex_units = units
     return units
+
+
+# Clearer public name. Keep ``hexagon_packaging`` as a compatibility alias for
+# existing callers and for readers familiar with the original API.
+build_packaging = hexagon_packaging
 
 
 def draw_hex_two_loops(
