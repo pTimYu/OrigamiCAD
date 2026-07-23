@@ -47,6 +47,7 @@ def hex_unit_chain(
     start_point: Coordinate = (0.0, 0.0),
     l: float = 15.0,
     count: int = 1,
+    reverse: bool = False,
 ) -> HexUnit:
     """
     Automatically draw one hexagon unit chain.
@@ -60,6 +61,8 @@ def hex_unit_chain(
             Side length of the inner hexagonal void.
         count:
             Unit chain index, used for point/surface names.
+        reverse:
+            If True, exchange every mountain crease with a valley crease.
 
     Output:
         Dictionary containing point IDs and surface IDs.
@@ -67,6 +70,12 @@ def hex_unit_chain(
 
     x0, y0 = start_point
     h: float = float(l * np.sqrt(3) / 2)
+    even_kind: CreaseKind = "valley" if reverse else "mountain"
+    odd_kind: CreaseKind = "mountain" if reverse else "valley"
+    crease_kinds: list[CreaseKind] = [
+        even_kind if i % 2 == 0 else odd_kind
+        for i in range(6)
+    ]
 
     # ------------------------------------------------------------
     # Inner hexagonal void points
@@ -131,10 +140,7 @@ def hex_unit_chain(
         )
 
         # Creases from outer points to inner void point
-        if i % 2 == 0:
-            crease_kind: CreaseKind = "mountain"
-        else:
-            crease_kind = "valley"
+        crease_kind = crease_kinds[i]
 
         pattern.add_line(
             side_ids[2 * i],
@@ -231,7 +237,7 @@ def hex_unit_chain(
     triangle_kinds: list[TriangleKind] = []
 
     for i in range(6):
-        crease_kind: CreaseKind = "mountain" if i % 2 == 0 else "valley"
+        crease_kind = crease_kinds[i]
 
         triangle_kinds.append(
             {
@@ -359,11 +365,15 @@ def draw_hex_two_loops(
     pattern: TwoDDrawer,
     start_point: Coordinate = (0.0, 0.0),
     l: float = 15.0,
+    reverse: bool = False,
 ) -> list[HexUnit]:
     """
     Draw one central hexagon unit chain and six surrounding unit chains.
 
     This version uses overlapping-panel placement.
+
+    Set ``reverse=True`` to exchange all mountain and valley crease labels.
+    The line geometry and the local kinematic metadata are reversed together.
 
     The function also stores local unit-chain metadata in:
 
@@ -381,6 +391,7 @@ def draw_hex_two_loops(
         start_point=(x0, y0),
         l=l,
         count=0,
+        reverse=reverse,
     )
     units.append(unit)
 
@@ -400,6 +411,7 @@ def draw_hex_two_loops(
             start_point=sp,
             l=l,
             count=count,
+            reverse=reverse,
         )
         units.append(unit)
 
