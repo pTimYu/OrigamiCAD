@@ -23,29 +23,6 @@ class LayerStackResult(TypedDict):
     max_interface_error: float
 
 
-def analytical_layer_height(
-    panel_distance: float,
-    dihedral_angle: float,
-    unit: Literal["rad", "deg"] = "deg",
-) -> float:
-    """Return ``d*sin(pi-theta)`` for one folded hexagon layer."""
-    panel_distance = float(panel_distance)
-    if not np.isfinite(panel_distance) or panel_distance <= 0.0:
-        raise ValueError("panel_distance must be a finite positive value.")
-
-    if unit == "deg":
-        theta = float(np.deg2rad(dihedral_angle))
-    elif unit == "rad":
-        theta = float(dihedral_angle)
-    else:
-        raise ValueError("unit must be 'deg' or 'rad'.")
-
-    if not np.isfinite(theta) or not (0.0 < theta < np.pi):
-        raise ValueError("dihedral_angle must be between 0 and 180 degrees.")
-
-    return float(panel_distance * np.sin(np.pi - theta))
-
-
 def _triangle_surface_ids(
     model: Cadder,
     kind: CreaseKind,
@@ -148,7 +125,9 @@ def layer_panel_levels(
 def stack_layers(
     model: Cadder,
     num_layers: int = 4,
-    expected_layer_height: Optional[float] = None,
+    panel_distance: Optional[float] = None,
+    dihedral_angle: Optional[float] = None,
+    unit: Literal["rad", "deg"] = "deg",
     tolerance: float = 1e-6,
 ) -> LayerStackResult:
     """
@@ -160,6 +139,10 @@ def stack_layers(
 
     The returned assembly intentionally contains no kinematic constraints:
     stacking is a post-solve geometry operation.
+
+    If ``panel_distance`` and ``dihedral_angle`` are supplied, the expected
+    height is calculated as ``d*sin(pi-theta)`` and checked against the solved
+    mountain-to-valley height. Supply both options together or omit both.
     """
     if isinstance(num_layers, bool) or int(num_layers) != num_layers:
         raise ValueError("num_layers must be an integer.")
@@ -180,15 +163,32 @@ def stack_layers(
             f"the stacking tolerance ({tolerance})."
         )
 
-    if expected_layer_height is not None:
-        expected_layer_height = float(expected_layer_height)
-        if (
-            not np.isfinite(expected_layer_height)
-            or expected_layer_height <= 0.0
-        ):
+    if (panel_distance is None) != (dihedral_angle is None):
+        raise ValueError(
+            "panel_distance and dihedral_angle must be supplied together."
+        )
+
+    expected_layer_height = None
+    if panel_distance is not None and dihedral_angle is not None:
+        panel_distance = float(panel_distance)
+        if not np.isfinite(panel_distance) or panel_distance <= 0.0:
+            raise ValueError("panel_distance must be a finite positive value.")
+
+        if unit == "deg":
+            theta = float(np.deg2rad(dihedral_angle))
+        elif unit == "rad":
+            theta = float(dihedral_angle)
+        else:
+            raise ValueError("unit must be 'deg' or 'rad'.")
+
+        if not np.isfinite(theta) or not (0.0 < theta < np.pi):
             raise ValueError(
-                "expected_layer_height must be a finite positive value."
+                "dihedral_angle must be between 0 and 180 degrees."
             )
+
+        expected_layer_height = float(
+            panel_distance * np.sin(np.pi - theta)
+        )
         if abs(layer_height - expected_layer_height) > tolerance:
             raise ValueError(
                 "The solved layer height does not match the expected height: "

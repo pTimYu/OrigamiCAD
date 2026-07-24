@@ -10,7 +10,6 @@ from .layout import (
 from .metadata import HexUnit
 from .stacking import (
     LayerStackResult,
-    analytical_layer_height,
     layer_panel_levels,
     stack_layers,
     stack_simple_hexagon_layers,
@@ -19,7 +18,6 @@ from .stacking import (
 __all__ = [
     "HexUnit",
     "LayerStackResult",
-    "analytical_layer_height",
     "build_packaging",
     "draw_hex_two_loops",
     "hex_unit_chain",

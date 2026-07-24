@@ -21,7 +21,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from origamicad import Cadder, TwoDDrawer
 from origamicad.io.cad_export import save_cad
 from origamicad.patterns.hexagon import (
-    analytical_layer_height,
     draw_hex_two_loops,
     solve_kinematics,
     stack_layers,
@@ -63,15 +62,12 @@ def main() -> None:
     # d is the perpendicular distance between the two parallel crease axes
     # across a quadrilateral panel.
     d = SIDE_LENGTH * np.sqrt(3.0) / 2.0
-    expected_layer_height = analytical_layer_height(
-        panel_distance=d,
-        dihedral_angle=TARGET_DIHEDRAL_DEG,
-        unit="deg",
-    )
     stack = stack_layers(
         base_model,
         num_layers=NUM_LAYERS,
-        expected_layer_height=expected_layer_height,
+        panel_distance=d,
+        dihedral_angle=TARGET_DIHEDRAL_DEG,
+        unit="deg",
         tolerance=1e-6 * max(1.0, SIDE_LENGTH),
     )
     assembly = stack["model"]
@@ -80,7 +76,10 @@ def main() -> None:
     output_path = OUTPUT_DIR / "simple_hexagon_four_layer_stack.step"
     save_cad(assembly, output_path)
 
-    print(f"Analytical layer height: {expected_layer_height:.6f} mm")
+    print(
+        "Analytical layer height: "
+        f"{stack['expected_layer_height']:.6f} mm"
+    )
     print(f"Solved layer height:     {stack['layer_height']:.6f} mm")
     print(f"Maximum interface error: {stack['max_interface_error']:.3e} mm")
     print(f"Saved four-layer stack:  {output_path}")
