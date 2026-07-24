@@ -1,21 +1,20 @@
-"""Contact-limited two-loop insertion simulation for the hexagon pattern.
+"""Sequential contact/snap insertion simulation for the hexagon pattern.
 
-The reference configuration is obtained by holding the central unit chain in
-its obtuse ``O3`` branch while all six surrounding sectors fold inward.  Shared
-hinges remain obtuse, so every surrounding unit chain is locally in the
-paper's lockable ``A2O`` mode.  In the six-bit representation this is mask
-``111111``.
+The default configuration labels physical parallelograms using insertion-only
+metadata.  The innermost ring is ``contact``.  Each later ring is processed
+once, from inner to outer: connection panels are ``snap``; panels sharing a
+connection panel's outward triangle are ``contact``; all remaining panels are
+``snap``.  Contact panels use the requested inner dihedral and snap panels use
+its supplement.
 
-For the implemented N=6 geometry with ``a = b`` and ``phi = 60 degrees``, the
-first panel-contact angle follows Eq. (2) of Jamalimehr et al.:
+The older regular six-sector mask search remains available through
+``assignment_mode="regular_masks"``.  For its all-acute mask and the
+implemented N=6 geometry with ``a = b`` and ``phi = 60 degrees``, the first
+panel-contact angle follows Eq. (2) of Jamalimehr et al.:
 
 ``A_lock = acos(cot(phi) * tan(pi / N)) = acos(1 / 3)``.
 
-Consequently, requesting an inner obtuse angle beyond
-``O_lock = 180 degrees - A_lock`` is geometrically impossible without panel
-interpenetration.  The simulation stops immediately before that analytical
-contact state, reports the requested and realized angles separately, and
-checks all non-adjacent panels for clipping.
+Every returned state is checked for non-adjacent panel clipping.
 
 There is no runnable entry point in this module.  The example program lives in
 ``main/simple_hexagon_insertion.py``.
@@ -23,6 +22,7 @@ There is no runnable entry point in this module.  The example program lives in
 
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from itertools import combinations
 from pathlib import Path
 from typing import Literal, Sequence, TypedDict
@@ -41,10 +41,44 @@ from .layout import draw_hex_two_loops
 from .stacking import stack_layers
 
 
+DEFAULT_CONTACT_ANGLE_BUFFER_DEG = 1e-3
+HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG = float(
+    np.rad2deg(np.arccos(1.0 / 3.0))
+)
+HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG = (
+    180.0 - HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG
+)
+DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG = (
+    HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG
+    - DEFAULT_CONTACT_ANGLE_BUFFER_DEG
+)
+# Backward-compatible alias. This is only the mask-111111 limit; mixed masks
+# can remain non-clipping at larger inner angles.
+DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG = (
+    DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG
+)
 DEFAULT_SIDE_LENGTH = 15.0
 DEFAULT_INNER_DIHEDRAL_DEG = 150.0
 DEFAULT_NUM_LAYERS = 4
-DEFAULT_CONTACT_ANGLE_BUFFER_DEG = 1e-3
+
+
+PanelState = Literal["contact", "snap"]
+PanelStateSource = Literal[
+    "inner",
+    "connection",
+    "same_outer_triangle",
+    "remaining",
+]
+
+
+class InsertionPanelState(TypedDict):
+    """Insertion-only state assigned to one physical parallelogram."""
+
+    surface_id: str
+    ring_index: int
+    state: PanelState
+    source: PanelStateSource
+    adjacent_triangle_ids: tuple[str, ...]
 
 
 class LoopDihedralStats(TypedDict):
@@ -86,6 +120,7 @@ class InsertionSimulationResult(TypedDict):
         "compact_nonclipping",
     ]
     reason: str
+    assignment_mode: Literal["panel_sequence", "regular_masks"]
     requested_inner_deg: float
     realized_inner_deg: float
     requested_angle_reached: bool
@@ -115,8 +150,17 @@ class InsertionSimulationResult(TypedDict):
     crease_loop_by_edge: dict[tuple[str, str], Literal["inner", "outer"]]
     crease_assignment_by_edge: dict[
         tuple[str, str],
-        Literal["inner-obtuse", "outer-acute", "outer-obtuse"],
+        Literal[
+            "contact",
+            "snap",
+            "inner-obtuse",
+            "outer-acute",
+            "outer-obtuse",
+        ],
     ]
+    panel_states: dict[str, InsertionPanelState]
+    contact_panel_ids: frozenset[str]
+    snap_panel_ids: frozenset[str]
     inner_surface_ids: frozenset[str]
     loop_dihedrals: list[LoopDihedralStats]
     mode_group_constraint_ids: tuple[tuple[str, ...], ...]
@@ -144,17 +188,10 @@ def _validate_angle(
 
 def _hexagon_lock_dihedral_pair() -> tuple[float, float]:
     """Return the analytical acute/obtuse first-contact pair for N=6."""
-    primitive_sides = 6
-    extrusion_angle = np.deg2rad(60.0)
-    acute = float(
-        np.rad2deg(
-            np.arccos(
-                (1.0 / np.tan(extrusion_angle))
-                * np.tan(np.pi / primitive_sides)
-            )
-        )
+    return (
+        HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG,
+        HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG,
     )
-    return acute, 180.0 - acute
 
 
 def _classify_spatial_hinges(
@@ -342,6 +379,254 @@ def _classify_outer_mode_groups(
     return tuple(free_components)
 
 
+def classify_insertion_panel_states(
+    pattern: TwoDDrawer,
+) -> dict[str, InsertionPanelState]:
+    """Propagate contact/snap parallelogram states from inner to outer.
+
+    This metadata belongs only to the insertion workflow.  Unit-chain rings
+    are found by breadth-first traversal from unit 0.  A physical surface is
+    owned by the innermost ring containing it, so processing a later ring can
+    never rewrite a state already assigned to an inner ring.
+
+    Ring 0 starts with every parallelogram in ``contact``.  In each later ring:
+
+    * a parallelogram adjacent to a triangle owned by an inner ring is a
+      ``snap`` connection panel;
+    * other panels sharing the connection panel's outward triangle are
+      ``contact`` panels;
+    * all remaining panels in that ring are ``snap`` panels.
+    """
+    if not pattern.hex_units:
+        raise ValueError(
+            "No hex-unit metadata found for insertion panel propagation."
+        )
+
+    units_by_count = {
+        int(unit["count"]): unit
+        for unit in pattern.hex_units
+    }
+    if len(units_by_count) != len(pattern.hex_units):
+        raise ValueError("Hex-unit counts must be unique.")
+    if 0 not in units_by_count:
+        raise ValueError("Insertion propagation requires innermost unit 0.")
+
+    surface_units: dict[str, set[int]] = defaultdict(set)
+    for unit_count, unit in units_by_count.items():
+        for surface_id in unit["surfaces"]:
+            surface_units[surface_id].add(unit_count)
+
+    unit_neighbors: dict[int, set[int]] = defaultdict(set)
+    for unit_counts in surface_units.values():
+        for unit_count in unit_counts:
+            unit_neighbors[unit_count].update(
+                unit_counts - {unit_count}
+            )
+
+    unit_ring_by_count = {0: 0}
+    queue: deque[int] = deque([0])
+    while queue:
+        unit_count = queue.popleft()
+        for neighbor in sorted(unit_neighbors[unit_count]):
+            if neighbor in unit_ring_by_count:
+                continue
+            unit_ring_by_count[neighbor] = (
+                unit_ring_by_count[unit_count] + 1
+            )
+            queue.append(neighbor)
+    missing_units = set(units_by_count) - set(unit_ring_by_count)
+    if missing_units:
+        raise ValueError(
+            "Hex-unit insertion topology is disconnected; unreachable units: "
+            f"{sorted(missing_units)}."
+        )
+
+    surface_ring = {
+        surface_id: min(
+            unit_ring_by_count[unit_count]
+            for unit_count in unit_counts
+        )
+        for surface_id, unit_counts in surface_units.items()
+    }
+    parallelogram_ids = {
+        surface_id
+        for unit in pattern.hex_units
+        for surface_id in unit["parallelograms"]
+    }
+    quad_triangles: dict[str, set[str]] = defaultdict(set)
+    for unit in pattern.hex_units:
+        for crease in unit["local_creases"]:
+            quad_triangles[crease["quad"]].add(crease["triangle"])
+
+    states: dict[str, InsertionPanelState] = {}
+
+    def assign(
+        surface_id: str,
+        *,
+        ring_index: int,
+        state: PanelState,
+        source: PanelStateSource,
+    ) -> None:
+        previous = states.get(surface_id)
+        if previous is not None:
+            if (
+                previous["ring_index"] != ring_index
+                or previous["state"] != state
+                or previous["source"] != source
+            ):
+                raise RuntimeError(
+                    "Insertion propagation attempted to rewrite panel "
+                    f"'{surface_id}' from {previous} to "
+                    f"ring={ring_index}, state={state}, source={source}."
+                )
+            return
+        states[surface_id] = {
+            "surface_id": surface_id,
+            "ring_index": ring_index,
+            "state": state,
+            "source": source,
+            "adjacent_triangle_ids": tuple(
+                sorted(quad_triangles[surface_id])
+            ),
+        }
+
+    for surface_id in sorted(parallelogram_ids):
+        if surface_ring[surface_id] == 0:
+            assign(
+                surface_id,
+                ring_index=0,
+                state="contact",
+                source="inner",
+            )
+
+    maximum_ring = max(unit_ring_by_count.values())
+    for ring_index in range(1, maximum_ring + 1):
+        ring_panels = {
+            surface_id
+            for surface_id in parallelogram_ids
+            if surface_ring[surface_id] == ring_index
+        }
+        connection_panels = {
+            surface_id
+            for surface_id in ring_panels
+            if any(
+                surface_ring[triangle_id] < ring_index
+                for triangle_id in quad_triangles[surface_id]
+            )
+        }
+        if ring_panels and not connection_panels:
+            raise RuntimeError(
+                f"Insertion ring {ring_index} has no connection panels."
+            )
+        for surface_id in sorted(connection_panels):
+            assign(
+                surface_id,
+                ring_index=ring_index,
+                state="snap",
+                source="connection",
+            )
+
+        same_triangle_panels: set[str] = set()
+        for connection_id in connection_panels:
+            outward_triangles = {
+                triangle_id
+                for triangle_id in quad_triangles[connection_id]
+                if surface_ring[triangle_id] == ring_index
+            }
+            for triangle_id in outward_triangles:
+                same_triangle_panels.update(
+                    surface_id
+                    for surface_id in ring_panels
+                    if (
+                        surface_id not in connection_panels
+                        and triangle_id
+                        in quad_triangles[surface_id]
+                    )
+                )
+        for surface_id in sorted(same_triangle_panels):
+            assign(
+                surface_id,
+                ring_index=ring_index,
+                state="contact",
+                source="same_outer_triangle",
+            )
+
+        remaining_panels = (
+            ring_panels - connection_panels - same_triangle_panels
+        )
+        for surface_id in sorted(remaining_panels):
+            assign(
+                surface_id,
+                ring_index=ring_index,
+                state="snap",
+                source="remaining",
+            )
+
+    if set(states) != parallelogram_ids:
+        raise RuntimeError(
+            "Insertion propagation did not classify every parallelogram."
+        )
+    return states
+
+
+def _constraint_panel_ids(
+    model: Cadder,
+    pattern: TwoDDrawer,
+) -> dict[str, str]:
+    """Map each physical dihedral constraint to its parallelogram."""
+    panel_by_constraint: dict[str, str] = {}
+    for unit in pattern.hex_units:
+        unit_count = int(unit["count"])
+        for crease in unit["local_creases"]:
+            constraint_id = (
+                f"dihedral_signed_u{unit_count}_"
+                f"i{crease['local_index']}_{crease['side']}"
+            )
+            if constraint_id in model.constraints:
+                panel_by_constraint[constraint_id] = crease["quad"]
+
+    dihedral_ids = {
+        constraint_id
+        for constraint_id, constraint in model.constraints.items()
+        if constraint.kind == "dihedral_signed_increment"
+    }
+    if set(panel_by_constraint) != dihedral_ids:
+        missing = sorted(dihedral_ids - set(panel_by_constraint))
+        raise RuntimeError(
+            "Could not associate every insertion crease with a panel: "
+            f"{missing}."
+        )
+    return panel_by_constraint
+
+
+def _set_panel_sequence_targets(
+    model: Cadder,
+    *,
+    panel_states: dict[str, InsertionPanelState],
+    panel_by_constraint: dict[str, str],
+    contact_dihedral_deg: float,
+) -> None:
+    """Set contact/snap hinge targets from propagated panel metadata."""
+    snap_dihedral_deg = 180.0 - contact_dihedral_deg
+    for constraint_id, constraint in model.constraints.items():
+        if constraint.kind != "dihedral_signed_increment":
+            continue
+        data = constraint.data
+        surface_id = panel_by_constraint[constraint_id]
+        panel = panel_states[surface_id]
+        target = (
+            contact_dihedral_deg
+            if panel["state"] == "contact"
+            else snap_dihedral_deg
+        )
+        data["target_kind"] = panel["state"]
+        data["insertion_panel_surface"] = surface_id
+        data["insertion_panel_ring"] = panel["ring_index"]
+        data["target_increment"] = float(
+            data["sign"] * np.deg2rad(180.0 - target)
+        )
+
+
 def _set_spatial_dihedral_targets(
     model: Cadder,
     *,
@@ -423,7 +708,7 @@ def _loop_dihedral_stats(
         role = data["spatial_loop"]
         kind: Literal["acute", "obtuse"] = (
             "acute"
-            if data["target_kind"] == "outer-acute"
+            if data["target_kind"] in {"outer-acute", "snap"}
             else "obtuse"
         )
         values[role][kind].append(_measured_dihedral(model, data))
@@ -875,32 +1160,40 @@ def simulate_insertion(
     num_layers: int = DEFAULT_NUM_LAYERS,
     side_length: float = DEFAULT_SIDE_LENGTH,
     *,
+    assignment_mode: Literal[
+        "panel_sequence",
+        "regular_masks",
+    ] = "panel_sequence",
     start_dihedral_deg: float = 175.0,
     combination_masks: Sequence[int] | None = None,
     branch_acute_start_deg: float = 88.0,
     initial_steps: int = 12,
     combination_steps: int = 3,
+    panel_sequence_steps: int = 12,
     max_nfev_per_step: int = 6000,
     solve_tolerance: float = 1e-10,
     feasibility_tolerance: float = 1e-7,
     geometry_tolerance: float = 1e-6,
     contact_tolerance: float | None = None,
     contact_angle_buffer_deg: float = DEFAULT_CONTACT_ANGLE_BUFFER_DEG,
+    beyond_contact_policy: Literal["search", "error", "stop"] = "search",
     verbose: bool = False,
 ) -> InsertionSimulationResult:
     """Fold the surrounding loop toward the requested insertion angle.
 
-    The requested inner obtuse angle determines the post-bifurcation partner
-    ``A = 180 - O``.  If that request lies beyond the analytical panel-contact
-    limit, the continuation stops just before contact rather than clipping
-    through the panels.  The realized inner angle is then lower than the
-    request and is reported separately.
+    The requested inner obtuse angle is the ``contact`` panel target.  A
+    ``snap`` panel receives its supplement ``180 degrees - contact``.
 
-    The surrounding topology contains six binary sectors.  Mask ``111111``
-    produces the reference sixfold state: central ``O3`` and six surrounding
-    ``A2O`` unit chains.  Passing ``combination_masks=[63]`` evaluates only
-    that state; omitting the argument retains the exhaustive 63-mask search.
+    ``assignment_mode="panel_sequence"`` applies the insertion-specific,
+    inner-to-outer propagation rule.  ``"regular_masks"`` retains the older
+    six-sector mask search.  In regular-mask mode, mask ``111111`` produces
+    the reference sixfold state; omitting ``combination_masks`` tests masks
+    1 through 63.
     """
+    if assignment_mode not in {"panel_sequence", "regular_masks"}:
+        raise ValueError(
+            "assignment_mode must be 'panel_sequence' or 'regular_masks'."
+        )
     requested_inner_dihedral_deg = _validate_angle(
         inner_dihedral_deg,
         name="inner_dihedral_deg",
@@ -933,16 +1226,50 @@ def simulate_insertion(
         geometric_lock_acute_deg,
         geometric_lock_obtuse_deg,
     ) = _hexagon_lock_dihedral_pair()
+    maximum_no_clipping_inner_deg = (
+        geometric_lock_obtuse_deg - contact_angle_buffer_deg
+    )
+    if beyond_contact_policy not in {"search", "error", "stop"}:
+        raise ValueError(
+            "beyond_contact_policy must be 'search', 'error', or 'stop'."
+        )
+    requested_beyond_contact = (
+        requested_inner_dihedral_deg
+        > maximum_no_clipping_inner_deg + 1e-12
+    )
+    if (
+        assignment_mode == "regular_masks"
+        and requested_beyond_contact
+        and beyond_contact_policy == "error"
+    ):
+        raise ValueError(
+            "The requested inner dihedral "
+            f"({requested_inner_dihedral_deg:.6f} deg) exceeds the all-acute "
+            "outer mask's pre-contact target "
+            f"({maximum_no_clipping_inner_deg:.6f} deg). "
+            "For this rigid A2O branch its supplementary acute angle "
+            f"({requested_acute_dihedral_deg:.6f} deg) lies past first "
+            "panel contact. Choose a smaller REQUESTED_INNER_DIHEDRAL_DEG, "
+            "or explicitly set beyond_contact_policy='stop' to fold only "
+            "until contact."
+        )
     contact_limited = (
-        requested_acute_dihedral_deg <= geometric_lock_acute_deg
+        assignment_mode == "regular_masks"
+        and requested_beyond_contact
+        and beyond_contact_policy == "stop"
     )
     if contact_limited:
-        acute_dihedral_deg = (
-            geometric_lock_acute_deg + contact_angle_buffer_deg
-        )
+        realized_inner_dihedral_deg = maximum_no_clipping_inner_deg
     else:
-        acute_dihedral_deg = requested_acute_dihedral_deg
-    realized_inner_dihedral_deg = 180.0 - acute_dihedral_deg
+        realized_inner_dihedral_deg = requested_inner_dihedral_deg
+    acute_dihedral_deg = 180.0 - realized_inner_dihedral_deg
+    contact_boundary_target = (
+        abs(
+            realized_inner_dihedral_deg
+            - maximum_no_clipping_inner_deg
+        )
+        <= 1e-12
+    )
 
     branch_acute_start_deg = _validate_angle(
         branch_acute_start_deg,
@@ -973,6 +1300,7 @@ def simulate_insertion(
     for name, value, minimum in (
         ("initial_steps", initial_steps, 2),
         ("combination_steps", combination_steps, 2),
+        ("panel_sequence_steps", panel_sequence_steps, 2),
         ("max_nfev_per_step", max_nfev_per_step, 1),
     ):
         if isinstance(value, bool) or int(value) != value or value < minimum:
@@ -980,7 +1308,14 @@ def simulate_insertion(
                 f"{name} must be an integer of at least {minimum}."
             )
 
-    if combination_masks is None:
+    if assignment_mode == "panel_sequence":
+        if combination_masks is not None:
+            raise ValueError(
+                "combination_masks is only valid when "
+                "assignment_mode='regular_masks'."
+            )
+        masks = [-1]
+    elif combination_masks is None:
         masks = list(range(1, 64))
     else:
         masks = []
@@ -1027,6 +1362,8 @@ def simulate_insertion(
         crease_loop_by_edge,
     ) = _classify_spatial_hinges(model)
     mode_groups = _classify_outer_mode_groups(model, pattern)
+    panel_states = classify_insertion_panel_states(pattern)
+    panel_by_constraint = _constraint_panel_ids(model, pattern)
 
     coordinates = kinematics._initial_guess(
         mountain_height=max(1.0, 0.15 * side_length),
@@ -1080,18 +1417,35 @@ def simulate_insertion(
     for combination_index, mask in enumerate(masks, start=1):
         candidate_coordinates = branch_coordinates.copy()
         candidate_report = None
-        for acute_target in np.linspace(
-            branch_acute_start_deg,
-            acute_dihedral_deg,
-            int(combination_steps),
-        ):
-            obtuse_target = 180.0 - float(acute_target)
-            _set_mixed_mode_targets(
-                model,
-                combination_mask=mask,
-                acute_dihedral_deg=float(acute_target),
-                obtuse_dihedral_deg=obtuse_target,
+        if assignment_mode == "panel_sequence":
+            target_sequence = np.linspace(
+                uniform_branch_angle,
+                realized_inner_dihedral_deg,
+                int(panel_sequence_steps),
             )
+        else:
+            target_sequence = 180.0 - np.linspace(
+                branch_acute_start_deg,
+                acute_dihedral_deg,
+                int(combination_steps),
+            )
+
+        for obtuse_target in target_sequence:
+            acute_target = 180.0 - float(obtuse_target)
+            if assignment_mode == "panel_sequence":
+                _set_panel_sequence_targets(
+                    model,
+                    panel_states=panel_states,
+                    panel_by_constraint=panel_by_constraint,
+                    contact_dihedral_deg=float(obtuse_target),
+                )
+            else:
+                _set_mixed_mode_targets(
+                    model,
+                    combination_mask=mask,
+                    acute_dihedral_deg=acute_target,
+                    obtuse_dihedral_deg=float(obtuse_target),
+                )
             candidate_report = model.solve(
                 X0=candidate_coordinates,
                 update_model=False,
@@ -1123,7 +1477,9 @@ def simulate_insertion(
             ) = _top_view_compactness(model)
             panel_gap, _, clipping = minimum_panel_clearance(model)
             analytical_reference_contact = (
-                contact_limited and mask == 0b111111
+                assignment_mode == "regular_masks"
+                and contact_boundary_target
+                and mask == 0b111111
             )
             contact = (
                 not clipping
@@ -1135,11 +1491,23 @@ def simulate_insertion(
             if not clipping:
                 safe_coordinates[mask] = candidate_coordinates.copy()
 
+        if assignment_mode == "panel_sequence":
+            bit_pattern = "panel-sequence"
+            num_acute_groups = 0
+            num_acute_hinges = sum(
+                panel_states[panel_by_constraint[constraint_id]]["state"]
+                == "snap"
+                for constraint_id in outer_constraint_ids
+            )
+        else:
+            bit_pattern = format(mask, "06b")
+            num_acute_groups = mask.bit_count()
+            num_acute_hinges = 6 * mask.bit_count()
         attempt: CombinationAttempt = {
             "mask": mask,
-            "bit_pattern": format(mask, "06b"),
-            "num_acute_groups": mask.bit_count(),
-            "num_acute_hinges": 6 * mask.bit_count(),
+            "bit_pattern": bit_pattern,
+            "num_acute_groups": num_acute_groups,
+            "num_acute_hinges": num_acute_hinges,
             "max_solve_residual": candidate_report.max_abs_residual,
             "kinematically_valid": kinematically_valid,
             "minimum_panel_gap": panel_gap,
@@ -1156,8 +1524,8 @@ def simulate_insertion(
                 else "n/a"
             )
             print(
-                f"[combination {combination_index:02d}/{len(masks)}] "
-                f"mask={attempt['bit_pattern']}, "
+                f"[assignment {combination_index:02d}/{len(masks)}] "
+                f"state={attempt['bit_pattern']}, "
                 f"A-groups={attempt['num_acute_groups']}, "
                 f"residual={attempt['max_solve_residual']:.3e}, "
                 f"XY-aspect={top_view_pca_aspect}, "
@@ -1175,6 +1543,17 @@ def simulate_insertion(
         if not attempt["clipping"]
         and attempt["minimum_panel_gap"] is not None
     ]
+    if (
+        assignment_mode == "panel_sequence"
+        and not nonclipping_attempts
+    ):
+        attempt = attempts[0]
+        raise RuntimeError(
+            "The propagated contact/snap panel sequence did not produce a "
+            "valid non-clipping state: "
+            f"residual={attempt['max_solve_residual']:.3e}, "
+            f"clipping={attempt['clipping']}."
+        )
     if not nonclipping_attempts:
         status = "kinematically_incompatible"
         fallback_mask = 0
@@ -1238,6 +1617,12 @@ def simulate_insertion(
                     "contact limit. Folding stopped at the analytical A2O "
                     "lock state before panel interpenetration."
                 )
+            elif contact_boundary_target:
+                reason = (
+                    "The requested inner angle is the numerical pre-contact "
+                    "A2O lock target. The angle was used exactly and the "
+                    "contact buffer prevents panel interpenetration."
+                )
             else:
                 reason = (
                     "The selected mixed A/O combination reaches non-adjacent "
@@ -1245,20 +1630,35 @@ def simulate_insertion(
                 )
         else:
             status = "compact_nonclipping"
-            reason = (
-                "No tested combination reached exact contact without "
-                "clipping. The selected configuration is the valid "
-                "non-clipping combination with the most compact top-view "
-                "footprint."
-            )
+            if assignment_mode == "panel_sequence":
+                reason = (
+                    "The insertion-specific inner-to-outer contact/snap "
+                    "sequence reached the exact requested angle without "
+                    "panel clipping."
+                )
+            else:
+                reason = (
+                    "No tested combination reached exact contact without "
+                    "clipping. The selected configuration is the valid "
+                    "non-clipping combination with the most compact top-view "
+                    "footprint."
+                )
 
     model.set_coordinate_vector(selected_coordinates)
-    _set_mixed_mode_targets(
-        model,
-        combination_mask=selected_attempt["mask"],
-        acute_dihedral_deg=selected_acute_dihedral_deg,
-        obtuse_dihedral_deg=selected_obtuse_dihedral_deg,
-    )
+    if assignment_mode == "panel_sequence":
+        _set_panel_sequence_targets(
+            model,
+            panel_states=panel_states,
+            panel_by_constraint=panel_by_constraint,
+            contact_dihedral_deg=selected_obtuse_dihedral_deg,
+        )
+    else:
+        _set_mixed_mode_targets(
+            model,
+            combination_mask=selected_attempt["mask"],
+            acute_dihedral_deg=selected_acute_dihedral_deg,
+            obtuse_dihedral_deg=selected_obtuse_dihedral_deg,
+        )
     loop_dihedrals = _loop_dihedral_stats(model)
     final_gap, final_pair, final_clipping = minimum_panel_clearance(model)
     if final_clipping:
@@ -1286,6 +1686,7 @@ def simulate_insertion(
         "pattern": pattern,
         "status": status,
         "reason": reason,
+        "assignment_mode": assignment_mode,
         "requested_inner_deg": requested_inner_dihedral_deg,
         "realized_inner_deg": selected_obtuse_dihedral_deg,
         "requested_angle_reached": (
@@ -1322,6 +1723,17 @@ def simulate_insertion(
         "outer_constraint_ids": outer_constraint_ids,
         "crease_loop_by_edge": crease_loop_by_edge,
         "crease_assignment_by_edge": crease_assignment_by_edge,
+        "panel_states": panel_states,
+        "contact_panel_ids": frozenset(
+            surface_id
+            for surface_id, panel in panel_states.items()
+            if panel["state"] == "contact"
+        ),
+        "snap_panel_ids": frozenset(
+            surface_id
+            for surface_id, panel in panel_states.items()
+            if panel["state"] == "snap"
+        ),
         "inner_surface_ids": inner_surface_ids,
         "loop_dihedrals": loop_dihedrals,
         "mode_group_constraint_ids": mode_groups,
@@ -1331,11 +1743,26 @@ def simulate_insertion(
 
 def print_insertion_report(result: InsertionSimulationResult) -> None:
     """Print the mixed-mode search and selected loop dihedrals."""
-    print("Spatial two-loop mixed A/O simulation")
-    print("-------------------------------------")
+    if result["assignment_mode"] == "panel_sequence":
+        print("Spatial two-loop contact/snap insertion simulation")
+        print("-------------------------------------------------")
+    else:
+        print("Spatial two-loop mixed A/O simulation")
+        print("-------------------------------------")
+    if result["assignment_mode"] == "panel_sequence":
+        assignment = (
+            "inner-to-outer propagated contact/snap parallelograms"
+        )
+    elif result["selected_combination_mask"] == 0b111111:
+        assignment = "central O3; six surrounding A2O unit chains"
+    elif result["selected_combination_mask"] == 0:
+        assignment = "uniform O3 reference"
+    else:
+        assignment = "central O3; mixed outer regular A/O sectors"
+    print(f"Assignment:                    {assignment}")
     print(
-        "Assignment:                    central O3; six surrounding "
-        "A2O unit chains"
+        "Assignment mode:               "
+        f"{result['assignment_mode']}"
     )
     print(
         "Requested inner loop:          "
@@ -1359,11 +1786,17 @@ def print_insertion_report(result: InsertionSimulationResult) -> None:
         f"{result['acute_dihedral_deg']:.6f} / "
         f"{result['obtuse_dihedral_deg']:.6f} deg"
     )
-    print(
-        "Selected combination:          "
-        f"{result['selected_bit_pattern']} "
-        f"(mask {result['selected_combination_mask']})"
-    )
+    if result["assignment_mode"] == "panel_sequence":
+        print(
+            "Selected state rule:          "
+            f"{result['selected_bit_pattern']}"
+        )
+    else:
+        print(
+            "Selected combination:          "
+            f"{result['selected_bit_pattern']} "
+            f"(mask {result['selected_combination_mask']})"
+        )
     print(
         "Selected solve residual:       "
         f"{result['selected_residual']:.3e}"
@@ -1373,8 +1806,12 @@ def print_insertion_report(result: InsertionSimulationResult) -> None:
         f"{result['feasibility_tolerance']:.3e}"
     )
     print(
-        "Combinations tested:           "
-        f"{result['num_combinations_tested']}"
+        (
+            "Panel sequences tested:       "
+            if result["assignment_mode"] == "panel_sequence"
+            else "Combinations tested:           "
+        )
+        + f"{result['num_combinations_tested']}"
     )
     print(
         "Kinematically valid:           "
@@ -1436,7 +1873,47 @@ def print_insertion_report(result: InsertionSimulationResult) -> None:
             f"{row['num_obtuse_hinges']:10d}"
         )
 
-    if result["attempts"]:
+    if result["assignment_mode"] == "panel_sequence":
+        print("")
+        print("Insertion parallelogram states")
+        print(
+            f"{'ring':>6s} {'source':>22s} "
+            f"{'contact':>10s} {'snap':>10s}"
+        )
+        rings = sorted(
+            {
+                panel["ring_index"]
+                for panel in result["panel_states"].values()
+            }
+        )
+        sources: tuple[PanelStateSource, ...] = (
+            "inner",
+            "connection",
+            "same_outer_triangle",
+            "remaining",
+        )
+        for ring_index in rings:
+            for source in sources:
+                panels = [
+                    panel
+                    for panel in result["panel_states"].values()
+                    if (
+                        panel["ring_index"] == ring_index
+                        and panel["source"] == source
+                    )
+                ]
+                if not panels:
+                    continue
+                print(
+                    f"{ring_index:6d} {source:>22s} "
+                    f"{sum(p['state'] == 'contact' for p in panels):10d} "
+                    f"{sum(p['state'] == 'snap' for p in panels):10d}"
+                )
+
+    if (
+        result["assignment_mode"] == "regular_masks"
+        and result["attempts"]
+    ):
         print("")
         ranked = sorted(
             result["attempts"],
@@ -1507,10 +1984,15 @@ def draw_insertion_simulation(
     panel_color = "#dbe7e9"
     inner_panel_color = "#c7d9dc"
     acute_panel_color = "#27c8ad"
+    contact_panel_color = "#f2a65a"
+    snap_panel_color = "#27c8ad"
     panel_edge = "#566568"
     inner_edge = "#a9580f"
     outer_acute_edge = "#009d8f"
     outer_obtuse_edge = "#5c6b70"
+    contact_edge = "#c66b16"
+    snap_edge = "#009d8f"
+    panel_sequence = result["assignment_mode"] == "panel_sequence"
 
     selected_attempt = next(
         (
@@ -1554,7 +2036,15 @@ def draw_insertion_simulation(
         is_acute_triangle = (
             len(point_ids) == 3 and "outer-acute" in assignments
         )
-        if is_acute_triangle:
+        if panel_sequence and surface_id in result["panel_states"]:
+            panel_state = result["panel_states"][surface_id]["state"]
+            face_color = (
+                contact_panel_color
+                if panel_state == "contact"
+                else snap_panel_color
+            )
+            alpha = 0.90
+        elif is_acute_triangle:
             face_color = acute_panel_color
             alpha = 0.94
         elif surface_id in inner_surfaces:
@@ -1573,7 +2063,10 @@ def draw_insertion_simulation(
         )
 
     minimum_z = min(record[0] for record in surface_records)
-    for mean_z, polygon_xy, face_color, alpha in sorted(surface_records):
+    for mean_z, polygon_xy, face_color, alpha in sorted(
+        surface_records,
+        key=lambda record: record[0],
+    ):
         top_axis.add_collection(
             PolyCollection(
                 [polygon_xy],
@@ -1593,6 +2086,8 @@ def draw_insertion_simulation(
         if assignment is None:
             continue
         crease_color = {
+            "contact": contact_edge,
+            "snap": snap_edge,
             "inner-obtuse": inner_edge,
             "outer-acute": outer_acute_edge,
             "outer-obtuse": outer_obtuse_edge,
@@ -1605,9 +2100,9 @@ def draw_insertion_simulation(
             color=crease_color,
             linewidth=(
                 2.25
-                if assignment == "outer-acute"
+                if assignment in {"outer-acute", "snap"}
                 else 1.15
-                if assignment == "inner-obtuse"
+                if assignment in {"inner-obtuse", "contact"}
                 else 0.8
             ),
             alpha=0.98,
@@ -1637,23 +2132,63 @@ def draw_insertion_simulation(
         if pca_aspect is not None
         else "n/a"
     )
-    top_axis.set_title(
-        "One-layer orthographic top view — A²O contact-lock configuration\n"
-        f"requested inner O = {result['requested_inner_deg']:.1f}°  →  "
-        f"contact-limited O = {result['realized_inner_deg']:.3f}°\n"
-        f"mask {result['selected_bit_pattern']}  ·  "
-        f"outer = {selected_attempt['num_acute_hinges']} A / "
-        f"{len(result['outer_constraint_ids']) - selected_attempt['num_acute_hinges']} O  ·  "
-        f"XY aspect = {aspect_text}",
-        fontsize=12.5,
-        pad=15.0,
-    )
-    top_axis.legend(
-        handles=[
+    if result["contact_limited"]:
+        angle_text = (
+            f"requested inner O = {result['requested_inner_deg']:.1f}°  →  "
+            f"contact-limited O = {result['realized_inner_deg']:.3f}°"
+        )
+    else:
+        angle_text = (
+            f"requested and realized inner O = "
+            f"{result['realized_inner_deg']:.3f}°"
+        )
+    if panel_sequence:
+        state_text = (
+            f"{len(result['contact_panel_ids'])} contact panels  ·  "
+            f"{len(result['snap_panel_ids'])} snap panels"
+        )
+        title = (
+            "One-layer orthographic top view — propagated panel sequence\n"
+            f"{angle_text}\n"
+            f"{state_text}  ·  XY aspect = {aspect_text}"
+        )
+        legend_handles = [
+            Patch(
+                facecolor=contact_panel_color,
+                edgecolor=contact_edge,
+                label=(
+                    "Contact parallelogram "
+                    f"({result['obtuse_dihedral_deg']:.1f}°)"
+                ),
+            ),
+            Patch(
+                facecolor=snap_panel_color,
+                edgecolor=snap_edge,
+                label=(
+                    "Snap parallelogram "
+                    f"({result['acute_dihedral_deg']:.1f}°)"
+                ),
+            ),
+            Patch(
+                facecolor=panel_color,
+                edgecolor=panel_edge,
+                label="Triangular panel",
+            ),
+        ]
+    else:
+        title = (
+            "One-layer orthographic top view — mixed A/O configuration\n"
+            f"{angle_text}\n"
+            f"mask {result['selected_bit_pattern']}  ·  "
+            f"outer = {selected_attempt['num_acute_hinges']} A / "
+            f"{len(result['outer_constraint_ids']) - selected_attempt['num_acute_hinges']} O  ·  "
+            f"XY aspect = {aspect_text}"
+        )
+        legend_handles = [
             Patch(
                 facecolor=acute_panel_color,
                 edgecolor=outer_acute_edge,
-                label="Panels adjoining acute A²O sectors",
+                label="Panels adjoining acute outer groups",
             ),
             Line2D(
                 [0],
@@ -1676,7 +2211,14 @@ def draw_insertion_simulation(
                 linewidth=1.0,
                 label="Outer loop: obtuse",
             ),
-        ],
+        ]
+    top_axis.set_title(
+        title,
+        fontsize=12.5,
+        pad=15.0,
+    )
+    top_axis.legend(
+        handles=legend_handles,
         loc="lower center",
         bbox_to_anchor=(0.5, -0.015),
         ncol=2,
@@ -1754,8 +2296,17 @@ def draw_insertion_stack_3d(
     axis.set_zlabel("z [mm]", labelpad=8.0)
     axis.view_init(elev=25.0, azim=-55.0)
     axis.grid(True, alpha=0.18)
+    if result["assignment_mode"] == "panel_sequence":
+        configuration_name = "propagated contact/snap assembly"
+    elif (
+        result["selected_combination_mask"] == 0b111111
+        and result["contact_detected"]
+    ):
+        configuration_name = "A²O contact-lock assembly"
+    else:
+        configuration_name = "mixed A/O assembly"
     axis.set_title(
-        f"{num_layers}-layer A²O contact-lock assembly — isometric view\n"
+        f"{num_layers}-layer {configuration_name} — isometric view\n"
         f"A = {result['acute_dihedral_deg']:.3f}°  ·  "
         f"O = {result['obtuse_dihedral_deg']:.3f}°  ·  "
         f"layer height = {result['layer_height']:.3f} mm  ·  "
