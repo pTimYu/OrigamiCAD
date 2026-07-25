@@ -98,8 +98,16 @@ def save_step(
     filename: str | Path,
     thickness: float = 0.0,
     model_name: str = "OrigamiCAD",
+    *,
+    separate_layer_parts: bool = False,
 ) -> Path:
-    """Write STEP surfaces or advanced BREP solids without a CAD kernel."""
+    """Write STEP surfaces or advanced BREP solids without a CAD kernel.
+
+    Set ``separate_layer_parts=True`` for a stacked model whose surface IDs
+    use the ``layer_<index>::<surface_id>`` convention.  The resulting STEP
+    file contains one product definition per layer, allowing Abaqus/CAE to
+    import the layers as separate parts.
+    """
     thickness = _validate_thickness(thickness)
     path = Path(filename)
     step = _StepFile()
@@ -113,22 +121,8 @@ def save_step(
         f"'international standard','config_control_design',1994,{app})"
     )
     product_context = step.add(f"PRODUCT_CONTEXT('',{app},'mechanical')")
-    escaped_name = _step_string(model_name)
-    product = step.add(
-        f"PRODUCT('{escaped_name}','{escaped_name}','',({product_context}))"
-    )
-    formation = step.add(
-        "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE(" 
-        f"'','',{product},.NOT_KNOWN.)"
-    )
     definition_context = step.add(
         f"PRODUCT_DEFINITION_CONTEXT('part definition',{app},'design')"
-    )
-    product_definition = step.add(
-        f"PRODUCT_DEFINITION('design','',{formation},{definition_context})"
-    )
-    product_shape = step.add(
-        f"PRODUCT_DEFINITION_SHAPE('','',{product_definition})"
     )
 
     length_unit = step.add(_step_length_unit(model.unit))
@@ -157,68 +151,43 @@ def save_step(
         f"AXIS2_PLACEMENT_3D('',{origin},{z_direction},{x_direction})"
     )
 
-    if thickness == 0.0:
-        shells = []
-        for surface_id, polygon in _panel_polygons(model):
-            faces = step.advanced_faces(
-                polygon,
-                [list(range(len(polygon)))],
-                [surface_id],
-            )
-            shells.append(step.add(f"OPEN_SHELL('',({_refs(faces)}))"))
-
-        surface_model = step.add(
-            f"SHELL_BASED_SURFACE_MODEL('{escaped_name}',({_refs(shells)}))"
-        )
-        representation = step.add(
-            f"MANIFOLD_SURFACE_SHAPE_REPRESENTATION('{escaped_name}',"
-            f"({_refs([placement, surface_model])}),{context})"
-        )
+    if separate_layer_parts:
+        part_groups = _layer_part_groups(model)
     else:
-        solids = []
-        half = 0.5 * thickness
-        for surface_id, polygon in _panel_polygons(model):
-            normal = _polygon_normal(polygon)
-            top = polygon + half * normal
-            bottom = polygon - half * normal
-            coordinates = np.vstack((top, bottom))
-            count = len(polygon)
+        part_groups = [(str(model_name), list(_panel_polygons(model)))]
 
-            face_indices = [
-                list(range(count)),
-                list(reversed(range(count, 2 * count))),
-            ]
-            face_names = [f"{surface_id} top", f"{surface_id} bottom"]
-            for index in range(count):
-                next_index = (index + 1) % count
-                face_indices.append(
-                    [
-                        count + index,
-                        count + next_index,
-                        next_index,
-                        index,
-                    ]
-                )
-                face_names.append(f"{surface_id} side {index}")
-
-            faces = step.advanced_faces(
-                coordinates,
-                face_indices,
-                face_names,
-            )
-            shell = step.add(f"CLOSED_SHELL('',({_refs(faces)}))")
-            solids.append(
-                step.add(
-                    f"MANIFOLD_SOLID_BREP('{_step_string(surface_id)}',{shell})"
-                )
-            )
-
-        representation = step.add(
-            f"ADVANCED_BREP_SHAPE_REPRESENTATION('{escaped_name}',"
-            f"({_refs([placement, *solids])}),{context})"
+    products = []
+    for part_name, panels in part_groups:
+        escaped_part_name = _step_string(part_name)
+        product = step.add(
+            f"PRODUCT('{escaped_part_name}','{escaped_part_name}','',"
+            f"({product_context}))"
         )
+        products.append(product)
+        formation = step.add(
+            "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE("
+            f"'','',{product},.NOT_KNOWN.)"
+        )
+        product_definition = step.add(
+            f"PRODUCT_DEFINITION('design','',{formation},{definition_context})"
+        )
+        product_shape = step.add(
+            f"PRODUCT_DEFINITION_SHAPE('','',{product_definition})"
+        )
+        representation = _step_panel_representation(
+            step,
+            panels,
+            thickness=thickness,
+            representation_name=part_name,
+            placement=placement,
+            context=context,
+        )
+        step.add(
+            f"SHAPE_DEFINITION_REPRESENTATION({product_shape},{representation})"
+        )
+
     step.add(
-        f"SHAPE_DEFINITION_REPRESENTATION({product_shape},{representation})"
+        f"PRODUCT_RELATED_PRODUCT_CATEGORY('part','',({_refs(products)}))"
     )
     step.write(path, model_name)
     return path
@@ -228,16 +197,30 @@ def save_cad(
     model,
     filename: str | Path,
     thickness: float = 0.0,
+    *,
+    separate_layer_parts: bool = False,
 ) -> Path:
-    """Select JSON, STL, or STEP export from the filename extension."""
+    """Select JSON, STL, or STEP export from the filename extension.
+
+    ``separate_layer_parts`` is available only for STEP output.
+    """
     path = Path(filename)
     extension = path.suffix.lower()
+    if separate_layer_parts and extension not in {".step", ".stp"}:
+        raise ValueError(
+            "separate_layer_parts is supported only for STEP output."
+        )
     if extension == ".json":
         return save_json(model, path)
     if extension == ".stl":
         return save_stl(model, path, thickness=thickness)
     if extension in {".step", ".stp"}:
-        return save_step(model, path, thickness=thickness)
+        return save_step(
+            model,
+            path,
+            thickness=thickness,
+            separate_layer_parts=separate_layer_parts,
+        )
     raise ValueError("Output extension must be .json, .stl, .step, or .stp.")
 
 
@@ -250,6 +233,118 @@ def _panel_polygons(model) -> Iterable[tuple[str, np.ndarray]]:
             [model.point_array(point_id) for point_id in vertices],
             dtype=float,
         )
+
+
+def _layer_part_groups(model) -> list[tuple[str, list[tuple[str, np.ndarray]]]]:
+    """Group stacked panel polygons into zero-based, contiguous layer parts."""
+    groups: dict[int, list[tuple[str, np.ndarray]]] = {}
+    layer_pattern = re.compile(r"^layer_(\d+)::(.+)$")
+
+    for surface_id, polygon in _panel_polygons(model):
+        match = layer_pattern.fullmatch(surface_id)
+        if match is None:
+            raise ValueError(
+                "separate_layer_parts requires every surface ID to match "
+                "'layer_<index>::<surface_id>'; "
+                f"got {surface_id!r}."
+            )
+        layer_index = int(match.group(1))
+        local_surface_id = match.group(2)
+        groups.setdefault(layer_index, []).append(
+            (local_surface_id, polygon)
+        )
+
+    if not groups:
+        raise ValueError(
+            "separate_layer_parts requires at least one stacked surface."
+        )
+
+    layer_indices = sorted(groups)
+    expected_indices = list(range(len(layer_indices)))
+    if layer_indices != expected_indices:
+        raise ValueError(
+            "Layer indices must be contiguous and start at zero; "
+            f"got {layer_indices}."
+        )
+
+    return [
+        (f"Layer_{layer_index + 1}", groups[layer_index])
+        for layer_index in layer_indices
+    ]
+
+
+def _step_panel_representation(
+    step,
+    panels: Iterable[tuple[str, np.ndarray]],
+    *,
+    thickness: float,
+    representation_name: str,
+    placement: str,
+    context: str,
+) -> str:
+    """Add one STEP shape representation containing the supplied panels."""
+    escaped_name = _step_string(representation_name)
+
+    if thickness == 0.0:
+        shells = []
+        for surface_id, polygon in panels:
+            faces = step.advanced_faces(
+                polygon,
+                [list(range(len(polygon)))],
+                [surface_id],
+            )
+            shells.append(step.add(f"OPEN_SHELL('',({_refs(faces)}))"))
+
+        surface_model = step.add(
+            f"SHELL_BASED_SURFACE_MODEL('{escaped_name}',({_refs(shells)}))"
+        )
+        return step.add(
+            f"MANIFOLD_SURFACE_SHAPE_REPRESENTATION('{escaped_name}',"
+            f"({_refs([placement, surface_model])}),{context})"
+        )
+
+    solids = []
+    half = 0.5 * thickness
+    for surface_id, polygon in panels:
+        normal = _polygon_normal(polygon)
+        top = polygon + half * normal
+        bottom = polygon - half * normal
+        coordinates = np.vstack((top, bottom))
+        count = len(polygon)
+
+        face_indices = [
+            list(range(count)),
+            list(reversed(range(count, 2 * count))),
+        ]
+        face_names = [f"{surface_id} top", f"{surface_id} bottom"]
+        for index in range(count):
+            next_index = (index + 1) % count
+            face_indices.append(
+                [
+                    count + index,
+                    count + next_index,
+                    next_index,
+                    index,
+                ]
+            )
+            face_names.append(f"{surface_id} side {index}")
+
+        faces = step.advanced_faces(
+            coordinates,
+            face_indices,
+            face_names,
+        )
+        shell = step.add(f"CLOSED_SHELL('',({_refs(faces)}))")
+        solids.append(
+            step.add(
+                f"MANIFOLD_SOLID_BREP('{_step_string(surface_id)}',{shell})"
+            )
+        )
+
+    return step.add(
+        f"ADVANCED_BREP_SHAPE_REPRESENTATION('{escaped_name}',"
+        f"({_refs([placement, *solids])}),{context})"
+    )
 
 
 def _mesh_triangles(model, thickness: float) -> list[np.ndarray]:

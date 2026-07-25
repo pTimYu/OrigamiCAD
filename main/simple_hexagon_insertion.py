@@ -44,26 +44,30 @@ def main() -> None:
     print("")
     print_insertion_report(result)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # step_path = OUTPUT_DIR / "simple_hexagon_insertion_4layer.step"
-    # result["assembly"].save_step(str(step_path))
-    # print(f"Saved four-layer STEP:         {step_path}")
+    step_path = OUTPUT_DIR / "simple_hexagon_insertion_4layer_abaqus.step"
+    result["assembly"].save_step(
+        str(step_path),
+        thickness=0.0,
+        separate_layer_parts=True,
+    )
+    print(f"Saved four-part Abaqus STEP:   {step_path}")
 
-    # drawing_path = OUTPUT_DIR / "simple_hexagon_insertion.png"
-    # draw_insertion_simulation(
-    #     result,
-    #     save_path=drawing_path,
-    #     show=False,
-    # )
-    # print(f"Saved drawing:                 {drawing_path}")
+    drawing_path = OUTPUT_DIR / "simple_hexagon_insertion.png"
+    draw_insertion_simulation(
+        result,
+        save_path=drawing_path,
+        show=False,
+    )
+    print(f"Saved drawing:                 {drawing_path}")
     stack_drawing_path = (
         OUTPUT_DIR / "simple_hexagon_insertion_4layer_3d.png"
     )
     draw_insertion_stack_3d(
         result,
-        # save_path=stack_drawing_path,
+        save_path=stack_drawing_path,
         show=True,
     )
-    # print(f"Saved 3D stack drawing:        {stack_drawing_path}")
+    print(f"Saved 3D stack drawing:        {stack_drawing_path}")
 
 
 if __name__ == "__main__":

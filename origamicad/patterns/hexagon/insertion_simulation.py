@@ -1994,27 +1994,6 @@ def draw_insertion_simulation(
     snap_edge = "#009d8f"
     panel_sequence = result["assignment_mode"] == "panel_sequence"
 
-    selected_attempt = next(
-        (
-            attempt
-            for attempt in result["attempts"]
-            if attempt["mask"] == result["selected_combination_mask"]
-        ),
-        {
-            "mask": 0,
-            "bit_pattern": "000000",
-            "num_acute_groups": 0,
-            "num_acute_hinges": 0,
-            "max_solve_residual": result["selected_residual"],
-            "kinematically_valid": True,
-            "minimum_panel_gap": result["minimum_panel_gap"],
-            "top_view_pca_aspect": None,
-            "top_view_bbox_aspect": None,
-            "clipping": False,
-            "contact": False,
-        },
-    )
-
     figure, top_axis = plt.subplots(
         figsize=(9.2, 9.2),
         constrained_layout=True,
@@ -2126,32 +2105,7 @@ def draw_insertion_simulation(
     top_axis.set_aspect("equal", adjustable="box")
     top_axis.axis("off")
 
-    pca_aspect = selected_attempt["top_view_pca_aspect"]
-    aspect_text = (
-        f"{pca_aspect:.3f}"
-        if pca_aspect is not None
-        else "n/a"
-    )
-    if result["contact_limited"]:
-        angle_text = (
-            f"requested inner O = {result['requested_inner_deg']:.1f}°  →  "
-            f"contact-limited O = {result['realized_inner_deg']:.3f}°"
-        )
-    else:
-        angle_text = (
-            f"requested and realized inner O = "
-            f"{result['realized_inner_deg']:.3f}°"
-        )
     if panel_sequence:
-        state_text = (
-            f"{len(result['contact_panel_ids'])} contact panels  ·  "
-            f"{len(result['snap_panel_ids'])} snap panels"
-        )
-        title = (
-            "One-layer orthographic top view — propagated panel sequence\n"
-            f"{angle_text}\n"
-            f"{state_text}  ·  XY aspect = {aspect_text}"
-        )
         legend_handles = [
             Patch(
                 facecolor=contact_panel_color,
@@ -2176,14 +2130,6 @@ def draw_insertion_simulation(
             ),
         ]
     else:
-        title = (
-            "One-layer orthographic top view — mixed A/O configuration\n"
-            f"{angle_text}\n"
-            f"mask {result['selected_bit_pattern']}  ·  "
-            f"outer = {selected_attempt['num_acute_hinges']} A / "
-            f"{len(result['outer_constraint_ids']) - selected_attempt['num_acute_hinges']} O  ·  "
-            f"XY aspect = {aspect_text}"
-        )
         legend_handles = [
             Patch(
                 facecolor=acute_panel_color,
@@ -2212,11 +2158,6 @@ def draw_insertion_simulation(
                 label="Outer loop: obtuse",
             ),
         ]
-    top_axis.set_title(
-        title,
-        fontsize=12.5,
-        pad=15.0,
-    )
     top_axis.legend(
         handles=legend_handles,
         loc="lower center",
@@ -2296,24 +2237,6 @@ def draw_insertion_stack_3d(
     axis.set_zlabel("z [mm]", labelpad=8.0)
     axis.view_init(elev=25.0, azim=-55.0)
     axis.grid(True, alpha=0.18)
-    if result["assignment_mode"] == "panel_sequence":
-        configuration_name = "propagated contact/snap assembly"
-    elif (
-        result["selected_combination_mask"] == 0b111111
-        and result["contact_detected"]
-    ):
-        configuration_name = "A²O contact-lock assembly"
-    else:
-        configuration_name = "mixed A/O assembly"
-    axis.set_title(
-        f"{num_layers}-layer {configuration_name} — isometric view\n"
-        f"A = {result['acute_dihedral_deg']:.3f}°  ·  "
-        f"O = {result['obtuse_dihedral_deg']:.3f}°  ·  "
-        f"layer height = {result['layer_height']:.3f} mm  ·  "
-        f"clipping = {'yes' if result['clipping_detected'] else 'no'}",
-        fontsize=13,
-        pad=18.0,
-    )
     axis.legend(
         handles=[
             Patch(
