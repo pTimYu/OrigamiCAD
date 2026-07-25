@@ -74,7 +74,11 @@ def main() -> None:
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     output_path = OUTPUT_DIR / "simple_hexagon_four_layer_stack.step"
-    save_cad(assembly, output_path)
+    save_cad(
+        assembly,
+        output_path,
+        separate_layer_parts=True,
+    )
 
     print(
         "Analytical layer height: "

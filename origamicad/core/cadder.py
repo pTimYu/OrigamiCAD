@@ -1875,17 +1875,43 @@ class Cadder(CadVisualizationMixin):
 
         save_stl(self, filename, thickness=thickness)
 
-    def save_step(self, filename: str, thickness: float = 0.0) -> None:
-        """Save panel geometry as a faceted STEP surface or solid model."""
+    def save_step(
+        self,
+        filename: str,
+        thickness: float = 0.0,
+        *,
+        separate_layer_parts: bool = False,
+    ) -> None:
+        """Save panel geometry as a faceted STEP surface or solid model.
+
+        Use ``separate_layer_parts=True`` on a model returned by
+        ``stack_layers`` to create one importable STEP part per layer.
+        """
         from ..io.cad_export import save_step
 
-        save_step(self, filename, thickness=thickness)
+        save_step(
+            self,
+            filename,
+            thickness=thickness,
+            separate_layer_parts=separate_layer_parts,
+        )
 
-    def save_cad(self, filename: str, thickness: float = 0.0) -> None:
+    def save_cad(
+        self,
+        filename: str,
+        thickness: float = 0.0,
+        *,
+        separate_layer_parts: bool = False,
+    ) -> None:
         """Export based on a .json, .stl, .step, or .stp extension."""
         from ..io.cad_export import save_cad
 
-        save_cad(self, filename, thickness=thickness)
+        save_cad(
+            self,
+            filename,
+            thickness=thickness,
+            separate_layer_parts=separate_layer_parts,
+        )
 
     def save_xy_dxf(
         self,
