@@ -109,6 +109,12 @@ def save_step(
     import the layers as separate parts.
     """
     thickness = _validate_thickness(thickness)
+    if separate_layer_parts and thickness != 0.0:
+        raise ValueError(
+            "separate_layer_parts requires thickness=0.0 so each layer can "
+            "be exported as one connected shell. Assign the shell thickness "
+            "in Abaqus/CAE after import."
+        )
     path = Path(filename)
     step = _StepFile()
 
@@ -154,7 +160,7 @@ def save_step(
     if separate_layer_parts:
         part_groups = _layer_part_groups(model)
     else:
-        part_groups = [(str(model_name), list(_panel_polygons(model)))]
+        part_groups = [(str(model_name), list(_panel_geometry(model)))]
 
     products = []
     for part_name, panels in part_groups:
@@ -181,6 +187,7 @@ def save_step(
             representation_name=part_name,
             placement=placement,
             context=context,
+            connected_open_shell=separate_layer_parts,
         )
         step.add(
             f"SHAPE_DEFINITION_REPRESENTATION({product_shape},{representation})"
@@ -224,23 +231,40 @@ def save_cad(
     raise ValueError("Output extension must be .json, .stl, .step, or .stp.")
 
 
-def _panel_polygons(model) -> Iterable[tuple[str, np.ndarray]]:
+def _panel_geometry(
+    model,
+) -> Iterable[tuple[str, tuple[str, ...], np.ndarray]]:
     for surface_id in model.surfaces:
-        vertices = model._surface_vertices(surface_id)
-        if len(vertices) < 3:
+        point_ids = tuple(model._surface_vertices(surface_id))
+        if len(point_ids) < 3:
             raise ValueError(f"Surface '{surface_id}' has fewer than 3 vertices.")
-        yield surface_id, np.array(
-            [model.point_array(point_id) for point_id in vertices],
+        yield surface_id, point_ids, np.array(
+            [model.point_array(point_id) for point_id in point_ids],
             dtype=float,
         )
 
 
-def _layer_part_groups(model) -> list[tuple[str, list[tuple[str, np.ndarray]]]]:
+def _panel_polygons(model) -> Iterable[tuple[str, np.ndarray]]:
+    for surface_id, _, polygon in _panel_geometry(model):
+        yield surface_id, polygon
+
+
+def _layer_part_groups(
+    model,
+) -> list[
+    tuple[
+        str,
+        list[tuple[str, tuple[str, ...], np.ndarray]],
+    ]
+]:
     """Group stacked panel polygons into zero-based, contiguous layer parts."""
-    groups: dict[int, list[tuple[str, np.ndarray]]] = {}
+    groups: dict[
+        int,
+        list[tuple[str, tuple[str, ...], np.ndarray]],
+    ] = {}
     layer_pattern = re.compile(r"^layer_(\d+)::(.+)$")
 
-    for surface_id, polygon in _panel_polygons(model):
+    for surface_id, point_ids, polygon in _panel_geometry(model):
         match = layer_pattern.fullmatch(surface_id)
         if match is None:
             raise ValueError(
@@ -250,8 +274,20 @@ def _layer_part_groups(model) -> list[tuple[str, list[tuple[str, np.ndarray]]]]:
             )
         layer_index = int(match.group(1))
         local_surface_id = match.group(2)
+
+        for point_id in point_ids:
+            point_match = layer_pattern.fullmatch(point_id)
+            if (
+                point_match is None
+                or int(point_match.group(1)) != layer_index
+            ):
+                raise ValueError(
+                    f"Surface {surface_id!r} references point {point_id!r} "
+                    "outside its layer."
+                )
+
         groups.setdefault(layer_index, []).append(
-            (local_surface_id, polygon)
+            (local_surface_id, point_ids, polygon)
         )
 
     if not groups:
@@ -275,25 +311,38 @@ def _layer_part_groups(model) -> list[tuple[str, list[tuple[str, np.ndarray]]]]:
 
 def _step_panel_representation(
     step,
-    panels: Iterable[tuple[str, np.ndarray]],
+    panels: Iterable[tuple[str, tuple[str, ...], np.ndarray]],
     *,
     thickness: float,
     representation_name: str,
     placement: str,
     context: str,
+    connected_open_shell: bool,
 ) -> str:
     """Add one STEP shape representation containing the supplied panels."""
     escaped_name = _step_string(representation_name)
+    panels = list(panels)
 
     if thickness == 0.0:
-        shells = []
-        for surface_id, polygon in panels:
-            faces = step.advanced_faces(
-                polygon,
-                [list(range(len(polygon)))],
-                [surface_id],
+        if connected_open_shell:
+            coordinates, face_indices, face_names = (
+                _connected_shell_geometry(panels)
             )
-            shells.append(step.add(f"OPEN_SHELL('',({_refs(faces)}))"))
+            faces = step.advanced_faces(
+                coordinates,
+                face_indices,
+                face_names,
+            )
+            shells = [step.add(f"OPEN_SHELL('',({_refs(faces)}))")]
+        else:
+            shells = []
+            for surface_id, _, polygon in panels:
+                faces = step.advanced_faces(
+                    polygon,
+                    [list(range(len(polygon)))],
+                    [surface_id],
+                )
+                shells.append(step.add(f"OPEN_SHELL('',({_refs(faces)}))"))
 
         surface_model = step.add(
             f"SHELL_BASED_SURFACE_MODEL('{escaped_name}',({_refs(shells)}))"
@@ -305,7 +354,7 @@ def _step_panel_representation(
 
     solids = []
     half = 0.5 * thickness
-    for surface_id, polygon in panels:
+    for surface_id, _, polygon in panels:
         normal = _polygon_normal(polygon)
         top = polygon + half * normal
         bottom = polygon - half * normal
@@ -345,6 +394,109 @@ def _step_panel_representation(
         f"ADVANCED_BREP_SHAPE_REPRESENTATION('{escaped_name}',"
         f"({_refs([placement, *solids])}),{context})"
     )
+
+
+def _connected_shell_geometry(
+    panels: list[tuple[str, tuple[str, ...], np.ndarray]],
+) -> tuple[np.ndarray, list[list[int]], list[str]]:
+    """Build consistently oriented faces with shared vertices and edges."""
+    if not panels:
+        raise ValueError("A connected STEP shell requires at least one panel.")
+
+    edge_occurrences: dict[
+        tuple[str, str],
+        list[tuple[int, bool]],
+    ] = {}
+    for face_index, (surface_id, point_ids, polygon) in enumerate(panels):
+        if len(point_ids) != len(polygon):
+            raise ValueError(
+                f"Surface {surface_id!r} has inconsistent point metadata."
+            )
+        if len(set(point_ids)) != len(point_ids):
+            raise ValueError(
+                f"Surface {surface_id!r} contains duplicate point IDs."
+            )
+
+        for position, start_id in enumerate(point_ids):
+            end_id = point_ids[(position + 1) % len(point_ids)]
+            edge = tuple(sorted((start_id, end_id)))
+            edge_occurrences.setdefault(edge, []).append(
+                (face_index, (start_id, end_id) == edge)
+            )
+
+    adjacency: dict[int, list[tuple[int, bool]]] = {
+        face_index: []
+        for face_index in range(len(panels))
+    }
+    for edge, occurrences in edge_occurrences.items():
+        if len(occurrences) > 2:
+            raise ValueError(
+                "Cannot create a manifold layer shell because edge "
+                f"{edge!r} belongs to {len(occurrences)} panels."
+            )
+        if len(occurrences) == 2:
+            (first_face, first_direction), (
+                second_face,
+                second_direction,
+            ) = occurrences
+            flip_relation = first_direction == second_direction
+            adjacency[first_face].append((second_face, flip_relation))
+            adjacency[second_face].append((first_face, flip_relation))
+
+    flips: dict[int, bool] = {0: False}
+    pending = [0]
+    while pending:
+        face_index = pending.pop()
+        for neighbor, flip_relation in adjacency[face_index]:
+            neighbor_flip = flips[face_index] ^ flip_relation
+            if neighbor in flips:
+                if flips[neighbor] != neighbor_flip:
+                    raise ValueError(
+                        "Layer panels do not form an orientable STEP shell."
+                    )
+                continue
+            flips[neighbor] = neighbor_flip
+            pending.append(neighbor)
+
+    if len(flips) != len(panels):
+        disconnected = [
+            panels[index][0]
+            for index in range(len(panels))
+            if index not in flips
+        ]
+        raise ValueError(
+            "Each exported layer must be connected through shared panel "
+            "edges; disconnected panels include "
+            f"{disconnected[:5]}."
+        )
+
+    point_indices: dict[str, int] = {}
+    point_coordinates: dict[str, np.ndarray] = {}
+    coordinates: list[np.ndarray] = []
+    face_indices = []
+    face_names = []
+
+    for face_index, (surface_id, point_ids, polygon) in enumerate(panels):
+        if flips[face_index]:
+            point_ids = tuple(reversed(point_ids))
+            polygon = polygon[::-1]
+
+        indices = []
+        for point_id, coordinate in zip(point_ids, polygon):
+            if point_id not in point_indices:
+                point_indices[point_id] = len(coordinates)
+                point_coordinates[point_id] = coordinate
+                coordinates.append(coordinate)
+            elif not np.array_equal(point_coordinates[point_id], coordinate):
+                raise ValueError(
+                    f"Point {point_id!r} has inconsistent coordinates."
+                )
+            indices.append(point_indices[point_id])
+
+        face_indices.append(indices)
+        face_names.append(surface_id)
+
+    return np.array(coordinates), face_indices, face_names
 
 
 def _mesh_triangles(model, thickness: float) -> list[np.ndarray]:
