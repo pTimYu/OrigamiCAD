@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 
-CreaseStyle = Literal["solid", "dashed"]
+CreaseStyle = Literal["solid", "dashed"] | list[object] | tuple[object, ...]
 DxfProfile = Literal["standard", "solidworks"]
+_MAX_REAL_DASH_SEGMENTS = 1_000_000
+
+
+@dataclass(frozen=True)
+class _CreaseStyleSpec:
+    name: Literal["solid", "dashed", "real dashed"]
+    dash_length: float | None = None
+    gap_length: float | None = None
 
 
 def save_dxf(
@@ -46,11 +55,26 @@ def dxf_string_from_metadata(
     include_side: bool = True,
     profile: DxfProfile = "standard",
 ) -> str:
-    """Convert 2D metadata to a simple DXF string made of LINE entities."""
-    if crease_style not in {"solid", "dashed"}:
-        raise ValueError("crease_style must be 'solid' or 'dashed'.")
+    """Convert 2D metadata to a simple DXF string made of LINE entities.
+
+    ``crease_style=["real dashed", a, b]`` emits actual continuous LINE
+    entities of length ``a``, separated by empty spans of length ``b``.
+    Both lengths use the unit declared by the input metadata.
+    """
+    crease_style_spec = _parse_crease_style(crease_style)
     if profile not in {"standard", "solidworks"}:
         raise ValueError("profile must be 'standard' or 'solidworks'.")
+
+    if profile == "solidworks" and crease_style_spec.name == "real dashed":
+        source_unit = metadata.get("metadata", {}).get("unit", "mm")
+        scale = _unit_to_inches_factor(source_unit)
+        assert crease_style_spec.dash_length is not None
+        assert crease_style_spec.gap_length is not None
+        crease_style_spec = _CreaseStyleSpec(
+            name="real dashed",
+            dash_length=crease_style_spec.dash_length * scale,
+            gap_length=crease_style_spec.gap_length * scale,
+        )
 
     export_metadata = _metadata_for_profile(metadata, profile)
     points = export_metadata.get("points", {})
@@ -59,7 +83,7 @@ def dxf_string_from_metadata(
 
     dxf = _DxfWriter(
         unit=unit,
-        crease_style=crease_style,
+        crease_style=crease_style_spec,
         include_creases=include_creases,
         include_construction=include_construction,
         include_rigid=include_rigid,
@@ -103,7 +127,7 @@ class _DxfWriter:
     def __init__(
         self,
         unit: str = "mm",
-        crease_style: CreaseStyle = "dashed",
+        crease_style: _CreaseStyleSpec | None = None,
         include_creases: bool = True,
         include_construction: bool = False,
         include_rigid: bool = True,
@@ -111,7 +135,7 @@ class _DxfWriter:
         profile: DxfProfile = "standard",
     ):
         self.unit = unit
-        self.crease_style = crease_style
+        self.crease_style = crease_style or _CreaseStyleSpec("dashed")
         self.include_creases = include_creases
         self.include_construction = include_construction
         self.include_rigid = include_rigid
@@ -197,6 +221,24 @@ class _DxfWriter:
         self.pair(0, "EOF")
 
     def add_line(self, start, end, kind: str) -> None:
+        if (
+            kind in {"valley", "mountain"}
+            and self.crease_style.name == "real dashed"
+        ):
+            assert self.crease_style.dash_length is not None
+            assert self.crease_style.gap_length is not None
+            for dash_start, dash_end in _real_dash_segments(
+                start,
+                end,
+                dash_length=self.crease_style.dash_length,
+                gap_length=self.crease_style.gap_length,
+            ):
+                self._add_line_entity(dash_start, dash_end, kind)
+            return
+
+        self._add_line_entity(start, end, kind)
+
+    def _add_line_entity(self, start, end, kind: str) -> None:
         layer, color, linetype = self._line_properties(kind)
         x0, y0 = _xy(start)
         x1, y1 = _xy(end)
@@ -224,7 +266,7 @@ class _DxfWriter:
         return "CUT_SIDE", 7, "CONTINUOUS"
 
     def _crease_linetype(self) -> str:
-        return "DASHED" if self.crease_style == "dashed" else "CONTINUOUS"
+        return "DASHED" if self.crease_style.name == "dashed" else "CONTINUOUS"
 
     def _layer_defs(self) -> list[tuple[str, int, str]]:
         layers = []
@@ -245,6 +287,129 @@ class _DxfWriter:
 
     def to_string(self) -> str:
         return "\n".join(self.rows) + "\n"
+
+
+def _parse_crease_style(crease_style: CreaseStyle) -> _CreaseStyleSpec:
+    if isinstance(crease_style, str):
+        if crease_style in {"solid", "dashed"}:
+            return _CreaseStyleSpec(crease_style)
+        raise ValueError(
+            "crease_style must be 'solid', 'dashed', or "
+            "['real dashed', dash_length, gap_length]."
+        )
+
+    if not isinstance(crease_style, (list, tuple)):
+        raise ValueError(
+            "crease_style must be 'solid', 'dashed', or "
+            "['real dashed', dash_length, gap_length]."
+        )
+    if len(crease_style) != 3 or crease_style[0] != "real dashed":
+        raise ValueError(
+            "A real dashed crease_style must have the form "
+            "['real dashed', dash_length, gap_length]."
+        )
+
+    dash_length = _positive_finite_length(crease_style[1], "dash_length")
+    gap_length = _positive_finite_length(crease_style[2], "gap_length")
+    return _CreaseStyleSpec("real dashed", dash_length, gap_length)
+
+
+def _positive_finite_length(value, name: str) -> float:
+    if isinstance(value, (str, bytes, bool)):
+        raise ValueError(f"{name} must be a positive finite number; got {value!r}.")
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{name} must be a positive finite number; got {value!r}."
+        ) from exc
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{name} must be a positive finite number; got {value!r}.")
+    return result
+
+
+def _real_dash_segments(
+    start,
+    end,
+    *,
+    dash_length: float,
+    gap_length: float,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Split a crease into centered, continuous LINE segments.
+
+    Full dashes and internal gaps retain their requested lengths. Any
+    remainder is divided equally between the two endpoint gaps, so a dash
+    never touches a side endpoint.
+    """
+    x0, y0 = _xy(start)
+    x1, y1 = _xy(end)
+    for value in (x0, y0, x1, y1):
+        if not math.isfinite(value):
+            raise ValueError(f"DXF coordinate must be finite, got {value!r}.")
+
+    dx = x1 - x0
+    dy = y1 - y0
+    line_length = math.hypot(dx, dy)
+    if not math.isfinite(line_length):
+        raise ValueError("DXF line length must be finite.")
+
+    period = dash_length + gap_length
+    tolerance = (
+        max(line_length, dash_length, gap_length) * 1e-12
+        + max(
+            math.ulp(line_length),
+            math.ulp(dash_length),
+            math.ulp(gap_length),
+        )
+        * 8.0
+    )
+
+    # A full dash must fit while leaving a non-zero gap at both endpoints.
+    if line_length <= dash_length + 2.0 * tolerance:
+        return []
+
+    estimated_count = (line_length + gap_length) / period
+    if not math.isfinite(estimated_count):
+        raise ValueError(
+            "The requested real dashed style would create more than "
+            f"{_MAX_REAL_DASH_SEGMENTS:,} LINE entities for one crease."
+        )
+
+    dash_count = int(math.floor(estimated_count))
+    if dash_count > _MAX_REAL_DASH_SEGMENTS:
+        raise ValueError(
+            "The requested real dashed style would create more than "
+            f"{_MAX_REAL_DASH_SEGMENTS:,} LINE entities for one crease."
+        )
+    occupied_length = (
+        dash_count * dash_length + max(0, dash_count - 1) * gap_length
+    )
+
+    # Exact division could otherwise put a solid dash directly on each side.
+    # Removing one dash makes the endpoint gaps adaptive while keeping the
+    # requested lengths for every emitted dash and internal gap.
+    if line_length - occupied_length <= 2.0 * tolerance:
+        dash_count -= 1
+        occupied_length = (
+            dash_count * dash_length + max(0, dash_count - 1) * gap_length
+        )
+    if dash_count <= 0:
+        return []
+
+    endpoint_gap = (line_length - occupied_length) / 2.0
+    ux = dx / line_length
+    uy = dy / line_length
+    segments = []
+    for index in range(dash_count):
+        start_distance = endpoint_gap + index * period
+        end_distance = start_distance + dash_length
+        segments.append(
+            (
+                (x0 + ux * start_distance, y0 + uy * start_distance),
+                (x0 + ux * end_distance, y0 + uy * end_distance),
+            )
+        )
+    return segments
 
 
 def _xy(coords) -> tuple[float, float]:

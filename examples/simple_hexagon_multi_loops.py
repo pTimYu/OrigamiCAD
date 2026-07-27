@@ -37,6 +37,7 @@ def main() -> None:
     pattern.print_summary()
     pattern.save_dxf(
             filename=f"{OUTPUT_DIR}/{N_LOOPS}loops_dxf.dxf",
+            crease_style=["real dashed", 2, 2],
             profile="solidworks"
     )
     pattern.draw(figsize=(12, 12))

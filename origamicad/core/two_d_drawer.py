@@ -650,7 +650,9 @@ class TwoDDrawer:
     def to_dxf_string(
         self,
         include_creases: bool = True,
-        crease_style: Literal["solid", "dashed"] = "dashed",
+        crease_style: (
+            Literal["solid", "dashed"] | list[object] | tuple[object, ...]
+        ) = "dashed",
         include_construction: bool = False,
         include_rigid: bool = True,
         include_side: bool = True,
@@ -675,7 +677,9 @@ class TwoDDrawer:
         self,
         filename: str,
         include_creases: bool = True,
-        crease_style: Literal["solid", "dashed"] = "dashed",
+        crease_style: (
+            Literal["solid", "dashed"] | list[object] | tuple[object, ...]
+        ) = "dashed",
         include_construction: bool = False,
         include_rigid: bool = True,
         include_side: bool = True,
@@ -685,8 +689,11 @@ class TwoDDrawer:
         Save the current 2D pattern as a DXF file.
 
         Crease lines are exported on valley/mountain crease layers. Use
-        crease_style="dashed" for dashed laser-cutting crease lines, or
-        include_creases=False to export only cut/rigid geometry. Use
+        crease_style="dashed" for a CAD linetype, or
+        crease_style=["real dashed", dash_length, gap_length] for separate
+        continuous LINE entities with gaps at both crease endpoints. Dash and
+        gap lengths use the pattern's length unit. Use include_creases=False
+        to export only cut/rigid geometry. Use
         profile="solidworks" for an R12-style inch-coordinate DXF that
         SolidWorks/eDrawings imports at the same physical size.
         """

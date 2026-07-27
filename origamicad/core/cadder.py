@@ -1917,7 +1917,9 @@ class Cadder(CadVisualizationMixin):
         self,
         filename: str,
         include_creases: bool = True,
-        crease_style: Literal["solid", "dashed"] = "dashed",
+        crease_style: (
+            Literal["solid", "dashed"] | list[object] | tuple[object, ...]
+        ) = "dashed",
         include_construction: bool = False,
         include_rigid: bool = True,
         include_side: bool = True,
