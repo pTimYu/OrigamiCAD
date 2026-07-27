@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from .kinematics import solve_kinematics, solve_simple_hexagon_kinematics
 from .layout import (
     build_packaging,
-    draw_hex_two_loops,
+    draw_hex_loops,
     hex_unit_chain,
     hexagon_packaging,
 )
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG,
         DEFAULT_INNER_DIHEDRAL_DEG,
         DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG,
+        DEFAULT_NUM_LOOPS,
         HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG,
         HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG,
         InsertionPanelState,
@@ -42,6 +43,7 @@ _INSERTION_EXPORTS = {
     "DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG",
     "DEFAULT_INNER_DIHEDRAL_DEG",
     "DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG",
+    "DEFAULT_NUM_LOOPS",
     "HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG",
     "HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG",
     "InsertionPanelState",
@@ -69,6 +71,7 @@ __all__ = [
     "DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG",
     "DEFAULT_INNER_DIHEDRAL_DEG",
     "DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG",
+    "DEFAULT_NUM_LOOPS",
     "HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG",
     "HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG",
     "HexUnit",
@@ -78,7 +81,7 @@ __all__ = [
     "LoopDihedralStats",
     "build_packaging",
     "classify_insertion_panel_states",
-    "draw_hex_two_loops",
+    "draw_hex_loops",
     "draw_insertion_simulation",
     "draw_insertion_stack_3d",
     "hex_unit_chain",

@@ -21,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from origamicad import Cadder, TwoDDrawer
 from origamicad.io.cad_export import save_cad
 from origamicad.patterns.hexagon import (
-    draw_hex_two_loops,
+    draw_hex_loops,
     solve_kinematics,
     stack_layers,
 )
@@ -35,8 +35,9 @@ NUM_LAYERS = 4
 
 def main() -> None:
     base_pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    draw_hex_two_loops(
+    draw_hex_loops(
         base_pattern,
+        n=3,
         start_point=(0.0, 0.0),
         l=SIDE_LENGTH,
         reverse=False,

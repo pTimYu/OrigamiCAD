@@ -33,11 +33,12 @@ from matplotlib.collections import PolyCollection
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from scipy.optimize import Bounds, LinearConstraint, milp
 
 from ...core.cadder import Cadder
 from ...core.two_d_drawer import TwoDDrawer
 from .kinematics import _HexagonKinematics
-from .layout import draw_hex_two_loops
+from .layout import draw_hex_loops
 from .stacking import stack_layers
 
 
@@ -59,6 +60,7 @@ DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG = (
 )
 DEFAULT_SIDE_LENGTH = 15.0
 DEFAULT_INNER_DIHEDRAL_DEG = 150.0
+DEFAULT_NUM_LOOPS = 2
 DEFAULT_NUM_LAYERS = 4
 
 
@@ -68,6 +70,7 @@ PanelStateSource = Literal[
     "connection",
     "same_outer_triangle",
     "remaining",
+    "closure_adjustment",
 ]
 
 
@@ -77,12 +80,13 @@ class InsertionPanelState(TypedDict):
     surface_id: str
     ring_index: int
     state: PanelState
+    requested_state: PanelState
     source: PanelStateSource
     adjacent_triangle_ids: tuple[str, ...]
 
 
 class LoopDihedralStats(TypedDict):
-    """Measured acute/obtuse dihedrals for one spatial loop."""
+    """Measured contact/snap dihedrals for one planar loop."""
 
     loop_index: int
     role: Literal["inner", "outer"]
@@ -136,6 +140,7 @@ class InsertionSimulationResult(TypedDict):
     num_combinations_tested: int
     num_kinematically_valid: int
     num_nonclipping: int
+    num_loops: int
     num_layers: int
     side_length: float
     layer_height: float
@@ -148,6 +153,7 @@ class InsertionSimulationResult(TypedDict):
     inner_constraint_ids: tuple[str, ...]
     outer_constraint_ids: tuple[str, ...]
     crease_loop_by_edge: dict[tuple[str, str], Literal["inner", "outer"]]
+    crease_ring_by_edge: dict[tuple[str, str], int]
     crease_assignment_by_edge: dict[
         tuple[str, str],
         Literal[
@@ -196,34 +202,40 @@ def _hexagon_lock_dihedral_pair() -> tuple[float, float]:
 
 def _classify_spatial_hinges(
     model: Cadder,
+    *,
+    panel_states: dict[str, InsertionPanelState],
+    panel_by_constraint: dict[str, str],
 ) -> tuple[
     tuple[str, ...],
     tuple[str, ...],
     dict[tuple[str, str], Literal["inner", "outer"]],
+    dict[tuple[str, str], int],
 ]:
-    """Assign each unique hinge to the inner or outer spatial loop.
-
-    The kinematic metadata is traversed with unit 0 first.  Consequently, a
-    constraint whose ID contains ``u0`` is either unique to the central unit or
-    is one of its shared physical hinges.  Shared hinges remain inner-owned.
-    """
+    """Assign each hinge to its insertion panel's innermost planar ring."""
     inner_ids: list[str] = []
     outer_ids: list[str] = []
     crease_loop_by_edge: dict[
         tuple[str, str],
         Literal["inner", "outer"],
     ] = {}
+    crease_ring_by_edge: dict[tuple[str, str], int] = {}
 
     for constraint_id, constraint in model.constraints.items():
         if constraint.kind != "dihedral_signed_increment":
             continue
         data = constraint.data
+        surface_id = panel_by_constraint[constraint_id]
+        panel = panel_states[surface_id]
+        ring_index = panel["ring_index"]
         role: Literal["inner", "outer"] = (
-            "inner"
-            if constraint_id.startswith("dihedral_signed_u0_")
-            else "outer"
+            "inner" if ring_index == 0 else "outer"
         )
         data["spatial_loop"] = role
+        data["spatial_loop_index"] = ring_index
+        data["insertion_panel_surface"] = surface_id
+        data["insertion_panel_ring"] = ring_index
+        data["insertion_panel_state"] = panel["state"]
+        data["insertion_panel_source"] = panel["source"]
         if role == "inner":
             inner_ids.append(constraint_id)
         else:
@@ -236,18 +248,22 @@ def _classify_spatial_hinges(
                 f"Physical hinge {edge} was assigned to both spatial loops."
             )
         crease_loop_by_edge[edge] = role
+        previous_ring = crease_ring_by_edge.get(edge)
+        if previous_ring is not None and previous_ring != ring_index:
+            raise RuntimeError(
+                f"Physical hinge {edge} was assigned to insertion rings "
+                f"{previous_ring} and {ring_index}."
+            )
+        crease_ring_by_edge[edge] = ring_index
 
-    if len(inner_ids) != 12 or len(outer_ids) != 48:
-        raise RuntimeError(
-            "Unexpected two-loop hinge topology: "
-            f"inner={len(inner_ids)}, outer={len(outer_ids)}; "
-            "expected inner=12 and outer=48."
-        )
+    if not inner_ids:
+        raise RuntimeError("Insertion topology has no inner-loop hinges.")
 
     return (
         tuple(inner_ids),
         tuple(outer_ids),
         crease_loop_by_edge,
+        crease_ring_by_edge,
     )
 
 
@@ -484,6 +500,7 @@ def classify_insertion_panel_states(
             "surface_id": surface_id,
             "ring_index": ring_index,
             "state": state,
+            "requested_state": state,
             "source": source,
             "adjacent_triangle_ids": tuple(
                 sorted(quad_triangles[surface_id])
@@ -569,6 +586,205 @@ def classify_insertion_panel_states(
     return states
 
 
+def _unit_panel_width_vectors(
+    pattern: TwoDDrawer,
+    unit: dict,
+) -> dict[str, np.ndarray]:
+    """Return each local panel's flat vector between its two triangle edges."""
+    vectors: dict[str, np.ndarray] = {}
+    local_creases = unit["local_creases"]
+    for local_index, surface_id in enumerate(unit["parallelograms"]):
+        first_triangle = unit["triangles"][local_index]
+        second_triangle = unit["triangles"][(local_index + 1) % 6]
+        first_edge = next(
+            crease["edge"]
+            for crease in local_creases
+            if (
+                crease["quad"] == surface_id
+                and crease["triangle"] == first_triangle
+            )
+        )
+        second_edge = next(
+            crease["edge"]
+            for crease in local_creases
+            if (
+                crease["quad"] == surface_id
+                and crease["triangle"] == second_triangle
+            )
+        )
+        first_midpoint = np.mean(
+            [
+                (
+                    pattern.points[point_id].x,
+                    pattern.points[point_id].y,
+                )
+                for point_id in first_edge
+            ],
+            axis=0,
+        )
+        second_midpoint = np.mean(
+            [
+                (
+                    pattern.points[point_id].x,
+                    pattern.points[point_id].y,
+                )
+                for point_id in second_edge
+            ],
+            axis=0,
+        )
+        vectors[surface_id] = second_midpoint - first_midpoint
+    return vectors
+
+
+def _reconcile_panel_sequence_for_rigid_closure(
+    pattern: TwoDDrawer,
+    panel_states: dict[str, InsertionPanelState],
+    *,
+    tolerance: float,
+) -> None:
+    """Resolve ambiguous outer-corner peers without rewriting inner rings.
+
+    The first surrounding ring follows the literal connection/contact/remain
+    rule.  On every later ring, snap panels already fixed on the completed
+    inner boundary act as the physical connections.  A binary closure solve
+    therefore selects the most-contact outer state compatible with those
+    frozen rings.  Any panel whose propagated request must change is recorded
+    explicitly as a ``closure_adjustment`` in insertion-only metadata.
+    """
+    panel_vectors = {
+        int(unit["count"]): _unit_panel_width_vectors(pattern, unit)
+        for unit in pattern.hex_units
+    }
+    unit_ring = {
+        int(unit["count"]): max(
+            panel_states[surface_id]["ring_index"]
+            for surface_id in unit["parallelograms"]
+        )
+        for unit in pattern.hex_units
+    }
+    maximum_ring = max(
+        panel["ring_index"]
+        for panel in panel_states.values()
+    )
+
+    for ring_index in range(1, maximum_ring + 1):
+        variable_ids = (
+            []
+            if ring_index == 1
+            else sorted(
+                surface_id
+                for surface_id, panel in panel_states.items()
+                if panel["ring_index"] == ring_index
+            )
+        )
+        variable_index = {
+            surface_id: index
+            for index, surface_id in enumerate(variable_ids)
+        }
+        rows: list[np.ndarray] = []
+        targets: list[float] = []
+
+        for unit in pattern.hex_units:
+            count = int(unit["count"])
+            if unit_ring[count] > ring_index:
+                continue
+            vectors = panel_vectors[count]
+            for axis in range(2):
+                row = np.zeros(len(variable_ids), dtype=float)
+                fixed_sum = 0.0
+                unknown_flat_sum = 0.0
+                for surface_id in unit["parallelograms"]:
+                    component = float(vectors[surface_id][axis])
+                    variable = variable_index.get(surface_id)
+                    if variable is None:
+                        state_sign = (
+                            1.0
+                            if panel_states[surface_id]["state"] == "contact"
+                            else -1.0
+                        )
+                        fixed_sum += state_sign * component
+                    else:
+                        row[variable] += 2.0 * component
+                        unknown_flat_sum += component
+                rows.append(row)
+                targets.append(-fixed_sum + unknown_flat_sum)
+
+        if not variable_ids:
+            if any(
+                abs(target) > tolerance
+                for target in targets
+            ):
+                raise RuntimeError(
+                    f"Insertion ring {ring_index} cannot close while "
+                    "preserving completed inner-ring panel states."
+                )
+            continue
+
+        matrix = np.asarray(rows, dtype=float)
+        target_vector = np.asarray(targets, dtype=float)
+        result = milp(
+            c=-np.ones(len(variable_ids), dtype=float),
+            integrality=np.ones(len(variable_ids), dtype=int),
+            bounds=Bounds(
+                np.zeros(len(variable_ids)),
+                np.ones(len(variable_ids)),
+            ),
+            constraints=LinearConstraint(
+                matrix,
+                target_vector,
+                target_vector,
+            ),
+            options={"presolve": True},
+        )
+        if not result.success or result.x is None:
+            raise RuntimeError(
+                "Could not reconcile insertion ring "
+                f"{ring_index} with rigid unit-cell closure: {result.message}"
+            )
+
+        for surface_id, value in zip(variable_ids, result.x):
+            panel = panel_states[surface_id]
+            selected_state: PanelState = (
+                "contact" if value >= 0.5 else "snap"
+            )
+            panel["state"] = selected_state
+            if selected_state != panel["requested_state"]:
+                panel["source"] = "closure_adjustment"
+
+
+def _panel_sequence_closure_errors(
+    pattern: TwoDDrawer,
+    panel_states: dict[str, InsertionPanelState],
+    *,
+    tolerance: float,
+) -> list[tuple[int, float]]:
+    """Return unit cells whose prescribed contact/snap projections cannot close.
+
+    Contact and snap dihedrals are supplementary, so their projected panel
+    widths have equal magnitudes and opposite signs.  Each rigid unit cell
+    must therefore have a zero signed sum of its six flat panel-width vectors.
+    This inexpensive geometric condition catches an incompatible state
+    sequence before the nonlinear solver stalls while compromising rigidity.
+    """
+    errors: list[tuple[int, float]] = []
+    for unit in pattern.hex_units:
+        closure = np.zeros(2, dtype=float)
+        vectors = _unit_panel_width_vectors(pattern, unit)
+        for surface_id in unit["parallelograms"]:
+            state_sign = (
+                1.0
+                if panel_states[surface_id]["state"] == "contact"
+                else -1.0
+            )
+            closure += state_sign * vectors[surface_id]
+
+        closure_error = float(np.linalg.norm(closure))
+        if closure_error > tolerance:
+            errors.append((int(unit["count"]), closure_error))
+
+    return errors
+
+
 def _constraint_panel_ids(
     model: Cadder,
     pattern: TwoDDrawer,
@@ -620,11 +836,142 @@ def _set_panel_sequence_targets(
             else snap_dihedral_deg
         )
         data["target_kind"] = panel["state"]
-        data["insertion_panel_surface"] = surface_id
-        data["insertion_panel_ring"] = panel["ring_index"]
         data["target_increment"] = float(
             data["sign"] * np.deg2rad(180.0 - target)
         )
+
+
+def _panel_sequence_branch_guess(
+    model: Cadder,
+    pattern: TwoDDrawer,
+    *,
+    panel_states: dict[str, InsertionPanelState],
+    contact_dihedral_deg: float,
+    fixed_triangle_surface_id: str,
+    tolerance: float,
+) -> np.ndarray:
+    """Construct an inside-out coordinate seed on the requested snap branch."""
+    quad_records: dict[str, dict[str, list[str]]] = defaultdict(dict)
+    for unit in pattern.hex_units:
+        for crease in unit["local_creases"]:
+            quad_records[crease["quad"]][crease["triangle"]] = crease["edge"]
+
+    fold_angle_rad = np.deg2rad(180.0 - contact_dihedral_deg)
+    contact_scale = float(np.cos(fold_angle_rad))
+    graph: dict[str, list[tuple[str, np.ndarray]]] = defaultdict(list)
+    panel_distances: list[float] = []
+
+    for surface_id, triangle_edges in quad_records.items():
+        if len(triangle_edges) != 2:
+            raise RuntimeError(
+                f"Insertion panel '{surface_id}' must connect two triangles."
+            )
+        (
+            (first_triangle, first_edge),
+            (second_triangle, second_edge),
+        ) = tuple(triangle_edges.items())
+        first_midpoint = np.mean(
+            [
+                (
+                    pattern.points[point_id].x,
+                    pattern.points[point_id].y,
+                )
+                for point_id in first_edge
+            ],
+            axis=0,
+        )
+        second_midpoint = np.mean(
+            [
+                (
+                    pattern.points[point_id].x,
+                    pattern.points[point_id].y,
+                )
+                for point_id in second_edge
+            ],
+            axis=0,
+        )
+        flat_vector = second_midpoint - first_midpoint
+        panel_distances.append(float(np.linalg.norm(flat_vector)))
+        projected_scale = (
+            contact_scale
+            if panel_states[surface_id]["state"] == "contact"
+            else -contact_scale
+        )
+        translation_delta = (projected_scale - 1.0) * flat_vector
+        graph[first_triangle].append(
+            (second_triangle, translation_delta)
+        )
+        graph[second_triangle].append(
+            (first_triangle, -translation_delta)
+        )
+
+    if fixed_triangle_surface_id not in graph:
+        raise RuntimeError(
+            f"Fixed triangle '{fixed_triangle_surface_id}' is not connected "
+            "to the insertion panel graph."
+        )
+    translations = {
+        fixed_triangle_surface_id: np.zeros(2, dtype=float)
+    }
+    queue: deque[str] = deque([fixed_triangle_surface_id])
+    while queue:
+        triangle_id = queue.popleft()
+        for neighbor_id, delta in graph[triangle_id]:
+            proposed = translations[triangle_id] + delta
+            previous = translations.get(neighbor_id)
+            if previous is None:
+                translations[neighbor_id] = proposed
+                queue.append(neighbor_id)
+            elif np.linalg.norm(previous - proposed) > tolerance:
+                raise RuntimeError(
+                    "Insertion branch construction found a non-closing "
+                    f"triangle path at '{neighbor_id}'."
+                )
+
+    if set(translations) != set(graph):
+        missing = sorted(set(graph) - set(translations))
+        raise RuntimeError(
+            f"Insertion triangle graph is disconnected: {missing}."
+        )
+
+    panel_distance = float(np.mean(panel_distances))
+    mountain_height = panel_distance * float(np.sin(fold_angle_rad))
+    kinematics = _HexagonKinematics(model)
+    proposed_by_point: dict[str, list[np.ndarray]] = defaultdict(list)
+    for triangle_id, translation in translations.items():
+        triangle_kind = kinematics._triangle_crease_kind(triangle_id)
+        z_value = 0.0 if triangle_kind == "valley" else mountain_height
+        for point_id in pattern.surfaces[triangle_id].vertices:
+            flat_point = pattern.points[point_id]
+            proposed_by_point[point_id].append(
+                np.array(
+                    [
+                        flat_point.x + translation[0],
+                        flat_point.y + translation[1],
+                        z_value,
+                    ],
+                    dtype=float,
+                )
+            )
+
+    coordinates = model.get_coordinate_vector().copy()
+    for point_index, point_id in enumerate(model.point_ids()):
+        proposals = proposed_by_point.get(point_id)
+        if not proposals:
+            continue
+        reference = proposals[0]
+        if any(
+            np.linalg.norm(proposal - reference) > tolerance
+            for proposal in proposals[1:]
+        ):
+            raise RuntimeError(
+                f"Insertion branch gives inconsistent coordinates for "
+                f"point '{point_id}'."
+            )
+        coordinates[
+            3 * point_index: 3 * point_index + 3
+        ] = np.mean(proposals, axis=0)
+    return coordinates
 
 
 def _set_spatial_dihedral_targets(
@@ -695,31 +1042,28 @@ def _loop_dihedral_stats(
     model: Cadder,
 ) -> list[LoopDihedralStats]:
     values: dict[
-        Literal["inner", "outer"],
+        int,
         dict[Literal["acute", "obtuse"], list[float]],
-    ] = {
-        "inner": {"acute": [], "obtuse": []},
-        "outer": {"acute": [], "obtuse": []},
-    }
+    ] = defaultdict(lambda: {"acute": [], "obtuse": []})
     for constraint in model.constraints.values():
         if constraint.kind != "dihedral_signed_increment":
             continue
         data = constraint.data
-        role = data["spatial_loop"]
+        ring_index = int(data["spatial_loop_index"])
         kind: Literal["acute", "obtuse"] = (
             "acute"
             if data["target_kind"] in {"outer-acute", "snap"}
             else "obtuse"
         )
-        values[role][kind].append(_measured_dihedral(model, data))
+        values[ring_index][kind].append(_measured_dihedral(model, data))
 
     rows: list[LoopDihedralStats] = []
-    for loop_index, role in (
-        (0, "inner"),
-        (1, "outer"),
-    ):
-        acute_values = values[role]["acute"]
-        obtuse_values = values[role]["obtuse"]
+    for loop_index in sorted(values):
+        role: Literal["inner", "outer"] = (
+            "inner" if loop_index == 0 else "outer"
+        )
+        acute_values = values[loop_index]["acute"]
+        obtuse_values = values[loop_index]["obtuse"]
         rows.append(
             {
                 "loop_index": loop_index,
@@ -1160,6 +1504,7 @@ def simulate_insertion(
     num_layers: int = DEFAULT_NUM_LAYERS,
     side_length: float = DEFAULT_SIDE_LENGTH,
     *,
+    num_loops: int = DEFAULT_NUM_LOOPS,
     assignment_mode: Literal[
         "panel_sequence",
         "regular_masks",
@@ -1179,16 +1524,16 @@ def simulate_insertion(
     beyond_contact_policy: Literal["search", "error", "stop"] = "search",
     verbose: bool = False,
 ) -> InsertionSimulationResult:
-    """Fold the surrounding loop toward the requested insertion angle.
+    """Fold concentric planar loops toward the requested insertion angle.
 
     The requested inner obtuse angle is the ``contact`` panel target.  A
     ``snap`` panel receives its supplement ``180 degrees - contact``.
 
     ``assignment_mode="panel_sequence"`` applies the insertion-specific,
-    inner-to-outer propagation rule.  ``"regular_masks"`` retains the older
-    six-sector mask search.  In regular-mask mode, mask ``111111`` produces
-    the reference sixfold state; omitting ``combination_masks`` tests masks
-    1 through 63.
+    inner-to-outer propagation rule to all ``num_loops`` planar loops.
+    ``"regular_masks"`` retains the older two-loop six-sector mask search.
+    In regular-mask mode, mask ``111111`` produces the reference sixfold
+    state; omitting ``combination_masks`` tests masks 1 through 63.
     """
     if assignment_mode not in {"panel_sequence", "regular_masks"}:
         raise ValueError(
@@ -1289,6 +1634,16 @@ def simulate_insertion(
     num_layers = int(num_layers)
     if num_layers < 1:
         raise ValueError("num_layers must be at least 1.")
+    if isinstance(num_loops, bool) or int(num_loops) != num_loops:
+        raise ValueError("num_loops must be an integer.")
+    num_loops = int(num_loops)
+    if num_loops < 1:
+        raise ValueError("num_loops must be at least 1.")
+    if assignment_mode == "regular_masks" and num_loops != 2:
+        raise ValueError(
+            "assignment_mode='regular_masks' is the legacy two-loop search; "
+            "use assignment_mode='panel_sequence' for arbitrary num_loops."
+        )
 
     for name, value in (
         ("solve_tolerance", solve_tolerance),
@@ -1341,12 +1696,38 @@ def simulate_insertion(
         raise ValueError("contact_tolerance must be a finite positive value.")
 
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    draw_hex_two_loops(
+    draw_hex_loops(
         pattern,
+        n=num_loops,
         start_point=(0.0, 0.0),
         l=side_length,
         reverse=False,
     )
+    panel_states = classify_insertion_panel_states(pattern)
+    if assignment_mode == "panel_sequence":
+        _reconcile_panel_sequence_for_rigid_closure(
+            pattern,
+            panel_states,
+            tolerance=geometry_tolerance * max(1.0, side_length),
+        )
+        closure_errors = _panel_sequence_closure_errors(
+            pattern,
+            panel_states,
+            tolerance=geometry_tolerance * max(1.0, side_length),
+        )
+        if closure_errors:
+            details = ", ".join(
+                f"unit {unit_count}: {error:.6g} mm"
+                for unit_count, error in closure_errors[:12]
+            )
+            raise ValueError(
+                "The reconciled insertion panel sequence is internally "
+                f"inconsistent for num_loops={num_loops}: the signed "
+                "projected panel widths do not close for "
+                f"{len(closure_errors)} unit cells ({details}). Contact and "
+                "snap targets are supplementary, so a nonzero closure cannot "
+                "be removed without distorting rigid panels."
+            )
     model = Cadder.from_drawer(pattern)
     kinematics = _HexagonKinematics(model)
     kinematics._add_kinematic_constraints(
@@ -1356,14 +1737,25 @@ def simulate_insertion(
         valley_z=0.0,
         strict_unique_edges=False,
     )
+    panel_by_constraint = _constraint_panel_ids(model, pattern)
     (
         inner_constraint_ids,
         outer_constraint_ids,
         crease_loop_by_edge,
-    ) = _classify_spatial_hinges(model)
-    mode_groups = _classify_outer_mode_groups(model, pattern)
-    panel_states = classify_insertion_panel_states(pattern)
-    panel_by_constraint = _constraint_panel_ids(model, pattern)
+        crease_ring_by_edge,
+    ) = _classify_spatial_hinges(
+        model,
+        panel_states=panel_states,
+        panel_by_constraint=panel_by_constraint,
+    )
+    mode_groups = (
+        _classify_outer_mode_groups(model, pattern)
+        if num_loops == 2
+        else ()
+    )
+    # Insertion-only metadata: deliberately kept out of the core model types.
+    pattern.insertion_panel_states = panel_states
+    model.insertion_panel_states = panel_states
 
     coordinates = kinematics._initial_guess(
         mountain_height=max(1.0, 0.15 * side_length),
@@ -1371,44 +1763,58 @@ def simulate_insertion(
     )
     maximum_residual = 0.0
     uniform_branch_angle = 180.0 - branch_acute_start_deg
-    for step_index, target in enumerate(
-        np.linspace(
-            start_dihedral_deg,
-            uniform_branch_angle,
-            int(initial_steps),
-        ),
-        start=1,
-    ):
-        _set_spatial_dihedral_targets(
+    use_direct_panel_branch = (
+        assignment_mode == "panel_sequence"
+        and num_loops > 2
+    )
+    if use_direct_panel_branch:
+        coordinates = _panel_sequence_branch_guess(
             model,
-            inner_dihedral_deg=float(target),
-            outer_dihedral_deg=float(target),
+            pattern,
+            panel_states=panel_states,
+            contact_dihedral_deg=realized_inner_dihedral_deg,
+            fixed_triangle_surface_id="tri_0_1",
+            tolerance=geometry_tolerance * max(1.0, side_length),
         )
-        report = model.solve(
-            X0=coordinates,
-            update_model=False,
-            max_nfev=int(max_nfev_per_step),
-            tol=solve_tolerance,
-            compute_rank=False,
-        )
-        maximum_residual = max(
-            maximum_residual,
-            report.max_abs_residual,
-        )
-        if report.max_abs_residual > feasibility_tolerance:
-            raise RuntimeError(
-                "Could not reach the uniform starting configuration: "
-                f"target={target:.9g} degrees, "
-                f"residual={report.max_abs_residual:.3e}."
+    else:
+        for step_index, target in enumerate(
+            np.linspace(
+                start_dihedral_deg,
+                uniform_branch_angle,
+                int(initial_steps),
+            ),
+            start=1,
+        ):
+            _set_spatial_dihedral_targets(
+                model,
+                inner_dihedral_deg=float(target),
+                outer_dihedral_deg=float(target),
             )
-        coordinates = report.x.copy()
-        model.set_coordinate_vector(coordinates)
-        if verbose:
-            print(
-                f"[initial {step_index:02d}/{initial_steps}] "
-                f"inner={target:.6f} deg, outer={target:.6f} deg, "
-                f"residual={report.max_abs_residual:.3e}"
+            report = model.solve(
+                X0=coordinates,
+                update_model=False,
+                max_nfev=int(max_nfev_per_step),
+                tol=solve_tolerance,
+                compute_rank=False,
             )
+            maximum_residual = max(
+                maximum_residual,
+                report.max_abs_residual,
+            )
+            if report.max_abs_residual > feasibility_tolerance:
+                raise RuntimeError(
+                    "Could not reach the uniform starting configuration: "
+                    f"target={target:.9g} degrees, "
+                    f"residual={report.max_abs_residual:.3e}."
+                )
+            coordinates = report.x.copy()
+            model.set_coordinate_vector(coordinates)
+            if verbose:
+                print(
+                    f"[initial {step_index:02d}/{initial_steps}] "
+                    f"inner={target:.6f} deg, outer={target:.6f} deg, "
+                    f"residual={report.max_abs_residual:.3e}"
+                )
 
     branch_coordinates = coordinates.copy()
     attempts: list[CombinationAttempt] = []
@@ -1418,10 +1824,14 @@ def simulate_insertion(
         candidate_coordinates = branch_coordinates.copy()
         candidate_report = None
         if assignment_mode == "panel_sequence":
-            target_sequence = np.linspace(
-                uniform_branch_angle,
-                realized_inner_dihedral_deg,
-                int(panel_sequence_steps),
+            target_sequence = (
+                np.array([realized_inner_dihedral_deg], dtype=float)
+                if use_direct_panel_branch
+                else np.linspace(
+                    uniform_branch_angle,
+                    realized_inner_dihedral_deg,
+                    int(panel_sequence_steps),
+                )
             )
         else:
             target_sequence = 180.0 - np.linspace(
@@ -1710,6 +2120,7 @@ def simulate_insertion(
         "num_combinations_tested": len(attempts),
         "num_kinematically_valid": len(valid_attempts),
         "num_nonclipping": len(nonclipping_attempts),
+        "num_loops": num_loops,
         "num_layers": num_layers,
         "side_length": side_length,
         "layer_height": stack["layer_height"],
@@ -1722,6 +2133,7 @@ def simulate_insertion(
         "inner_constraint_ids": inner_constraint_ids,
         "outer_constraint_ids": outer_constraint_ids,
         "crease_loop_by_edge": crease_loop_by_edge,
+        "crease_ring_by_edge": crease_ring_by_edge,
         "crease_assignment_by_edge": crease_assignment_by_edge,
         "panel_states": panel_states,
         "contact_panel_ids": frozenset(
@@ -1744,11 +2156,14 @@ def simulate_insertion(
 def print_insertion_report(result: InsertionSimulationResult) -> None:
     """Print the mixed-mode search and selected loop dihedrals."""
     if result["assignment_mode"] == "panel_sequence":
-        print("Spatial two-loop contact/snap insertion simulation")
-        print("-------------------------------------------------")
+        title = (
+            f"Spatial {result['num_loops']}-loop contact/snap "
+            "insertion simulation"
+        )
     else:
-        print("Spatial two-loop mixed A/O simulation")
-        print("-------------------------------------")
+        title = "Spatial two-loop mixed A/O simulation"
+    print(title)
+    print("-" * len(title))
     if result["assignment_mode"] == "panel_sequence":
         assignment = (
             "inner-to-outer propagated contact/snap parallelograms"
@@ -1839,6 +2254,7 @@ def print_insertion_report(result: InsertionSimulationResult) -> None:
         "Closest panel pair:            "
         f"{result['closest_panel_pair']}"
     )
+    print(f"Planar loops:                   {result['num_loops']}")
     print(f"Stacked layers:                 {result['num_layers']}")
     print(f"Layer height:                   {result['layer_height']:.6f} mm")
     print(
@@ -1891,6 +2307,7 @@ def print_insertion_report(result: InsertionSimulationResult) -> None:
             "connection",
             "same_outer_triangle",
             "remaining",
+            "closure_adjustment",
         )
         for ring_index in rings:
             for source in sources:

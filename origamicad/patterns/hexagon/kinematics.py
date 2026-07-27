@@ -33,7 +33,8 @@ class _HexagonKinematics:
         if not self.hex_units:
             raise ValueError(
                 "No hex-unit metadata found. Build the pattern with "
-                "build_packaging() before creating the Cadder model."
+                "draw_hex_loops() or build_packaging() before creating "
+                "the Cadder model."
             )
 
         if valley_sign not in {+1, -1}:

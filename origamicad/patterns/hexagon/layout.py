@@ -338,16 +338,22 @@ def hexagon_packaging(
 build_packaging = hexagon_packaging
 
 
-def draw_hex_two_loops(
+def draw_hex_loops(
     pattern: TwoDDrawer,
+    n: int = 2,
     start_point: Coordinate = (0.0, 0.0),
     l: float = 15.0,
     reverse: bool = False,
 ) -> list[HexUnit]:
     """
-    Draw one central hexagon unit chain and six surrounding unit chains.
+    Draw ``n`` concentric hexagonal loops of unit chains.
 
-    This version uses overlapping-panel placement.
+    Loop 1 contains the central unit chain.  Every later loop traces a regular
+    hexagon around it using overlapping-panel placement.  Loop ``k`` contains
+    ``6 * (k - 1)`` unique unit chains and has ``k`` unit-chain centers along
+    each side, including the two corner centers.  The center-point hexagon for
+    loop ``k >= 2`` has side length ``sqrt(7) * l * (k - 1)`` and is parallel
+    to every other loop.
 
     Set ``reverse=True`` to exchange all mountain and valley crease labels.
     The line geometry and the local kinematic metadata are reversed together.
@@ -357,40 +363,69 @@ def draw_hex_two_loops(
         pattern.hex_units
     """
 
+    try:
+        integer_n = int(n)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("n must be a positive integer.") from exc
+    if isinstance(n, bool) or integer_n != n or integer_n < 1:
+        raise ValueError("n must be a positive integer.")
+    if not np.isfinite(l) or l <= 0:
+        raise ValueError("l must be a finite positive value.")
+
+    n = integer_n
     x0, y0 = start_point
     h: float = float(l * np.sqrt(3) / 2)
 
-    units: list[HexUnit] = []
-
     # First loop: central unit chain
-    unit = hex_unit_chain(
-        pattern,
-        start_point=(x0, y0),
-        l=l,
-        count=0,
-        reverse=reverse,
-    )
-    units.append(unit)
-
-    # Second loop: six surrounding unit chains
-    second_loop_start_points: list[Coordinate] = [
-        (x0 - 0.5 * l, y0 + 3 * h),
-        (x0 + 2.0 * l, y0 + 2 * h),
-        (x0 + 2.5 * l, y0 - 1 * h),
-        (x0 + 0.5 * l, y0 - 3 * h),
-        (x0 - 2.0 * l, y0 - 2 * h),
-        (x0 - 2.5 * l, y0 + 1 * h),
-    ]
-
-    for count, sp in enumerate(second_loop_start_points, start=1):
-        unit = hex_unit_chain(
+    units: list[HexUnit] = [
+        hex_unit_chain(
             pattern,
-            start_point=sp,
+            start_point=(x0, y0),
             l=l,
-            count=count,
+            count=0,
             reverse=reverse,
         )
-        units.append(unit)
+    ]
+
+    # These are the six loop-2 corner offsets.  Consecutive offsets are also
+    # the six directions of the lattice, so scaling and subdividing their
+    # edges produces every larger, parallel center-point hexagon.
+    corner_offsets = np.array(
+        [
+            (-0.5 * l, 3.0 * h),
+            (2.0 * l, 2.0 * h),
+            (2.5 * l, -1.0 * h),
+            (0.5 * l, -3.0 * h),
+            (-2.0 * l, -2.0 * h),
+            (-2.5 * l, 1.0 * h),
+        ],
+        dtype=float,
+    )
+
+    for loop_number in range(2, n + 1):
+        edge_segments = loop_number - 1
+        loop_corners = edge_segments * corner_offsets
+
+        for side_index in range(6):
+            side_start = loop_corners[side_index]
+            side_end = loop_corners[(side_index + 1) % 6]
+            side_step = (side_end - side_start) / edge_segments
+
+            # Exclude the end corner: it is the next side's start corner.
+            for step_index in range(edge_segments):
+                offset = side_start + step_index * side_step
+                units.append(
+                    hex_unit_chain(
+                        pattern,
+                        start_point=(
+                            float(x0 + offset[0]),
+                            float(y0 + offset[1]),
+                        ),
+                        l=l,
+                        count=len(units),
+                        reverse=reverse,
+                    )
+                )
 
     pattern.hex_units = units
     return units
