@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import io
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import ezdxf
+from ezdxf import bbox, units
+
 
 CreaseStyle = Literal["solid", "dashed"] | list[object] | tuple[object, ...]
-DxfProfile = Literal["standard", "solidworks"]
+DxfProfile = Literal["solidworks"]
 _MAX_REAL_DASH_SEGMENTS = 1_000_000
+_DASH_LENGTH_MM = 3.0
 
 
 @dataclass(frozen=True)
@@ -26,9 +31,9 @@ def save_dxf(
     include_construction: bool = False,
     include_rigid: bool = True,
     include_side: bool = True,
-    profile: DxfProfile = "standard",
+    profile: DxfProfile = "solidworks",
 ) -> Path:
-    """Save 2D metadata as an ASCII DXF file."""
+    """Save 2D metadata as an AutoCAD/SolidWorks-compatible ASCII DXF file."""
     path = Path(filename)
     path.write_text(
         dxf_string_from_metadata(
@@ -41,7 +46,7 @@ def save_dxf(
             profile=profile,
         ),
         encoding="ascii",
-        newline="\n",
+        newline="",
     )
     return path
 
@@ -53,49 +58,58 @@ def dxf_string_from_metadata(
     include_construction: bool = False,
     include_rigid: bool = True,
     include_side: bool = True,
-    profile: DxfProfile = "standard",
+    profile: DxfProfile = "solidworks",
 ) -> str:
-    """Convert 2D metadata to a simple DXF string made of LINE entities.
+    """Convert 2D metadata to a complete AutoCAD 2000 DXF document.
 
     ``crease_style=["real dashed", a, b]`` emits actual continuous LINE
     entities of length ``a``, separated by empty spans of length ``b``.
     Both lengths use the unit declared by the input metadata.
+
+    The only supported profile is ``"solidworks"``. It is retained as an
+    argument for source compatibility.
     """
     crease_style_spec = _parse_crease_style(crease_style)
-    if profile not in {"standard", "solidworks"}:
-        raise ValueError("profile must be 'standard' or 'solidworks'.")
-
-    if profile == "solidworks" and crease_style_spec.name == "real dashed":
-        source_unit = metadata.get("metadata", {}).get("unit", "mm")
-        scale = _unit_to_inches_factor(source_unit)
-        assert crease_style_spec.dash_length is not None
-        assert crease_style_spec.gap_length is not None
-        crease_style_spec = _CreaseStyleSpec(
-            name="real dashed",
-            dash_length=crease_style_spec.dash_length * scale,
-            gap_length=crease_style_spec.gap_length * scale,
+    if profile != "solidworks":
+        raise ValueError(
+            "The 'standard' DXF profile has been removed because it emitted "
+            "invalid AC1015 tables. The only supported profile is 'solidworks'."
         )
 
-    export_metadata = _metadata_for_profile(metadata, profile)
-    points = export_metadata.get("points", {})
-    lines = export_metadata.get("lines", {})
-    unit = export_metadata.get("metadata", {}).get("unit", "mm")
+    source_unit = metadata.get("metadata", {}).get("unit", "mm")
+    document_unit = _dxf_unit(source_unit)
+    points = metadata.get("points", {})
+    lines = metadata.get("lines", {})
 
-    dxf = _DxfWriter(
-        unit=unit,
-        crease_style=crease_style_spec,
+    document = ezdxf.new("R2000", setup=False, units=document_unit)
+    dash_length = _DASH_LENGTH_MM * units.conversion_factor(
+        units.MM,
+        document_unit,
+    )
+    document.linetypes.add(
+        "DASHED",
+        pattern=[
+            2.0 * dash_length,
+            dash_length,
+            -dash_length,
+        ],
+        description="Dashed __ __ __",
+    )
+    for layer, color, linetype in _layer_defs(
+        crease_style_spec,
         include_creases=include_creases,
         include_construction=include_construction,
         include_rigid=include_rigid,
         include_side=include_side,
-        profile=profile,
-    )
-    dxf.write_header()
-    dxf.write_tables()
-    dxf.begin_entities()
+    ):
+        document.layers.add(layer, color=color, linetype=linetype)
+
+    modelspace = document.modelspace()
 
     for line_id, line in lines.items():
         kind = line.get("kind", "side")
+        if kind not in {"valley", "mountain", "construction", "rigid", "side"}:
+            kind = "side"
 
         if kind in {"valley", "mountain"} and not include_creases:
             continue
@@ -113,180 +127,114 @@ def dxf_string_from_metadata(
                 f"Line '{line_id}' references missing point(s): {start}, {end}."
             )
 
-        dxf.add_line(
-            points[start],
-            points[end],
-            kind=kind,
-        )
-
-    dxf.end_entities()
-    return dxf.to_string()
-
-
-class _DxfWriter:
-    def __init__(
-        self,
-        unit: str = "mm",
-        crease_style: _CreaseStyleSpec | None = None,
-        include_creases: bool = True,
-        include_construction: bool = False,
-        include_rigid: bool = True,
-        include_side: bool = True,
-        profile: DxfProfile = "standard",
-    ):
-        self.unit = unit
-        self.crease_style = crease_style or _CreaseStyleSpec("dashed")
-        self.include_creases = include_creases
-        self.include_construction = include_construction
-        self.include_rigid = include_rigid
-        self.include_side = include_side
-        self.profile = profile
-        self.rows: list[str] = []
-
-    def pair(self, code: int, value) -> None:
-        self.rows.extend([str(code), str(value)])
-
-    def write_header(self) -> None:
-        self.pair(0, "SECTION")
-        self.pair(2, "HEADER")
-        self.pair(9, "$ACADVER")
-        if self.profile == "solidworks":
-            # SolidWorks/eDrawings is most reliable with this simple R12-style
-            # DXF. R12 has no dependable unit header, so the profile scales
-            # coordinates to inches before writing.
-            self.pair(1, "AC1009")
-        else:
-            self.pair(1, "AC1015")
-            self.pair(9, "$INSUNITS")
-            self.pair(70, _dxf_unit_code(self.unit))
-            self.pair(9, "$MEASUREMENT")
-            self.pair(70, _dxf_measurement_code(self.unit))
-        self.pair(0, "ENDSEC")
-
-    def write_tables(self) -> None:
-        self.pair(0, "SECTION")
-        self.pair(2, "TABLES")
-        self._write_linetype_table()
-        self._write_layer_table()
-        self.pair(0, "ENDSEC")
-
-    def _write_linetype_table(self) -> None:
-        self.pair(0, "TABLE")
-        self.pair(2, "LTYPE")
-        self.pair(70, 2)
-
-        self.pair(0, "LTYPE")
-        self.pair(2, "CONTINUOUS")
-        self.pair(70, 0)
-        self.pair(3, "Solid line")
-        self.pair(72, 65)
-        self.pair(73, 0)
-        self.pair(40, 0.0)
-
-        self.pair(0, "LTYPE")
-        self.pair(2, "DASHED")
-        self.pair(70, 0)
-        self.pair(3, "Dashed __ __ __")
-        self.pair(72, 65)
-        self.pair(73, 2)
-        self.pair(40, 6.0)
-        self.pair(49, 3.0)
-        self.pair(74, 0)
-        self.pair(49, -3.0)
-        self.pair(74, 0)
-
-        self.pair(0, "ENDTAB")
-
-    def _write_layer_table(self) -> None:
-        self.pair(0, "TABLE")
-        self.pair(2, "LAYER")
-        layer_defs = self._layer_defs()
-        self.pair(70, len(layer_defs))
-
-        for layer, color, linetype in layer_defs:
-            self.pair(0, "LAYER")
-            self.pair(2, layer)
-            self.pair(70, 0)
-            self.pair(62, color)
-            self.pair(6, linetype)
-
-        self.pair(0, "ENDTAB")
-
-    def begin_entities(self) -> None:
-        self.pair(0, "SECTION")
-        self.pair(2, "ENTITIES")
-
-    def end_entities(self) -> None:
-        self.pair(0, "ENDSEC")
-        self.pair(0, "EOF")
-
-    def add_line(self, start, end, kind: str) -> None:
         if (
             kind in {"valley", "mountain"}
-            and self.crease_style.name == "real dashed"
+            and crease_style_spec.name == "real dashed"
         ):
-            assert self.crease_style.dash_length is not None
-            assert self.crease_style.gap_length is not None
+            assert crease_style_spec.dash_length is not None
+            assert crease_style_spec.gap_length is not None
             for dash_start, dash_end in _real_dash_segments(
-                start,
-                end,
-                dash_length=self.crease_style.dash_length,
-                gap_length=self.crease_style.gap_length,
+                points[start],
+                points[end],
+                dash_length=crease_style_spec.dash_length,
+                gap_length=crease_style_spec.gap_length,
             ):
-                self._add_line_entity(dash_start, dash_end, kind)
-            return
+                _add_line_entity(
+                    modelspace,
+                    dash_start,
+                    dash_end,
+                    kind,
+                    crease_style_spec,
+                )
+            continue
 
-        self._add_line_entity(start, end, kind)
+        _add_line_entity(
+            modelspace,
+            points[start],
+            points[end],
+            kind,
+            crease_style_spec,
+        )
 
-    def _add_line_entity(self, start, end, kind: str) -> None:
-        layer, color, linetype = self._line_properties(kind)
-        x0, y0 = _xy(start)
-        x1, y1 = _xy(end)
+    extents = bbox.extents(modelspace, fast=True)
+    if extents.has_data:
+        document.header["$EXTMIN"] = extents.extmin
+        document.header["$EXTMAX"] = extents.extmax
+        document.header["$LIMMIN"] = extents.extmin.vec2
+        document.header["$LIMMAX"] = extents.extmax.vec2
 
-        self.pair(0, "LINE")
-        self.pair(8, layer)
-        self.pair(62, color)
-        self.pair(6, linetype)
-        self.pair(10, _number(x0))
-        self.pair(20, _number(y0))
-        self.pair(30, "0.0")
-        self.pair(11, _number(x1))
-        self.pair(21, _number(y1))
-        self.pair(31, "0.0")
+    stream = io.StringIO()
+    document.write(stream, fmt="asc")
+    # CRLF is the conventional ASCII DXF line ending and remains the most
+    # conservative choice for Windows CAD applications.
+    return stream.getvalue().replace("\r\n", "\n").replace("\n", "\r\n")
 
-    def _line_properties(self, kind: str) -> tuple[str, int, str]:
-        if kind == "valley":
-            return "CREASE_VALLEY", 5, self._crease_linetype()
-        if kind == "mountain":
-            return "CREASE_MOUNTAIN", 1, self._crease_linetype()
-        if kind == "rigid":
-            return "RIGID", 8, "CONTINUOUS"
-        if kind == "construction":
-            return "CONSTRUCTION", 9, "DASHED"
-        return "CUT_SIDE", 7, "CONTINUOUS"
 
-    def _crease_linetype(self) -> str:
-        return "DASHED" if self.crease_style.name == "dashed" else "CONTINUOUS"
+def _add_line_entity(
+    modelspace,
+    start,
+    end,
+    kind: str,
+    crease_style: _CreaseStyleSpec,
+) -> None:
+    x0, y0 = _finite_xy(start)
+    x1, y1 = _finite_xy(end)
+    layer, color, linetype = _line_properties(kind, crease_style)
+    modelspace.add_line(
+        (x0, y0),
+        (x1, y1),
+        dxfattribs={
+            "layer": layer,
+            "color": color,
+            "linetype": linetype,
+        },
+    )
 
-    def _layer_defs(self) -> list[tuple[str, int, str]]:
-        layers = []
-        if self.include_side:
-            layers.append(("CUT_SIDE", 7, "CONTINUOUS"))
-        if self.include_rigid:
-            layers.append(("RIGID", 8, "CONTINUOUS"))
-        if self.include_creases:
-            layers.extend(
-                [
-                    ("CREASE_VALLEY", 5, self._crease_linetype()),
-                    ("CREASE_MOUNTAIN", 1, self._crease_linetype()),
-                ]
-            )
-        if self.include_construction:
-            layers.append(("CONSTRUCTION", 9, "DASHED"))
-        return layers
 
-    def to_string(self) -> str:
-        return "\n".join(self.rows) + "\n"
+def _line_properties(
+    kind: str,
+    crease_style: _CreaseStyleSpec,
+) -> tuple[str, int, str]:
+    crease_linetype = (
+        "DASHED" if crease_style.name == "dashed" else "CONTINUOUS"
+    )
+    if kind == "valley":
+        return "CREASE_VALLEY", 5, crease_linetype
+    if kind == "mountain":
+        return "CREASE_MOUNTAIN", 1, crease_linetype
+    if kind == "rigid":
+        return "RIGID", 8, "CONTINUOUS"
+    if kind == "construction":
+        return "CONSTRUCTION", 9, "DASHED"
+    return "CUT_SIDE", 7, "CONTINUOUS"
+
+
+def _layer_defs(
+    crease_style: _CreaseStyleSpec,
+    *,
+    include_creases: bool,
+    include_construction: bool,
+    include_rigid: bool,
+    include_side: bool,
+) -> list[tuple[str, int, str]]:
+    layers = []
+    if include_side:
+        layers.append(("CUT_SIDE", 7, "CONTINUOUS"))
+    if include_rigid:
+        layers.append(("RIGID", 8, "CONTINUOUS"))
+    if include_creases:
+        crease_linetype = (
+            "DASHED" if crease_style.name == "dashed" else "CONTINUOUS"
+        )
+        layers.extend(
+            [
+                ("CREASE_VALLEY", 5, crease_linetype),
+                ("CREASE_MOUNTAIN", 1, crease_linetype),
+            ]
+        )
+    if include_construction:
+        layers.append(("CONSTRUCTION", 9, "DASHED"))
+    return layers
 
 
 def _parse_crease_style(crease_style: CreaseStyle) -> _CreaseStyleSpec:
@@ -418,92 +366,45 @@ def _xy(coords) -> tuple[float, float]:
     return float(coords[0]), float(coords[1])
 
 
-def _number(value: float) -> str:
-    value = float(value)
-    if not math.isfinite(value):
-        raise ValueError(f"DXF coordinate must be finite, got {value!r}.")
-    if abs(value) < 1e-9:
-        value = 0.0
-
-    text = f"{value:.12f}".rstrip("0").rstrip(".")
-    if text in {"", "-0"}:
-        return "0"
-    return text
+def _finite_xy(coords) -> tuple[float, float]:
+    x, y = _xy(coords)
+    for value in (x, y):
+        if not math.isfinite(value):
+            raise ValueError(f"DXF coordinate must be finite, got {value!r}.")
+    return x, y
 
 
-def _metadata_for_profile(metadata: dict, profile: DxfProfile) -> dict:
-    if profile != "solidworks":
-        return metadata
-
-    info = dict(metadata.get("metadata", {}))
-    unit = info.get("unit", "mm")
-    factor = _unit_to_inches_factor(unit)
-    info["unit"] = "in"
-
-    return {
-        **metadata,
-        "metadata": info,
-        "points": {
-            point_id: _scale_coordinates(coords, factor)
-            for point_id, coords in metadata.get("points", {}).items()
-        },
-    }
-
-
-def _scale_coordinates(coords, factor: float) -> list[float]:
-    scaled = list(coords)
-    for index in range(min(3, len(scaled))):
-        scaled[index] = float(scaled[index]) * factor
-    return scaled
-
-
-def _unit_to_inches_factor(unit: str) -> float:
+def _dxf_unit(unit: str) -> int:
     key = str(unit).strip().lower()
-    factors = {
-        "in": 1.0,
-        "inch": 1.0,
-        "inches": 1.0,
-        "ft": 12.0,
-        "feet": 12.0,
-        "mm": 1.0 / 25.4,
-        "millimeter": 1.0 / 25.4,
-        "millimeters": 1.0 / 25.4,
-        "cm": 1.0 / 2.54,
-        "centimeter": 1.0 / 2.54,
-        "centimeters": 1.0 / 2.54,
-        "m": 1000.0 / 25.4,
-        "meter": 1000.0 / 25.4,
-        "meters": 1000.0 / 25.4,
+    unit_codes = {
+        "in": units.IN,
+        "inch": units.IN,
+        "inches": units.IN,
+        "ft": units.FT,
+        "foot": units.FT,
+        "feet": units.FT,
+        "mi": units.MI,
+        "mile": units.MI,
+        "miles": units.MI,
+        "mm": units.MM,
+        "millimeter": units.MM,
+        "millimeters": units.MM,
+        "cm": units.CM,
+        "centimeter": units.CM,
+        "centimeters": units.CM,
+        "m": units.M,
+        "meter": units.M,
+        "meters": units.M,
+        "km": units.KM,
+        "kilometer": units.KM,
+        "kilometers": units.KM,
+        "yd": units.YD,
+        "yard": units.YD,
+        "yards": units.YD,
     }
-    if key not in factors:
+    if key not in unit_codes:
         raise ValueError(
-            "profile='solidworks' requires a known length unit; "
+            "DXF export requires a known length unit; "
             f"got unit={unit!r}."
         )
-    return factors[key]
-
-
-def _dxf_unit_code(unit: str) -> int:
-    return {
-        "in": 1,
-        "inch": 1,
-        "inches": 1,
-        "ft": 2,
-        "feet": 2,
-        "mi": 3,
-        "mile": 3,
-        "miles": 3,
-        "mm": 4,
-        "millimeter": 4,
-        "millimeters": 4,
-        "cm": 5,
-        "centimeter": 5,
-        "centimeters": 5,
-        "m": 6,
-        "meter": 6,
-        "meters": 6,
-    }.get(str(unit).lower(), 0)
-
-
-def _dxf_measurement_code(unit: str) -> int:
-    return 0 if _dxf_unit_code(unit) in {1, 2, 3} else 1
+    return unit_codes[key]
