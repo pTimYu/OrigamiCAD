@@ -1,12 +1,3 @@
-"""Generate and solve the two-loop hexagon pattern in 3D.
-
-Run from the project root:
-
-    python -m examples.simple_hexagon_example_3d
-
-You can also run this file directly from an IDE.
-"""
-
 from pathlib import Path
 import sys
 
@@ -15,26 +6,22 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import Cadder, TwoDDrawer
-from origamicad.patterns.hexagon import draw_hex_loops, solve_kinematics
-from origamicad.io.cad_export import save_cad
+from origamicad.patterns.hexagon import build_packaging, solve_kinematics
+
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+DXF_PATH = OUTPUT_DIR / "hexagon_projection.dxf"
 
 
 def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    draw_hex_loops(
-        pattern,
-        n=2,
-        start_point=(0, 0),
-        l=15,
-    )
+    build_packaging(pattern, l=15, alpha=3, beta=3, gamma=3, delta=10)
 
     model = Cadder.from_drawer(pattern)
 
     solve_kinematics(
         model,
-        final_dihedral=136.03,
+        final_dihedral=120.0,
         start_dihedral=175.0,
         steps=4,
         unit="deg",
@@ -46,18 +33,21 @@ def main() -> None:
         valley_height=0.0,
         max_nfev_per_step=8000,
         tol=1e-10,
-        verbose=True
+        verbose=True,
     )
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
-    save_cad(model, f"{OUTPUT_DIR}/3D_simple_hexagon_136_03deg.step")
-
-    model.draw(
-        figsize=(10, 10),
-        # save_fig=True,
-        # save_path=f"{OUTPUT_DIR}/3D_simple_hexagon.png"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    saved_path = model.save_xy_dxf(
+        DXF_PATH,
+        include_creases=True,
+        crease_style="dashed",
+        include_construction=False,
+        include_rigid=True,
+        include_side=True,
+        point_tol=1e-6,
+        profile="solidworks",
     )
+    print(f"Saved projected DXF to {saved_path}")
 
 
 if __name__ == "__main__":

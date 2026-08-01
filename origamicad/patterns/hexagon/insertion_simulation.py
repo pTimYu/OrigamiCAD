@@ -22,6 +22,7 @@ There is no runnable entry point in this module.  The example program lives in
 
 from __future__ import annotations
 
+import copy
 from collections import defaultdict, deque
 from itertools import combinations
 from pathlib import Path
@@ -1499,12 +1500,39 @@ def _top_view_compactness(model: Cadder) -> tuple[float, float]:
     return pca_aspect, bbox_aspect
 
 
+def _infer_num_loops(pattern: TwoDDrawer) -> int:
+    """Infer the number of concentric loops from hex-unit metadata."""
+    num_units = len(pattern.hex_units)
+    if num_units < 1:
+        raise ValueError("The insertion model must contain at least one hex unit.")
+
+    # draw_hex_loops creates 1 + 6 * (1 + ... + (n - 1)) units.
+    discriminant = 1.0 + 4.0 * (num_units - 1) / 3.0
+    num_loops = int(round((1.0 + np.sqrt(discriminant)) / 2.0))
+    if 1 + 3 * num_loops * (num_loops - 1) != num_units:
+        raise ValueError(
+            "Could not infer a regular concentric-loop count from the model's "
+            f"{num_units} hex units."
+        )
+    return num_loops
+
+
+def _infer_side_length(pattern: TwoDDrawer) -> float:
+    """Infer the base hexagon side length from the innermost unit."""
+    unit = pattern.hex_units[0]
+    first_id, second_id = unit["mid"][:2]
+    first = pattern.points[first_id]
+    second = pattern.points[second_id]
+    return float(np.hypot(second.x - first.x, second.y - first.y))
+
+
 def simulate_insertion(
     inner_dihedral_deg: float = DEFAULT_INNER_DIHEDRAL_DEG,
     num_layers: int = DEFAULT_NUM_LAYERS,
-    side_length: float = DEFAULT_SIDE_LENGTH,
+    side_length: float | None = None,
     *,
-    num_loops: int = DEFAULT_NUM_LOOPS,
+    num_loops: int | None = None,
+    model: Cadder | None = None,
     assignment_mode: Literal[
         "panel_sequence",
         "regular_masks",
@@ -1529,8 +1557,15 @@ def simulate_insertion(
     The requested inner obtuse angle is the ``contact`` panel target.  A
     ``snap`` panel receives its supplement ``180 degrees - contact``.
 
+    If ``model`` is supplied, it must be a ``Cadder`` built from a compatible
+    hexagon-loop pattern. Its points, lines, surfaces, and hex-unit metadata
+    are used as the insertion geometry template. The supplied model is not
+    modified; the returned ``result["model"]`` is a solved deep copy.
+
     ``assignment_mode="panel_sequence"`` applies the insertion-specific,
-    inner-to-outer propagation rule to all ``num_loops`` planar loops.
+    inner-to-outer propagation rule to all ``num_loops`` planar loops. When a
+    model is supplied, ``num_loops`` and ``side_length`` may be omitted and
+    are inferred from its hex-unit metadata and innermost hexagon.
     ``"regular_masks"`` retains the older two-loop six-sector mask search.
     In regular-mask mode, mask ``111111`` produces the reference sixfold
     state; omitting ``combination_masks`` tests masks 1 through 63.
@@ -1626,6 +1661,53 @@ def simulate_insertion(
             "branch_acute_start_deg must be greater than the final acute "
             "dihedral."
         )
+    if model is not None and not isinstance(model, Cadder):
+        raise TypeError("model must be a Cadder instance or None.")
+
+    if model is None:
+        if side_length is None:
+            side_length = DEFAULT_SIDE_LENGTH
+        if num_loops is None:
+            num_loops = DEFAULT_NUM_LOOPS
+        pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
+        draw_hex_loops(
+            pattern,
+            n=num_loops,
+            start_point=(0.0, 0.0),
+            l=side_length,
+            reverse=False,
+        )
+        insertion_model = Cadder.from_drawer(pattern)
+    else:
+        if not model.hex_units:
+            raise ValueError(
+                "The insertion model must contain hex-unit metadata. Build it "
+                "with draw_hex_loops() before calling simulate_insertion()."
+            )
+        pattern = model.to_2d_drawer(point_tol=1e-6)
+        inferred_num_loops = _infer_num_loops(pattern)
+        inferred_side_length = _infer_side_length(pattern)
+        if num_loops is None:
+            num_loops = inferred_num_loops
+        elif int(num_loops) != inferred_num_loops:
+            raise ValueError(
+                "num_loops does not match the supplied model: "
+                f"expected {inferred_num_loops}, got {num_loops}."
+            )
+        if side_length is None:
+            side_length = inferred_side_length
+        elif not np.isclose(side_length, inferred_side_length):
+            raise ValueError(
+                "side_length does not match the supplied model: "
+                f"expected {inferred_side_length:g}, got {side_length:g}."
+            )
+
+        # The insertion solver owns the constraints it creates. Work on a
+        # copy so a model that is already solved or constrained remains intact.
+        insertion_model = copy.deepcopy(model)
+        insertion_model.constraints = {}
+        insertion_model._constraint_count = 0
+
     side_length = float(side_length)
     if not np.isfinite(side_length) or side_length <= 0.0:
         raise ValueError("side_length must be a finite positive value.")
@@ -1695,14 +1777,7 @@ def simulate_insertion(
     if not np.isfinite(contact_tolerance) or contact_tolerance <= 0.0:
         raise ValueError("contact_tolerance must be a finite positive value.")
 
-    pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    draw_hex_loops(
-        pattern,
-        n=num_loops,
-        start_point=(0.0, 0.0),
-        l=side_length,
-        reverse=False,
-    )
+    assert num_loops is not None
     panel_states = classify_insertion_panel_states(pattern)
     if assignment_mode == "panel_sequence":
         _reconcile_panel_sequence_for_rigid_closure(
@@ -1728,7 +1803,7 @@ def simulate_insertion(
                 "snap targets are supplementary, so a nonzero closure cannot "
                 "be removed without distorting rigid panels."
             )
-    model = Cadder.from_drawer(pattern)
+    model = insertion_model
     kinematics = _HexagonKinematics(model)
     kinematics._add_kinematic_constraints(
         target_dihedral=start_dihedral_deg,

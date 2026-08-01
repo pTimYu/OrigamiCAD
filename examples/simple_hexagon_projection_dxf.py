@@ -10,7 +10,7 @@ from origamicad.patterns.hexagon import draw_hex_loops, solve_kinematics
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-DXF_PATH = OUTPUT_DIR / "simple_hexagon_projection.dxf"
+DXF_PATH = OUTPUT_DIR / "simple_hexagon_projection_120deg.dxf"
 
 
 def main() -> None:
@@ -26,7 +26,7 @@ def main() -> None:
 
     solve_kinematics(
         model,
-        final_dihedral=150.0,
+        final_dihedral=120,
         start_dihedral=175.0,
         steps=4,
         unit="deg",

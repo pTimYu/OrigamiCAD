@@ -21,7 +21,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    build_packaging(pattern, l=15, alpha=3, beta=3, gamma=3, delta=10)
+    build_packaging(pattern, l=15, alpha=2, beta=2, gamma=3, delta=10)
     pattern.print_summary()
     pattern.draw(
         # save_fig=True,
