@@ -258,6 +258,125 @@ def hex_unit_chain(
     }
 
 
+def _quad_coordinate_signature(
+    start_point: Coordinate,
+    l: float,
+    index: int,
+) -> tuple[tuple[float, float], ...]:
+    """Return a rounded coordinate signature for one unit-chain quad."""
+    x0, y0 = start_point
+    h = float(l * np.sqrt(3) / 2)
+    mid_coords: list[Coordinate] = [
+        (x0, y0),
+        (x0 + l, y0),
+        (x0 + 1.5 * l, y0 - h),
+        (x0 + l, y0 - 2 * h),
+        (x0, y0 - 2 * h),
+        (x0 - 0.5 * l, y0 - h),
+    ]
+    side_coords: list[Coordinate] = [
+        (x0 - l, y0),
+        (x0 - 0.5 * l, y0 + h),
+        (x0 + 0.5 * l, y0 + h),
+        (x0 + 1.5 * l, y0 + h),
+        (x0 + 2 * l, y0),
+        (x0 + 2.5 * l, y0 - h),
+        (x0 + 2 * l, y0 - 2 * h),
+        (x0 + 1.5 * l, y0 - 3 * h),
+        (x0 + 0.5 * l, y0 - 3 * h),
+        (x0 - 0.5 * l, y0 - 3 * h),
+        (x0 - l, y0 - 2 * h),
+        (x0 - 1.5 * l, y0 - h),
+    ]
+    next_index = (index + 1) % 6
+    vertices = (
+        mid_coords[index],
+        mid_coords[next_index],
+        side_coords[(2 * index + 2) % 12],
+        side_coords[2 * index + 1],
+    )
+    return tuple(
+        sorted((round(float(x), 10), round(float(y), 10)) for x, y in vertices)
+    )
+
+
+def _validate_hole_punch_diameter(
+    name: str,
+    diameter: float,
+    l: float,
+) -> float:
+    try:
+        value = float(diameter)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite non-negative diameter.") from exc
+
+    if not np.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative diameter.")
+
+    maximum = float(l * np.sqrt(3) / 2)
+    if value > maximum:
+        raise ValueError(
+            f"{name} must not exceed the side parallelogram's inscribed "
+            f"circle diameter ({maximum:g})."
+        )
+    return value
+
+
+def _add_packaging_hole_punches(
+    pattern: TwoDDrawer,
+    units_by_cell: dict[tuple[int, int], HexUnit],
+    cell_start_points: dict[tuple[int, int], Coordinate],
+    draw_cell: np.ndarray,
+    l: float,
+    outer_diameter: float,
+    cavity_diameter: float,
+) -> None:
+    """Add hole punches to boundary parallelograms of a packaging grid."""
+    if outer_diameter == 0 and cavity_diameter == 0:
+        return
+
+    quad_locations: dict[
+        tuple[tuple[float, float], ...],
+        list[tuple[tuple[int, int], int]],
+    ] = {}
+    for cell, start_point in cell_start_points.items():
+        for quad_index in range(6):
+            signature = _quad_coordinate_signature(start_point, l, quad_index)
+            quad_locations.setdefault(signature, []).append((cell, quad_index))
+
+    for cell, unit in units_by_cell.items():
+        start_point = cell_start_points[cell]
+        for quad_index, surface_id in enumerate(unit["parallelograms"]):
+            signature = _quad_coordinate_signature(start_point, l, quad_index)
+            peer_cells = [
+                peer_cell
+                for peer_cell, peer_quad_index in quad_locations[signature]
+                if peer_cell != cell
+            ]
+
+            if any(peer_cell in units_by_cell for peer_cell in peer_cells):
+                continue
+
+            cavity_boundary = any(
+                not bool(draw_cell[peer_cell])
+                for peer_cell in peer_cells
+            )
+            diameter = cavity_diameter if cavity_boundary else outer_diameter
+            if diameter == 0:
+                continue
+
+            surface = pattern.surfaces[surface_id]
+            center_x = sum(pattern.points[pid].x for pid in surface.vertices) / 4
+            center_y = sum(pattern.points[pid].y for pid in surface.vertices) / 4
+            row, col = cell
+            boundary_name = "cavity" if cavity_boundary else "outer"
+            pattern.add_hole_punch(
+                center=(center_x, center_y),
+                diameter=diameter,
+                hole_id=f"hole_{boundary_name}_{row}_{col}_{quad_index}",
+            )
+
+
 def hexagon_packaging(
     pattern: TwoDDrawer,
     l: float = 15.0,
@@ -266,17 +385,38 @@ def hexagon_packaging(
     gamma: int = 3,
     delta: int = 4,
     start_point: Coordinate = (0.0, 0.0),
+    enable_left_open: bool = False,
+    enable_right_open: bool = False,
+    enable_top_open: bool = False,
+    enable_bot_open: bool = False,
+    enable_hole_punch_outer: float = 0.0,
+    enable_hole_punch_cavity: float = 0.0,
 ) -> list[HexUnit]:
     """
     Draw a packed lattice of hexagon unit chains with a rectangular cavity.
 
     ``alpha`` and ``beta`` are the left/right and top/bottom border thicknesses
-    in unit-chain cells. ``delta`` and ``gamma`` are the cavity width and height
-    in unit-chain cells.
+    in unit-chain cells. ``gamma`` and ``delta`` are the cavity width and height
+    in unit-chain cells. ``alpha`` and ``beta`` must be positive because they
+    provide the wall thickness. The four ``enable_*_open`` flags independently
+    remove the corresponding cavity-side wall. Set ``enable_hole_punch_outer``
+    or ``enable_hole_punch_cavity`` to a positive diameter to add circular cut
+    lines to the outer or cavity-side parallelograms, respectively.
     """
 
     if l <= 0:
         raise ValueError("l must be positive.")
+
+    outer_hole_diameter = _validate_hole_punch_diameter(
+        "enable_hole_punch_outer",
+        enable_hole_punch_outer,
+        l,
+    )
+    cavity_hole_diameter = _validate_hole_punch_diameter(
+        "enable_hole_punch_cavity",
+        enable_hole_punch_cavity,
+        l,
+    )
 
     dimensions = {
         "alpha": alpha,
@@ -290,37 +430,57 @@ def hexagon_packaging(
         if value < 0:
             raise ValueError(f"{name} must be non-negative.")
 
+    for name, enabled in {
+        "enable_left_open": enable_left_open,
+        "enable_right_open": enable_right_open,
+        "enable_top_open": enable_top_open,
+        "enable_bot_open": enable_bot_open,
+    }.items():
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{name} must be a boolean.")
+
     alpha = int(alpha)
     beta = int(beta)
     gamma = int(gamma)
     delta = int(delta)
 
-    num_cols = 2 * alpha + delta
-    num_rows = 2 * beta + gamma
-    if num_cols <= 0 or num_rows <= 0:
-        raise ValueError("The generated packaging grid must contain at least one cell.")
+    if alpha == 0 or beta == 0:
+        raise ValueError("alpha and beta must be positive wall thicknesses.")
+
+    num_cols = 2 * alpha + gamma
+    num_rows = 2 * beta + delta
 
     x0, y0 = start_point
     h = float(l * np.sqrt(3) / 2)
 
     draw_cell = np.ones((num_rows, num_cols), dtype=bool)
-    draw_cell[beta: beta + gamma, alpha: alpha + delta] = False
+    cavity_col_start = 0 if enable_left_open else alpha
+    cavity_col_end = num_cols if enable_right_open else alpha + gamma
+    cavity_row_start = 0 if enable_top_open else beta
+    cavity_row_end = num_rows if enable_bot_open else beta + delta
+    draw_cell[
+        cavity_row_start:cavity_row_end,
+        cavity_col_start:cavity_col_end,
+    ] = False
 
     units: list[HexUnit] = []
+    units_by_cell: dict[tuple[int, int], HexUnit] = {}
+    cell_start_points: dict[tuple[int, int], Coordinate] = {}
     for row in range(num_rows):
         unit_x = float(x0) + 0.5 * l * row
         unit_y = float(y0) - 3.0 * h * row
 
         for col in range(num_cols):
+            cell_start_points[(row, col)] = (unit_x, unit_y)
             if draw_cell[row, col]:
-                units.append(
-                    hex_unit_chain(
-                        pattern,
-                        start_point=(unit_x, unit_y),
-                        l=l,
-                        count=len(units),
-                    )
+                unit = hex_unit_chain(
+                    pattern,
+                    start_point=(unit_x, unit_y),
+                    l=l,
+                    count=len(units),
                 )
+                units.append(unit)
+                units_by_cell[(row, col)] = unit
 
             if col % 2 == 0:
                 unit_x += 2.5 * l
@@ -328,6 +488,16 @@ def hexagon_packaging(
             else:
                 unit_x += 2.0 * l
                 unit_y += 2.0 * h
+
+    _add_packaging_hole_punches(
+        pattern,
+        units_by_cell,
+        cell_start_points,
+        draw_cell,
+        l,
+        outer_hole_diameter,
+        cavity_hole_diameter,
+    )
 
     pattern.hex_units = units
     return units

@@ -21,13 +21,22 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    build_packaging(pattern, l=15, alpha=2, beta=2, gamma=3, delta=10)
+    build_packaging(
+        pattern,
+        l=15,
+        alpha=2,
+        beta=2,
+        gamma=15,
+        delta=7,
+        enable_left_open=True,
+        enable_hole_punch_outer=5
+    )
     pattern.print_summary()
     pattern.draw(
         # save_fig=True,
         # save_path=f"{OUTPUT_DIR}/2D_hexagon.png"
     )
-    pattern.save_dxf(f"{OUTPUT_DIR}/2D_hexagon.dxf", profile="solidworks");
+    # pattern.save_dxf(f"{OUTPUT_DIR}/2D_hexagon.dxf", profile="solidworks");
 
 if __name__ == "__main__":
     main()

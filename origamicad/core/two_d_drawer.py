@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple, Optional, Literal
 import json
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D as MplLine2D
+from matplotlib.patches import Circle
 import math
 
 
@@ -56,6 +57,7 @@ class TwoDDrawer:
         self.points: Dict[str, Point2D] = {}
         self.lines: Dict[str, Line2D] = {}
         self.surfaces: Dict[str, Surface2D] = {}
+        self.hole_punches: list[dict] = []
 
         self._point_count = 0
         self._line_count = 0
@@ -100,6 +102,8 @@ class TwoDDrawer:
             for point_id in vertices:
                 drawer._check_point_exists(point_id)
             drawer.surfaces[surface_id] = Surface2D(surface_id, vertices)
+
+        drawer.hole_punches = list(metadata.get("hole_punches", []))
 
         drawer.hex_units = metadata.get("hex_units", [])
         drawer._point_count = len(drawer.points)
@@ -514,6 +518,63 @@ class TwoDDrawer:
             auto_boundary=auto_boundary,
         )
 
+    def add_hole_punch(
+        self,
+        center: Tuple[float, float],
+        diameter: float,
+        segments: int = 32,
+        hole_id: Optional[str] = None,
+    ) -> str:
+        """
+        Add a polygonal circular hole-punch cut line.
+
+        The cut is represented by side lines around a regular polygon so it
+        remains available to the existing 2D and CAD exporters. The hole
+        metadata is also retained for drawing and JSON round-tripping.
+        """
+        if not math.isfinite(float(diameter)) or float(diameter) <= 0:
+            raise ValueError("diameter must be a finite positive value.")
+        if isinstance(segments, bool) or int(segments) != segments:
+            raise ValueError("segments must be an integer.")
+        segments = int(segments)
+        if segments < 8:
+            raise ValueError("segments must be at least 8.")
+
+        if hole_id is None:
+            hole_id = f"hole_{len(self.hole_punches)}"
+        if any(hole.get("id") == hole_id for hole in self.hole_punches):
+            raise ValueError(f"Hole id '{hole_id}' already exists.")
+
+        cx, cy = float(center[0]), float(center[1])
+        radius = float(diameter) / 2.0
+        point_ids: list[str] = []
+        for index in range(segments):
+            angle = 2.0 * math.pi * index / segments
+            point_ids.append(
+                self.add_point(
+                    cx + radius * math.cos(angle),
+                    cy + radius * math.sin(angle),
+                    point_id=f"{hole_id}_p{index}",
+                )
+            )
+
+        for index in range(segments):
+            self.add_line(
+                point_ids[index],
+                point_ids[(index + 1) % segments],
+                kind="side",
+            )
+
+        self.hole_punches.append(
+            {
+                "id": hole_id,
+                "center": [cx, cy],
+                "diameter": float(diameter),
+                "segments": segments,
+            }
+        )
+        return hole_id
+
     # ------------------------------------------------------------
     # Counters / summary
     # ------------------------------------------------------------
@@ -638,6 +699,9 @@ class TwoDDrawer:
         if hasattr(self, "hex_units"):
             data["hex_units"] = self.hex_units
 
+        if self.hole_punches:
+            data["hole_punches"] = self.hole_punches
+
         return data
 
     def save_json(self, filename: str) -> None:
@@ -757,6 +821,21 @@ class TwoDDrawer:
                 cx = sum(xs) / len(xs)
                 cy = sum(ys) / len(ys)
                 ax.text(cx, cy, surface.id, ha="center", va="center")
+
+        # Mask the polygonal cut-line interiors so hole punches are visible
+        # as holes in the 2D preview. Their side-line boundaries are drawn
+        # below and remain available to CAD export.
+        for hole in self.hole_punches:
+            cx, cy = hole["center"]
+            ax.add_patch(
+                Circle(
+                    (cx, cy),
+                    hole["diameter"] / 2.0,
+                    facecolor="white",
+                    edgecolor="none",
+                    zorder=1.5,
+                )
+            )
 
         # Draw lines
         for line in self.lines.values():
