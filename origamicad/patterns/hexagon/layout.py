@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from ...core.two_d_drawer import TwoDDrawer
@@ -377,6 +379,32 @@ def _add_packaging_hole_punches(
             )
 
 
+def _rotate_packaging_to_horizon(
+    pattern: TwoDDrawer,
+    cavity_center: Coordinate,
+) -> None:
+    """Rotate the generated packaging clockwise to level its cavity."""
+    angle = math.radians(-10.8934)
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    center_x, center_y = cavity_center
+
+    for point in pattern.points.values():
+        relative_x = point.x - center_x
+        relative_y = point.y - center_y
+        point.x = center_x + cosine * relative_x - sine * relative_y
+        point.y = center_y + sine * relative_x + cosine * relative_y
+
+    for hole in pattern.hole_punches:
+        hole_x, hole_y = hole["center"]
+        relative_x = hole_x - center_x
+        relative_y = hole_y - center_y
+        hole["center"] = [
+            center_x + cosine * relative_x - sine * relative_y,
+            center_y + sine * relative_x + cosine * relative_y,
+        ]
+
+
 def hexagon_packaging(
     pattern: TwoDDrawer,
     l: float = 15.0,
@@ -391,6 +419,7 @@ def hexagon_packaging(
     enable_bot_open: bool = False,
     enable_hole_punch_outer: float = 0.0,
     enable_hole_punch_cavity: float = 0.0,
+    rotate_cavity_to_horizon: bool = False,
 ) -> list[HexUnit]:
     """
     Draw a packed lattice of hexagon unit chains with a rectangular cavity.
@@ -401,7 +430,9 @@ def hexagon_packaging(
     provide the wall thickness. The four ``enable_*_open`` flags independently
     remove the corresponding cavity-side wall. Set ``enable_hole_punch_outer``
     or ``enable_hole_punch_cavity`` to a positive diameter to add circular cut
-    lines to the outer or cavity-side parallelograms, respectively.
+    lines to the outer or cavity-side parallelograms, respectively. Set
+    ``rotate_cavity_to_horizon=True`` to rotate the complete structure clockwise
+    by 10.8934 degrees about the cavity center.
     """
 
     if l <= 0:
@@ -435,6 +466,7 @@ def hexagon_packaging(
         "enable_right_open": enable_right_open,
         "enable_top_open": enable_top_open,
         "enable_bot_open": enable_bot_open,
+        "rotate_cavity_to_horizon": rotate_cavity_to_horizon,
     }.items():
         if not isinstance(enabled, bool):
             raise ValueError(f"{name} must be a boolean.")
@@ -498,6 +530,21 @@ def hexagon_packaging(
         outer_hole_diameter,
         cavity_hole_diameter,
     )
+
+    if rotate_cavity_to_horizon:
+        cavity_cells = [
+            cell_start_points[(row, col)]
+            for row in range(cavity_row_start, cavity_row_end)
+            for col in range(cavity_col_start, cavity_col_end)
+        ]
+        if cavity_cells:
+            cavity_center = (
+                sum(x for x, _ in cavity_cells) / len(cavity_cells) + 0.5 * l,
+                sum(y for _, y in cavity_cells) / len(cavity_cells) - h,
+            )
+        else:
+            cavity_center = (float(x0), float(y0))
+        _rotate_packaging_to_horizon(pattern, cavity_center)
 
     pattern.hex_units = units
     return units
