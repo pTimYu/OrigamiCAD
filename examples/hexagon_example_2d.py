@@ -26,17 +26,20 @@ def main() -> None:
         l=15,
         alpha=2,
         beta=2,
-        gamma=15,
-        delta=7,
+        gamma=12,
+        delta=5,
         enable_left_open=True,
-        enable_hole_punch_outer=5
+        enable_hole_punch_outer=5,
+        enable_hole_punch_cavity=5,
+        rotate_cavity_to_horizon=True,
+        fill_cavity=True
     )
     pattern.print_summary()
     pattern.draw(
-        # save_fig=True,
-        # save_path=f"{OUTPUT_DIR}/2D_hexagon.png"
+        save_fig=True,
+        save_path=f"{OUTPUT_DIR}/2D_hexagon_filled.png"
     )
-    # pattern.save_dxf(f"{OUTPUT_DIR}/2D_hexagon.dxf", profile="solidworks");
+    pattern.save_dxf(f"{OUTPUT_DIR}/2D_hexagon_with_cavity.dxf", crease_style=["real dashed", 1.5, 1.5], profile="solidworks");
 
 if __name__ == "__main__":
     main()

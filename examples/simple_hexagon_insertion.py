@@ -23,8 +23,8 @@ from origamicad.patterns.hexagon import (
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 SIDE_LENGTH = 15.0
 # Exact contact-panel target; snap panels receive its supplementary angle.
-REQUESTED_INNER_DIHEDRAL_DEG = 120.0
-NUM_LOOPS = 3
+REQUESTED_INNER_DIHEDRAL_DEG = 135.0
+NUM_LOOPS = 2
 NUM_LAYERS = 4
 ASSIGNMENT_MODE = "panel_sequence"
 REFERENCE_A2O_MASK = 0b111111
@@ -54,20 +54,20 @@ def main() -> None:
     # )
     # print(f"Saved four-part Abaqus STEP:   {step_path}")
 
-    drawing_path = OUTPUT_DIR / "simple_hexagon_insertion.png"
+    drawing_path = OUTPUT_DIR / "simple_hexagon_insertion_135.png"
     draw_insertion_simulation(
         result,
-        # save_path=drawing_path,
-        show=False,
+        save_path=drawing_path,
+        show=True,
     )
-    # print(f"Saved drawing:                 {drawing_path}")
+    print(f"Saved drawing:                 {drawing_path}")
     stack_drawing_path = (
         OUTPUT_DIR / "simple_hexagon_insertion_4layer_3d.png"
     )
     draw_insertion_stack_3d(
         result,
         # save_path=stack_drawing_path,
-        show=True,
+        show=False,
     )
     # print(f"Saved 3D stack drawing:        {stack_drawing_path}")
 

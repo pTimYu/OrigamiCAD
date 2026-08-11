@@ -17,7 +17,7 @@ from origamicad.patterns.hexagon import draw_hex_loops, simulate_insertion
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-DXF_PATH = OUTPUT_DIR / "simple_hexagon_insertion_projection.dxf"
+DXF_PATH = OUTPUT_DIR / "simple_hexagon_insertion_projection_120.dxf"
 
 
 def main() -> None:
@@ -27,7 +27,7 @@ def main() -> None:
 
     result = simulate_insertion(
         model=model,
-        inner_dihedral_deg=136.03,
+        inner_dihedral_deg=120,
         num_layers=4,
         # num_loops and side_length are inferred from model.
         verbose=False,

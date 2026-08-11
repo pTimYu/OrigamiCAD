@@ -420,6 +420,7 @@ def hexagon_packaging(
     enable_hole_punch_outer: float = 0.0,
     enable_hole_punch_cavity: float = 0.0,
     rotate_cavity_to_horizon: bool = False,
+    fill_cavity: bool = False,
 ) -> list[HexUnit]:
     """
     Draw a packed lattice of hexagon unit chains with a rectangular cavity.
@@ -432,7 +433,8 @@ def hexagon_packaging(
     or ``enable_hole_punch_cavity`` to a positive diameter to add circular cut
     lines to the outer or cavity-side parallelograms, respectively. Set
     ``rotate_cavity_to_horizon=True`` to rotate the complete structure clockwise
-    by 10.8934 degrees about the cavity center.
+    by 10.8934 degrees about the cavity center. Set ``fill_cavity=True`` to
+    populate the cavity region instead of leaving it empty.
     """
 
     if l <= 0:
@@ -467,6 +469,7 @@ def hexagon_packaging(
         "enable_top_open": enable_top_open,
         "enable_bot_open": enable_bot_open,
         "rotate_cavity_to_horizon": rotate_cavity_to_horizon,
+        "fill_cavity": fill_cavity,
     }.items():
         if not isinstance(enabled, bool):
             raise ValueError(f"{name} must be a boolean.")
@@ -490,10 +493,11 @@ def hexagon_packaging(
     cavity_col_end = num_cols if enable_right_open else alpha + gamma
     cavity_row_start = 0 if enable_top_open else beta
     cavity_row_end = num_rows if enable_bot_open else beta + delta
-    draw_cell[
-        cavity_row_start:cavity_row_end,
-        cavity_col_start:cavity_col_end,
-    ] = False
+    if not fill_cavity:
+        draw_cell[
+            cavity_row_start:cavity_row_end,
+            cavity_col_start:cavity_col_end,
+        ] = False
 
     units: list[HexUnit] = []
     units_by_cell: dict[tuple[int, int], HexUnit] = {}
