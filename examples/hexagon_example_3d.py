@@ -45,7 +45,6 @@ def main() -> None:
         fixed_triangle_surface_id="tri_0_1",
         valley_z=0.0,
         strict_unique_edges=False,
-        mountain_height=2.0,
         valley_height=0.0,
         max_nfev_per_step=8000,
         tol=1e-10,

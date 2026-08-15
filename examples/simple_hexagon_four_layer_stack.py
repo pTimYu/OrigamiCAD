@@ -12,8 +12,6 @@ triangle rests on a mountain triangle from the layer below.
 from pathlib import Path
 import sys
 
-import numpy as np
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -53,22 +51,15 @@ def main() -> None:
         fixed_triangle_surface_id="tri_0_1",
         valley_z=0.0,
         strict_unique_edges=False,
-        mountain_height=2.0,
         valley_height=0.0,
         max_nfev_per_step=8000,
         tol=1e-10,
         verbose=True,
     )
 
-    # d is the perpendicular distance between the two parallel crease axes
-    # across a quadrilateral panel.
-    d = SIDE_LENGTH * np.sqrt(3.0) / 2.0
     stack = stack_layers(
         base_model,
         num_layers=NUM_LAYERS,
-        panel_distance=d,
-        dihedral_angle=TARGET_DIHEDRAL_DEG,
-        unit="deg",
         tolerance=1e-6 * max(1.0, SIDE_LENGTH),
     )
     assembly = stack["model"]
@@ -81,10 +72,6 @@ def main() -> None:
         separate_layer_parts=True,
     )
 
-    print(
-        "Analytical layer height: "
-        f"{stack['expected_layer_height']:.6f} mm"
-    )
     print(f"Solved layer height:     {stack['layer_height']:.6f} mm")
     print(f"Maximum interface error: {stack['max_interface_error']:.3e} mm")
     print(f"Saved four-layer stack:  {output_path}")

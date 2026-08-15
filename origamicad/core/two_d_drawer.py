@@ -58,6 +58,7 @@ class TwoDDrawer:
         self.lines: Dict[str, Line2D] = {}
         self.surfaces: Dict[str, Surface2D] = {}
         self.hole_punches: list[dict] = []
+        self.surface_holes: dict[str, list[list[str]]] = {}
 
         self._point_count = 0
         self._line_count = 0
@@ -104,6 +105,10 @@ class TwoDDrawer:
             drawer.surfaces[surface_id] = Surface2D(surface_id, vertices)
 
         drawer.hole_punches = list(metadata.get("hole_punches", []))
+        drawer.surface_holes = {
+            str(surface_id): [list(loop) for loop in loops]
+            for surface_id, loops in metadata.get("surface_holes", {}).items()
+        }
 
         drawer.hex_units = metadata.get("hex_units", [])
         drawer._point_count = len(drawer.points)
@@ -701,6 +706,9 @@ class TwoDDrawer:
 
         if self.hole_punches:
             data["hole_punches"] = self.hole_punches
+
+        if self.surface_holes:
+            data["surface_holes"] = self.surface_holes
 
         return data
 

@@ -252,7 +252,7 @@ class _HexagonKinematics:
 
     def _initial_guess(
         self,
-        mountain_height: float = 5.0,
+        mountain_height: float,
         valley_height: float = 0.0,
     ) -> np.ndarray:
         X0 = self.get_coordinate_vector().copy()
@@ -278,6 +278,76 @@ class _HexagonKinematics:
             X0[3 * point_to_index[pid] + 2] = z
 
         return X0
+
+    def _automatic_mountain_height(
+        self,
+        dihedral_angle: float,
+        unit: Literal["rad", "deg"] = "deg",
+        valley_height: float = 0.0,
+    ) -> float:
+        """Return the initial mountain elevation from the hexagon geometry.
+
+        For a hexagon with side length ``d`` and dihedral angle ``theta``, the
+        mountain-to-valley height is
+
+            h = sqrt(3) / 2 * d * sin(theta).
+
+        The side length is measured from the ordered middle-hexagon vertices,
+        so callers do not need to repeat the pattern's ``l`` parameter.
+        """
+        if not self.hex_units:
+            raise ValueError(
+                "Cannot calculate mountain height without hex-unit metadata."
+            )
+
+        side_lengths = []
+        for unit_data in self.hex_units:
+            mid_point_ids = list(unit_data.get("mid", []))
+            if len(mid_point_ids) != 6:
+                raise ValueError(
+                    "Each hex unit must provide six ordered 'mid' points to "
+                    "calculate its side length."
+                )
+            if any(point_id not in self.points for point_id in mid_point_ids):
+                raise ValueError(
+                    "Hex-unit metadata references a missing middle-hexagon point."
+                )
+
+            coordinates = [
+                self.point_array(point_id)
+                for point_id in mid_point_ids
+            ]
+            side_lengths.extend(
+                float(
+                    np.linalg.norm(
+                        coordinates[(index + 1) % 6] - coordinates[index]
+                    )
+                )
+                for index in range(6)
+            )
+
+        side_length = float(np.mean(side_lengths))
+        length_tolerance = 1e-6 * max(1.0, side_length)
+        if not np.isfinite(side_length) or side_length <= length_tolerance:
+            raise ValueError("The measured hexagon side length must be positive.")
+        maximum_length_error = max(
+            abs(length - side_length)
+            for length in side_lengths
+        )
+        if maximum_length_error > length_tolerance:
+            raise ValueError(
+                "Hex-unit side lengths are inconsistent; one value of d cannot "
+                "be used in the automatic height formula."
+            )
+
+        theta = self._angle_to_rad(dihedral_angle, unit=unit)
+        if not (0.0 < theta < np.pi):
+            raise ValueError("dihedral_angle must be between 0 and 180 degrees.")
+
+        layer_height = float(
+            np.sqrt(3.0) / 2.0 * side_length * np.sin(theta)
+        )
+        return float(valley_height) + layer_height
 
     def _print_metadata_summary(self) -> None:
         print("Hexagon metadata summary")
@@ -381,7 +451,7 @@ class _HexagonKinematics:
         fixed_triangle_surface_id: Optional[str] = None,
         valley_z: float = 0.0,
         strict_unique_edges: bool = False,
-        mountain_height: float = 5.0,
+        mountain_height: Optional[float] = None,
         valley_height: float = 0.0,
         X0: Optional[np.ndarray] = None,
         max_nfev_per_step: int = 5000,
@@ -400,7 +470,10 @@ class _HexagonKinematics:
 
         The same start_dihedral is used to initialize the dihedral constraints
         and to start continuation, so the setup target and solver start target
-        cannot drift apart accidentally.
+        cannot drift apart accidentally. If ``mountain_height`` is omitted,
+        its initial value is calculated as
+        ``valley_height + sqrt(3) / 2 * d * sin(start_dihedral)``, where ``d``
+        is measured directly from the hexagon pattern.
         """
         if print_metadata_summary:
             self._print_metadata_summary()
@@ -417,6 +490,12 @@ class _HexagonKinematics:
             print(constraint_info)
 
         if X0 is None:
+            if mountain_height is None:
+                mountain_height = self._automatic_mountain_height(
+                    dihedral_angle=start_dihedral,
+                    unit=unit,
+                    valley_height=valley_height,
+                )
             X0 = self._initial_guess(
                 mountain_height=mountain_height,
                 valley_height=valley_height,
@@ -518,7 +597,7 @@ def solve_kinematics(
     fixed_triangle_surface_id: Optional[str] = None,
     valley_z: float = 0.0,
     strict_unique_edges: bool = False,
-    mountain_height: float = 5.0,
+    mountain_height: Optional[float] = None,
     valley_height: float = 0.0,
     X0: Optional[np.ndarray] = None,
     max_nfev_per_step: int = 5000,

@@ -10,18 +10,18 @@ from origamicad.patterns.hexagon import build_packaging, solve_kinematics
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-DXF_PATH = OUTPUT_DIR / "hexagon_projection_120deg.dxf"
+DXF_PATH = OUTPUT_DIR / "hexagon_projection_130deg_2243.dxf"
 
 
 def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    build_packaging(pattern, l=15, alpha=2, beta=2, gamma=15, delta=5,enable_left_open=True)
+    build_packaging(pattern, l=15, alpha=2, beta=2, gamma=4, delta=3,enable_left_open=False)
 
     model = Cadder.from_drawer(pattern)
 
     solve_kinematics(
         model,
-        final_dihedral=121.348,
+        final_dihedral=130,
         start_dihedral=175.0,
         steps=4,
         unit="deg",
@@ -29,7 +29,6 @@ def main() -> None:
         fixed_triangle_surface_id="tri_0_1",
         valley_z=0.0,
         strict_unique_edges=False,
-        mountain_height=2.0,
         valley_height=0.0,
         max_nfev_per_step=8000,
         tol=1e-10,

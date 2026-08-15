@@ -3,6 +3,7 @@
 from importlib import import_module
 from typing import TYPE_CHECKING
 
+from .cargo import CargoSize, calculate_cargo_size
 from .kinematics import solve_kinematics, solve_simple_hexagon_kinematics
 from .layout import (
     build_packaging,
@@ -12,9 +13,12 @@ from .layout import (
 )
 from .metadata import HexUnit
 from .stacking import (
+    LayerInterfaceResult,
     LayerStackResult,
+    MixedLayerStackResult,
     layer_panel_levels,
     stack_layers,
+    stack_mixed_layers,
     stack_simple_hexagon_layers,
 )
 
@@ -68,6 +72,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "CombinationAttempt",
+    "CargoSize",
     "DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG",
     "DEFAULT_INNER_DIHEDRAL_DEG",
     "DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG",
@@ -77,9 +82,12 @@ __all__ = [
     "HexUnit",
     "InsertionPanelState",
     "InsertionSimulationResult",
+    "LayerInterfaceResult",
     "LayerStackResult",
     "LoopDihedralStats",
+    "MixedLayerStackResult",
     "build_packaging",
+    "calculate_cargo_size",
     "classify_insertion_panel_states",
     "draw_hex_loops",
     "draw_insertion_simulation",
@@ -93,5 +101,6 @@ __all__ = [
     "solve_kinematics",
     "solve_simple_hexagon_kinematics",
     "stack_layers",
+    "stack_mixed_layers",
     "stack_simple_hexagon_layers",
 ]

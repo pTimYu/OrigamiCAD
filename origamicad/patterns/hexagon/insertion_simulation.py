@@ -860,7 +860,7 @@ def _panel_sequence_branch_guess(
     fold_angle_rad = np.deg2rad(180.0 - contact_dihedral_deg)
     contact_scale = float(np.cos(fold_angle_rad))
     graph: dict[str, list[tuple[str, np.ndarray]]] = defaultdict(list)
-    panel_distances: list[float] = []
+    crease_axis_distances: list[float] = []
 
     for surface_id, triangle_edges in quad_records.items():
         if len(triangle_edges) != 2:
@@ -892,7 +892,7 @@ def _panel_sequence_branch_guess(
             axis=0,
         )
         flat_vector = second_midpoint - first_midpoint
-        panel_distances.append(float(np.linalg.norm(flat_vector)))
+        crease_axis_distances.append(float(np.linalg.norm(flat_vector)))
         projected_scale = (
             contact_scale
             if panel_states[surface_id]["state"] == "contact"
@@ -935,8 +935,8 @@ def _panel_sequence_branch_guess(
             f"Insertion triangle graph is disconnected: {missing}."
         )
 
-    panel_distance = float(np.mean(panel_distances))
-    mountain_height = panel_distance * float(np.sin(fold_angle_rad))
+    mean_crease_axis_distance = float(np.mean(crease_axis_distances))
+    mountain_height = mean_crease_axis_distance * float(np.sin(fold_angle_rad))
     kinematics = _HexagonKinematics(model)
     proposed_by_point: dict[str, list[np.ndarray]] = defaultdict(list)
     for triangle_id, translation in translations.items():

@@ -66,6 +66,9 @@ class Cadder(CadVisualizationMixin):
         self.points: Dict[str, Point3D] = {}
         self.lines: dict = {}
         self.surfaces: dict = {}
+        # Optional inner boundary loops for panel faces. Each key is a surface
+        # ID and each value is a list of loops containing point IDs.
+        self.surface_holes: dict[str, list[list[str]]] = {}
         self.constraints: Dict[str, Constraint] = {}
 
         self.hex_units = []
@@ -90,6 +93,9 @@ class Cadder(CadVisualizationMixin):
 
         model.lines = drawer.to_dict()["lines"]
         model.surfaces = drawer.to_dict()["surfaces"]
+        model.surface_holes = copy.deepcopy(
+            getattr(drawer, "surface_holes", {})
+        )
 
         model.hex_units = getattr(drawer, "hex_units", [])
 
@@ -112,6 +118,9 @@ class Cadder(CadVisualizationMixin):
 
         model.lines = metadata.get("lines", {})
         model.surfaces = metadata.get("surfaces", {})
+        model.surface_holes = copy.deepcopy(
+            metadata.get("surface_holes", {})
+        )
         model.hex_units = metadata.get("hex_units", [])
 
         return model
@@ -151,6 +160,7 @@ class Cadder(CadVisualizationMixin):
             )
 
         drawer.hex_units = copy.deepcopy(self.hex_units)
+        drawer.surface_holes = copy.deepcopy(self.surface_holes)
         drawer._point_count = len(drawer.points)
         drawer._line_count = len(drawer.lines)
         drawer._surface_count = len(drawer.surfaces)

@@ -17,6 +17,16 @@ model = Cadder.from_drawer(pattern)
 solve_kinematics(model, final_dihedral=135.0)
 ```
 
+Calculate the transverse and longitudinal cargo dimensions for a folded
+hexagon package (angles are in degrees by default):
+
+```python
+from origamicad.patterns.hexagon import calculate_cargo_size
+
+cargo = calculate_cargo_size(l=15.0, theta=135.0, gamma=3, delta=4)
+print(cargo.transverse, cargo.longitudinal)
+```
+
 The reusable core is kept separate from pattern-specific code:
 
 ```text
@@ -35,4 +45,5 @@ Run the 2D and 3D examples from the project root with:
 ```bash
 python -m examples.hexagon_example_2d
 python -m examples.hexagon_example_3d
+python -m examples.simple_hexagon_insertion_projection_dxf
 ```

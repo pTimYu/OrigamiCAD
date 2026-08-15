@@ -16,6 +16,15 @@ from typing import Any, Iterable
 import numpy as np
 
 
+HoleLoopGeometry = tuple[tuple[str, ...], np.ndarray]
+PanelGeometry = tuple[
+    str,
+    tuple[str, ...],
+    np.ndarray,
+    list[HoleLoopGeometry],
+]
+
+
 def model_to_dict(model) -> dict:
     """Return the current 3D configuration as JSON-compatible metadata."""
     data = {
@@ -47,6 +56,8 @@ def model_to_dict(model) -> dict:
 
     if model.hex_units:
         data["hex_units"] = _json_ready(model.hex_units)
+    if getattr(model, "surface_holes", None):
+        data["surface_holes"] = _json_ready(model.surface_holes)
 
     return data
 
@@ -106,7 +117,9 @@ def save_step(
     Set ``separate_layer_parts=True`` for a stacked model whose surface IDs
     use the ``layer_<index>::<surface_id>`` convention.  The resulting STEP
     file contains one product definition per layer, allowing Abaqus/CAE to
-    import the layers as separate parts.
+    import the layers as separate parts. Panel hole punches recorded in
+    ``model.surface_holes`` are exported as true inner face boundaries for
+    zero-thickness shell surfaces.
     """
     thickness = _validate_thickness(thickness)
     if separate_layer_parts and thickness != 0.0:
@@ -233,38 +246,54 @@ def save_cad(
 
 def _panel_geometry(
     model,
-) -> Iterable[tuple[str, tuple[str, ...], np.ndarray]]:
+) -> Iterable[PanelGeometry]:
+    surface_holes = getattr(model, "surface_holes", {})
     for surface_id in model.surfaces:
         point_ids = tuple(model._surface_vertices(surface_id))
         if len(point_ids) < 3:
             raise ValueError(f"Surface '{surface_id}' has fewer than 3 vertices.")
-        yield surface_id, point_ids, np.array(
+        polygon = np.array(
             [model.point_array(point_id) for point_id in point_ids],
             dtype=float,
         )
+        hole_loops = []
+        for loop in surface_holes.get(surface_id, []):
+            hole_point_ids = tuple(loop)
+            if len(hole_point_ids) < 3:
+                raise ValueError(
+                    f"Hole in surface '{surface_id}' has fewer than 3 vertices."
+                )
+            hole_loops.append(
+                (
+                    hole_point_ids,
+                    np.array(
+                        [
+                            model.point_array(point_id)
+                            for point_id in hole_point_ids
+                        ],
+                        dtype=float,
+                    ),
+                )
+            )
+        yield surface_id, point_ids, polygon, hole_loops
 
 
 def _panel_polygons(model) -> Iterable[tuple[str, np.ndarray]]:
-    for surface_id, _, polygon in _panel_geometry(model):
+    for surface_id, _, polygon, _ in _panel_geometry(model):
         yield surface_id, polygon
 
 
 def _layer_part_groups(
     model,
-) -> list[
-    tuple[
-        str,
-        list[tuple[str, tuple[str, ...], np.ndarray]],
-    ]
-]:
+) -> list[tuple[str, list[PanelGeometry]]]:
     """Group stacked panel polygons into zero-based, contiguous layer parts."""
     groups: dict[
         int,
-        list[tuple[str, tuple[str, ...], np.ndarray]],
+        list[PanelGeometry],
     ] = {}
     layer_pattern = re.compile(r"^layer_(\d+)::(.+)$")
 
-    for surface_id, point_ids, polygon in _panel_geometry(model):
+    for surface_id, point_ids, polygon, hole_loops in _panel_geometry(model):
         match = layer_pattern.fullmatch(surface_id)
         if match is None:
             raise ValueError(
@@ -286,8 +315,20 @@ def _layer_part_groups(
                     "outside its layer."
                 )
 
+        for hole_point_ids, _ in hole_loops:
+            for point_id in hole_point_ids:
+                point_match = layer_pattern.fullmatch(point_id)
+                if (
+                    point_match is None
+                    or int(point_match.group(1)) != layer_index
+                ):
+                    raise ValueError(
+                        f"Hole in {surface_id!r} references point "
+                        f"{point_id!r} outside its layer."
+                    )
+
         groups.setdefault(layer_index, []).append(
-            (local_surface_id, point_ids, polygon)
+            (local_surface_id, point_ids, polygon, hole_loops)
         )
 
     if not groups:
@@ -311,7 +352,7 @@ def _layer_part_groups(
 
 def _step_panel_representation(
     step,
-    panels: Iterable[tuple[str, tuple[str, ...], np.ndarray]],
+    panels: Iterable[PanelGeometry],
     *,
     thickness: float,
     representation_name: str,
@@ -325,22 +366,39 @@ def _step_panel_representation(
 
     if thickness == 0.0:
         if connected_open_shell:
-            coordinates, face_indices, face_names = (
+            coordinates, face_indices, face_names, face_inner_indices = (
                 _connected_shell_geometry(panels)
             )
             faces = step.advanced_faces(
                 coordinates,
                 face_indices,
                 face_names,
+                face_inner_indices=face_inner_indices,
             )
             shells = [step.add(f"OPEN_SHELL('',({_refs(faces)}))")]
         else:
             shells = []
-            for surface_id, _, polygon in panels:
+            for surface_id, _, polygon, hole_loops in panels:
+                coordinates = [*polygon]
+                inner_indices = []
+                for _, hole_polygon in hole_loops:
+                    if float(
+                        np.dot(
+                            _polygon_normal(hole_polygon),
+                            _polygon_normal(polygon),
+                        )
+                    ) < 0.0:
+                        hole_polygon = hole_polygon[::-1]
+                    start = len(coordinates)
+                    coordinates.extend(hole_polygon)
+                    inner_indices.append(
+                        list(range(start, start + len(hole_polygon)))
+                    )
                 faces = step.advanced_faces(
-                    polygon,
+                    np.asarray(coordinates, dtype=float),
                     [list(range(len(polygon)))],
                     [surface_id],
+                    face_inner_indices=[inner_indices],
                 )
                 shells.append(step.add(f"OPEN_SHELL('',({_refs(faces)}))"))
 
@@ -352,9 +410,15 @@ def _step_panel_representation(
             f"({_refs([placement, surface_model])}),{context})"
         )
 
+    if any(hole_loops for _, _, _, hole_loops in panels):
+        raise ValueError(
+            "STEP export of thickened panels with hole punches is not yet "
+            "supported. Use thickness=0.0 for punched shell surfaces."
+        )
+
     solids = []
     half = 0.5 * thickness
-    for surface_id, _, polygon in panels:
+    for surface_id, _, polygon, _ in panels:
         normal = _polygon_normal(polygon)
         top = polygon + half * normal
         bottom = polygon - half * normal
@@ -397,8 +461,13 @@ def _step_panel_representation(
 
 
 def _connected_shell_geometry(
-    panels: list[tuple[str, tuple[str, ...], np.ndarray]],
-) -> tuple[np.ndarray, list[list[int]], list[str]]:
+    panels: list[PanelGeometry],
+) -> tuple[
+    np.ndarray,
+    list[list[int]],
+    list[str],
+    list[list[list[int]]],
+]:
     """Build consistently oriented faces with shared vertices and edges."""
     if not panels:
         raise ValueError("A connected STEP shell requires at least one panel.")
@@ -407,7 +476,7 @@ def _connected_shell_geometry(
         tuple[str, str],
         list[tuple[int, bool]],
     ] = {}
-    for face_index, (surface_id, point_ids, polygon) in enumerate(panels):
+    for face_index, (surface_id, point_ids, polygon, _) in enumerate(panels):
         if len(point_ids) != len(polygon):
             raise ValueError(
                 f"Surface {surface_id!r} has inconsistent point metadata."
@@ -475,8 +544,14 @@ def _connected_shell_geometry(
     coordinates: list[np.ndarray] = []
     face_indices = []
     face_names = []
+    face_inner_indices = []
 
-    for face_index, (surface_id, point_ids, polygon) in enumerate(panels):
+    for face_index, (
+        surface_id,
+        point_ids,
+        polygon,
+        hole_loops,
+    ) in enumerate(panels):
         if flips[face_index]:
             point_ids = tuple(reversed(point_ids))
             polygon = polygon[::-1]
@@ -496,7 +571,38 @@ def _connected_shell_geometry(
         face_indices.append(indices)
         face_names.append(surface_id)
 
-    return np.array(coordinates), face_indices, face_names
+        inner_indices = []
+        normal = _polygon_normal(polygon)
+        for hole_point_ids, hole_polygon in hole_loops:
+            if len(hole_point_ids) != len(hole_polygon):
+                raise ValueError(
+                    f"Hole in {surface_id!r} has inconsistent point metadata."
+                )
+            distances = np.abs((hole_polygon - polygon[0]) @ normal)
+            if float(np.max(distances)) > 1e-6:
+                raise ValueError(
+                    f"Hole in {surface_id!r} is not coplanar with its panel."
+                )
+
+            if float(np.dot(_polygon_normal(hole_polygon), normal)) < 0.0:
+                hole_point_ids = tuple(reversed(hole_point_ids))
+                hole_polygon = hole_polygon[::-1]
+
+            loop_indices = []
+            for point_id, coordinate in zip(hole_point_ids, hole_polygon):
+                if point_id not in point_indices:
+                    point_indices[point_id] = len(coordinates)
+                    point_coordinates[point_id] = coordinate
+                    coordinates.append(coordinate)
+                elif not np.array_equal(point_coordinates[point_id], coordinate):
+                    raise ValueError(
+                        f"Point {point_id!r} has inconsistent coordinates."
+                    )
+                loop_indices.append(point_indices[point_id])
+            inner_indices.append(loop_indices)
+        face_inner_indices.append(inner_indices)
+
+    return np.array(coordinates), face_indices, face_names, face_inner_indices
 
 
 def _mesh_triangles(model, thickness: float) -> list[np.ndarray]:
@@ -655,11 +761,16 @@ class _StepFile:
         coordinates: np.ndarray,
         face_indices: list[list[int]],
         face_names: list[str],
+        face_inner_indices: list[list[list[int]]] | None = None,
     ) -> list[str]:
         """Create planar ADVANCED_FACE entities with shared edge topology."""
         coordinates = np.asarray(coordinates, dtype=float)
         if len(face_indices) != len(face_names):
             raise ValueError("Each STEP face must have one name.")
+        if face_inner_indices is None:
+            face_inner_indices = [[] for _ in face_indices]
+        if len(face_inner_indices) != len(face_indices):
+            raise ValueError("Each STEP face must have one inner-loop list.")
 
         point_refs = [self.cartesian_point(point) for point in coordinates]
         vertex_refs = [
@@ -669,17 +780,7 @@ class _StepFile:
         edge_cache = {}
         faces = []
 
-        for indices, name in zip(face_indices, face_names):
-            polygon = coordinates[indices]
-            normal = _polygon_normal(polygon)
-            reference = polygon[1] - polygon[0]
-            axis = self.add(
-                "AXIS2_PLACEMENT_3D(" 
-                f"'',{point_refs[indices[0]]},"
-                f"{self.direction(normal)},{self.direction(reference)})"
-            )
-            plane = self.add(f"PLANE('',{axis})")
-
+        def edge_loop(indices: list[int]) -> str:
             oriented_edges = []
             for position, start_index in enumerate(indices):
                 end_index = indices[(position + 1) % len(indices)]
@@ -696,7 +797,7 @@ class _StepFile:
                         f"LINE('',{point_refs[start_index]},{vector})"
                     )
                     edge = self.add(
-                        "EDGE_CURVE(" 
+                        "EDGE_CURVE("
                         f"'',{vertex_refs[start_index]},{vertex_refs[end_index]},"
                         f"{line},.T.)"
                     )
@@ -711,11 +812,40 @@ class _StepFile:
                     self.add(f"ORIENTED_EDGE('',*,*,{edge},{orientation})")
                 )
 
-            loop = self.add(f"EDGE_LOOP('',({_refs(oriented_edges)}))")
-            bound = self.add(f"FACE_OUTER_BOUND('',{loop},.T.)")
+            return self.add(f"EDGE_LOOP('',({_refs(oriented_edges)}))")
+
+        for indices, inner_loops, name in zip(
+            face_indices,
+            face_inner_indices,
+            face_names,
+        ):
+            polygon = coordinates[indices]
+            normal = _polygon_normal(polygon)
+            reference = polygon[1] - polygon[0]
+            axis = self.add(
+                "AXIS2_PLACEMENT_3D("
+                f"'',{point_refs[indices[0]]},"
+                f"{self.direction(normal)},{self.direction(reference)})"
+            )
+            plane = self.add(f"PLANE('',{axis})")
+
+            outer_loop = edge_loop(indices)
+            bounds = [
+                self.add(f"FACE_OUTER_BOUND('',{outer_loop},.T.)")
+            ]
+            for inner_indices in inner_loops:
+                if len(inner_indices) < 3:
+                    raise ValueError(
+                        "A STEP inner face boundary needs at least 3 vertices."
+                    )
+                inner_loop = edge_loop(inner_indices)
+                bounds.append(
+                    self.add(f"FACE_BOUND('',{inner_loop},.F.)")
+                )
             faces.append(
                 self.add(
-                    f"ADVANCED_FACE('{_step_string(name)}',({bound}),{plane},.T.)"
+                    f"ADVANCED_FACE('{_step_string(name)}',"
+                    f"({_refs(bounds)}),{plane},.T.)"
                 )
             )
 
