@@ -1935,6 +1935,7 @@ class Cadder(CadVisualizationMixin):
         include_side: bool = True,
         point_tol: float = 1e-9,
         profile: Literal["solidworks"] = "solidworks",
+        connecting_dots: bool = False,
     ):
         """
         Project the current 3D structure to x-y and save it as DXF.
@@ -1947,6 +1948,7 @@ class Cadder(CadVisualizationMixin):
             include_rigid=include_rigid,
             include_side=include_side,
             profile=profile,
+            connecting_dots=connecting_dots,
         )
 
     # ------------------------------------------------------------

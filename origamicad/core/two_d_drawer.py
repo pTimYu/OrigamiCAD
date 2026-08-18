@@ -729,6 +729,7 @@ class TwoDDrawer:
         include_rigid: bool = True,
         include_side: bool = True,
         profile: Literal["solidworks"] = "solidworks",
+        connecting_dots: bool = False,
     ) -> str:
         """
         Convert the current 2D metadata to an ASCII DXF string.
@@ -743,6 +744,7 @@ class TwoDDrawer:
             include_rigid=include_rigid,
             include_side=include_side,
             profile=profile,
+            connecting_dots=connecting_dots,
         )
 
     def save_dxf(
@@ -756,6 +758,7 @@ class TwoDDrawer:
         include_rigid: bool = True,
         include_side: bool = True,
         profile: Literal["solidworks"] = "solidworks",
+        connecting_dots: bool = False,
     ):
         """
         Save the current 2D pattern as a DXF file.
@@ -765,9 +768,12 @@ class TwoDDrawer:
         crease_style=["real dashed", dash_length, gap_length] for separate
         continuous LINE entities with gaps at both crease endpoints. Dash and
         gap lengths use the pattern's length unit. Use include_creases=False
-        to export only cut/rigid geometry. DXF output uses a complete AutoCAD
-        2000 document that preserves and declares the pattern's length unit for
-        AutoCAD and SolidWorks.
+        to export only cut/rigid geometry. Set connecting_dots=True to replace
+        closed side boundaries with evenly distributed 0.6 mm blank gaps,
+        leaving solid cut lines over the remaining approximately 99% of the
+        boundary perimeter. DXF output uses a complete AutoCAD 2000 document
+        that preserves and declares the pattern's length unit for AutoCAD and
+        SolidWorks.
         """
         from ..io.dxf_export import save_dxf
 
@@ -780,6 +786,7 @@ class TwoDDrawer:
             include_rigid=include_rigid,
             include_side=include_side,
             profile=profile,
+            connecting_dots=connecting_dots,
         )
 
     # ------------------------------------------------------------

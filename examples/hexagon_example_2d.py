@@ -32,14 +32,14 @@ def main() -> None:
         enable_hole_punch_outer=2.5,
         enable_hole_punch_cavity=2.5,
         rotate_cavity_to_horizon=True,
-        fill_cavity=False
+        fill_cavity=True
     )
     pattern.print_summary()
     pattern.draw(
         # save_fig=True,
         # save_path=f"{OUTPUT_DIR}/2D_hexagon_2by3.png"
     )
-    # pattern.save_dxf(f"{OUTPUT_DIR}/2D_hexagon_2by3.dxf", crease_style=["real dashed", 1.5, 1.5], profile="solidworks");
+    pattern.save_dxf(f"{OUTPUT_DIR}/2D_hexagon_2by3_solid.dxf", crease_style=["real dashed", 1.5, 1.5], connecting_dots=True, profile="solidworks");
 
 if __name__ == "__main__":
     main()

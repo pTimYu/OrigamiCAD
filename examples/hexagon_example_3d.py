@@ -25,12 +25,14 @@ def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
     build_packaging(
         pattern,
-        start_point=(0, 0),
         l=15,
         alpha=2,
         beta=2,
-        gamma=3,
-        delta=4,
+        gamma=2,
+        delta=3,
+        enable_left_open=True,
+        rotate_cavity_to_horizon=True,
+        fill_cavity=True
     )
 
     model = Cadder.from_drawer(pattern)
@@ -57,6 +59,7 @@ def main() -> None:
         # save_path=f"{OUTPUT_DIR}/3D_hexagon.png"
     )
 
+    model.save_cad(filename=f"{OUTPUT_DIR}/3D_hexagon.step")
 
 if __name__ == "__main__":
     main()

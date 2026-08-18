@@ -14,6 +14,8 @@ CreaseStyle = Literal["solid", "dashed"] | list[object] | tuple[object, ...]
 DxfProfile = Literal["solidworks"]
 _MAX_REAL_DASH_SEGMENTS = 1_000_000
 _DASH_LENGTH_MM = 3.0
+_CONNECTING_DOT_LENGTH_MM = 0.6
+_CONNECTING_DOT_COVERAGE = 0.01
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,7 @@ def save_dxf(
     include_rigid: bool = True,
     include_side: bool = True,
     profile: DxfProfile = "solidworks",
+    connecting_dots: bool = False,
 ) -> Path:
     """Save 2D metadata as an AutoCAD/SolidWorks-compatible ASCII DXF file."""
     path = Path(filename)
@@ -44,6 +47,7 @@ def save_dxf(
             include_rigid=include_rigid,
             include_side=include_side,
             profile=profile,
+            connecting_dots=connecting_dots,
         ),
         encoding="ascii",
         newline="",
@@ -59,6 +63,7 @@ def dxf_string_from_metadata(
     include_rigid: bool = True,
     include_side: bool = True,
     profile: DxfProfile = "solidworks",
+    connecting_dots: bool = False,
 ) -> str:
     """Convert 2D metadata to a complete AutoCAD 2000 DXF document.
 
@@ -66,10 +71,18 @@ def dxf_string_from_metadata(
     entities of length ``a``, separated by empty spans of length ``b``.
     Both lengths use the unit declared by the input metadata.
 
+    Set ``connecting_dots=True`` to replace the closed side boundaries with
+    evenly distributed 0.6 mm blank gaps while keeping the remaining boundary
+    as solid cut lines. The total blank length is calculated to cover
+    approximately 1% of the outer figure's perimeter. Inner cavity and
+    hole-punch boundaries remain continuous.
+
     The only supported profile is ``"solidworks"``. It is retained as an
     argument for source compatibility.
     """
     crease_style_spec = _parse_crease_style(crease_style)
+    if not isinstance(connecting_dots, bool):
+        raise ValueError("connecting_dots must be a boolean.")
     if profile != "solidworks":
         raise ValueError(
             "The 'standard' DXF profile has been removed because it emitted "
@@ -86,6 +99,14 @@ def dxf_string_from_metadata(
         units.MM,
         document_unit,
     )
+    connecting_dot_data = None
+    if connecting_dots and include_side:
+        connecting_dot_data = _create_connecting_dots(
+            metadata,
+            dot_length=_CONNECTING_DOT_LENGTH_MM
+            * units.conversion_factor(units.MM, document_unit),
+            coverage=_CONNECTING_DOT_COVERAGE,
+        )
     document.linetypes.add(
         "DASHED",
         pattern=[
@@ -118,6 +139,13 @@ def dxf_string_from_metadata(
         if kind == "rigid" and not include_rigid:
             continue
         if kind == "side" and not include_side:
+            continue
+
+        if (
+            kind == "side"
+            and connecting_dot_data is not None
+            and line_id in connecting_dot_data[1]
+        ):
             continue
 
         start = line["start"]
@@ -156,6 +184,16 @@ def dxf_string_from_metadata(
             crease_style_spec,
         )
 
+    if connecting_dot_data is not None:
+        for solid_start, solid_end in connecting_dot_data[0]:
+            _add_line_entity(
+                modelspace,
+                solid_start,
+                solid_end,
+                "side",
+                crease_style_spec,
+            )
+
     extents = bbox.extents(modelspace, fast=True)
     if extents.has_data:
         document.header["$EXTMIN"] = extents.extmin
@@ -189,6 +227,320 @@ def _add_line_entity(
             "linetype": linetype,
         },
     )
+
+
+def _create_connecting_dots(
+    metadata: dict,
+    *,
+    dot_length: float,
+    coverage: float,
+) -> tuple[
+    list[tuple[tuple[float, float], tuple[float, float]]],
+    set[str],
+]:
+    """Create solid cut segments with blank connecting dots.
+
+    Side lines are stored as independent segments, so this first reconstructs
+    planar loops and selects the loop with the largest enclosed area as the
+    figure boundary. Blank dots are then placed at equal arc-length intervals
+    on that loop, and the complementary solid segments are returned. Returning
+    the source line IDs lets the exporter replace only the boundary lines it
+    has successfully reconstructed; cavity, hole-punch, and unrelated side
+    lines are preserved.
+    """
+    if not math.isfinite(dot_length) or dot_length <= 0.0:
+        raise ValueError("dot_length must be a positive finite number.")
+    if not math.isfinite(coverage) or coverage <= 0.0:
+        raise ValueError("coverage must be a positive finite number.")
+
+    points = metadata.get("points", {})
+    lines = metadata.get("lines", {})
+    excluded_line_ids = _hole_punch_line_ids(metadata, points)
+    paths = _closed_side_paths(points, lines, excluded_line_ids)
+    if not paths:
+        return [], set()
+
+    outer_path, outer_line_ids = max(
+        paths,
+        key=lambda path_data: abs(
+            _signed_area(
+                [_finite_xy(points[start]) for start, _ in path_data[0]]
+            )
+        ),
+    )
+    outer_length = _path_length(outer_path, points)
+    if outer_length < dot_length:
+        return [], set()
+
+    dot_count = max(1, int(round(outer_length * coverage / dot_length)))
+    dot_count = min(dot_count, _MAX_REAL_DASH_SEGMENTS)
+
+    dot_centers = _dash_centers(
+        outer_path,
+        points,
+        outer_length,
+        dot_count,
+        dot_length,
+    )
+    solid_intervals = []
+    solid_start = 0.0
+    for center in dot_centers:
+        dot_start = center - 0.5 * dot_length
+        dot_end = center + 0.5 * dot_length
+        if dot_start > solid_start:
+            solid_intervals.append((solid_start, dot_start))
+        solid_start = dot_end
+    if solid_start < outer_length:
+        solid_intervals.append((solid_start, outer_length))
+
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    replaced_line_ids: set[str] = set()
+    replaced_line_ids.update(outer_line_ids)
+    for solid_start, solid_end in solid_intervals:
+        segments.extend(
+            _path_subsegments(
+                outer_path,
+                points,
+                solid_start,
+                solid_end,
+            )
+        )
+
+    return segments, replaced_line_ids
+
+
+def _hole_punch_line_ids(metadata: dict, points: dict) -> set[str]:
+    """Return side-line IDs belonging to explicit hole-punch polygons."""
+    hole_point_ids: set[str] = set()
+    for hole in metadata.get("hole_punches", []):
+        hole_id = hole.get("id")
+        if hole_id is None:
+            continue
+        prefix = f"{hole_id}_p"
+        hole_point_ids.update(
+            point_id
+            for point_id in points
+            if str(point_id).startswith(prefix)
+        )
+
+    excluded: set[str] = set()
+    for line_id, line in metadata.get("lines", {}).items():
+        if (
+            line.get("kind", "side") == "side"
+            and line.get("start") in hole_point_ids
+            and line.get("end") in hole_point_ids
+        ):
+            excluded.add(line_id)
+    return excluded
+
+
+def _closed_side_paths(
+    points: dict,
+    lines: dict,
+    excluded_line_ids: set[str],
+) -> list[tuple[list[tuple[str, str]], set[str]]]:
+    """Trace the bounded faces formed by side-line segments.
+
+    The half-edge walk handles both ordinary polygons and side graphs with
+    vertices shared by several boundary segments. Positive signed-area walks
+    are the bounded faces; the reverse walk of each simple loop is the outer
+    face and is discarded.
+    """
+    adjacency: dict[str, list[tuple[str, str]]] = {}
+    coordinates: dict[str, tuple[float, float]] = {}
+    side_edges: list[tuple[str, str, str]] = []
+
+    for line_id, line in lines.items():
+        if line_id in excluded_line_ids:
+            continue
+        if line.get("kind", "side") != "side":
+            continue
+
+        start = line.get("start")
+        end = line.get("end")
+        if start not in points or end not in points:
+            raise ValueError(
+                f"Line '{line_id}' references missing point(s): {start}, {end}."
+            )
+        if start == end:
+            continue
+
+        coordinates[start] = _finite_xy(points[start])
+        coordinates[end] = _finite_xy(points[end])
+        side_edges.append((start, end, line_id))
+        adjacency.setdefault(start, []).append((end, line_id))
+        adjacency.setdefault(end, []).append((start, line_id))
+
+    if not side_edges:
+        return []
+
+    for point_id, neighbors in adjacency.items():
+        x0, y0 = coordinates[point_id]
+        neighbors.sort(
+            key=lambda item: math.atan2(
+                coordinates[item[0]][1] - y0,
+                coordinates[item[0]][0] - x0,
+            )
+        )
+
+    directed_edges = [
+        directed_edge
+        for start, end, line_id in side_edges
+        for directed_edge in (
+            (start, end, line_id),
+            (end, start, line_id),
+        )
+    ]
+    visited: set[tuple[str, str, str]] = set()
+    paths: list[tuple[list[tuple[str, str]], set[str]]] = []
+
+    for first_edge in directed_edges:
+        if first_edge in visited:
+            continue
+
+        current = first_edge
+        walk: list[tuple[str, str, str]] = []
+        closed = False
+        while current not in visited:
+            visited.add(current)
+            walk.append(current)
+            start, end, line_id = current
+
+            neighbors = adjacency[end]
+            reverse_index = next(
+                (
+                    index
+                    for index, (neighbor, edge_id) in enumerate(neighbors)
+                    if neighbor == start and edge_id == line_id
+                ),
+                None,
+            )
+            if reverse_index is None:
+                break
+
+            # The clockwise neighbor from the reverse half-edge keeps the
+            # face on the left side of the walk.
+            next_start, next_line_id = neighbors[
+                (reverse_index - 1) % len(neighbors)
+            ]
+            current = (end, next_start, next_line_id)
+            if current == first_edge:
+                closed = True
+                break
+
+        if not closed or len(walk) < 3:
+            continue
+
+        polygon = [coordinates[start] for start, _, _ in walk]
+        area = _signed_area(polygon)
+        if area <= 0.0:
+            continue
+
+        paths.append(
+            (
+                [(start, end) for start, end, _ in walk],
+                {line_id for _, _, line_id in walk},
+            )
+        )
+
+    return paths
+
+
+def _signed_area(polygon: list[tuple[float, float]]) -> float:
+    return 0.5 * sum(
+        x0 * y1 - x1 * y0
+        for (x0, y0), (x1, y1) in zip(
+            polygon,
+            polygon[1:] + polygon[:1],
+        )
+    )
+
+
+def _path_length(path: list[tuple[str, str]], points: dict) -> float:
+    return sum(
+        math.hypot(
+            _finite_xy(points[end])[0] - _finite_xy(points[start])[0],
+            _finite_xy(points[end])[1] - _finite_xy(points[start])[1],
+        )
+        for start, end in path
+    )
+
+
+def _dash_centers(
+    path: list[tuple[str, str]],
+    points: dict,
+    path_length: float,
+    count: int,
+    dot_length: float,
+) -> list[float]:
+    """Choose evenly spaced dash centers away from polygon vertices."""
+    spacing = path_length / count
+    vertex_distances = []
+    distance = 0.0
+    for start_id, end_id in path[:-1]:
+        x0, y0 = _finite_xy(points[start_id])
+        x1, y1 = _finite_xy(points[end_id])
+        distance += math.hypot(x1 - x0, y1 - y0)
+        vertex_distances.append(distance)
+
+    # A dash crossing a corner would be emitted as two shorter LINE entities.
+    # Shift the regular pattern by a small deterministic amount until every
+    # dash remains on one straight side whenever the geometry permits it.
+    phase = 0.5 * spacing
+    tolerance = max(path_length, dot_length) * 1e-12
+    for _ in range(100):
+        centers = [phase + index * spacing for index in range(count)]
+        stays_inside_path = (
+            centers[0] - 0.5 * dot_length >= -tolerance
+            and centers[-1] + 0.5 * dot_length
+            <= path_length + tolerance
+        )
+        if stays_inside_path and all(
+            not any(
+                center - 0.5 * dot_length - tolerance
+                <= vertex_distance
+                <= center + 0.5 * dot_length + tolerance
+                for vertex_distance in vertex_distances
+            )
+            for center in centers
+        ):
+            return centers
+        phase = (phase + 0.5 * dot_length) % spacing
+
+    return [phase + index * spacing for index in range(count)]
+
+
+def _path_subsegments(
+    path: list[tuple[str, str]],
+    points: dict,
+    start_distance: float,
+    end_distance: float,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Return the pieces of an arc-length interval as LINE segments."""
+    if end_distance <= start_distance:
+        return []
+
+    segments = []
+    distance = 0.0
+    for start_id, end_id in path:
+        x0, y0 = _finite_xy(points[start_id])
+        x1, y1 = _finite_xy(points[end_id])
+        length = math.hypot(x1 - x0, y1 - y0)
+        segment_start = max(start_distance, distance)
+        segment_end = min(end_distance, distance + length)
+        if segment_end > segment_start and length > 0.0:
+            t0 = (segment_start - distance) / length
+            t1 = (segment_end - distance) / length
+            segments.append(
+                (
+                    (x0 + t0 * (x1 - x0), y0 + t0 * (y1 - y0)),
+                    (x0 + t1 * (x1 - x0), y0 + t1 * (y1 - y0)),
+                )
+            )
+        distance += length
+        if distance >= end_distance:
+            break
+    return segments
 
 
 def _line_properties(
