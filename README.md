@@ -27,6 +27,14 @@ cargo = calculate_cargo_size(l=15.0, theta=135.0, gamma=3, delta=4)
 print(cargo.transverse, cargo.longitudinal)
 ```
 
+The corresponding folded height is available separately:
+
+```python
+from origamicad.patterns.hexagon import calculate_cargo_height
+
+height = calculate_cargo_height(l=15.0, theta=135.0)
+```
+
 The reusable core is kept separate from pattern-specific code:
 
 ```text

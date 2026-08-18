@@ -13,6 +13,48 @@ class CargoSize(NamedTuple):
     longitudinal: float
 
 
+def calculate_cargo_height(
+    l: float,
+    theta: float,
+    *,
+    unit: Literal["rad", "deg"] = "deg",
+    valley_height: float = 0.0,
+) -> float:
+    """Calculate the folded cargo height from panel side and dihedral angle.
+
+    The height is measured from the valley-panel level and follows the
+    hexagon relation ``sqrt(3) / 2 * l * sin(theta)``. ``valley_height``
+    translates the result to a non-zero valley-panel elevation.
+
+    Parameters
+    ----------
+    l:
+        Panel side length. It must be positive.
+    theta:
+        Dihedral angle, expressed in degrees by default.
+    unit:
+        Angle unit for ``theta``: ``"deg"`` or ``"rad"``.
+    valley_height:
+        Elevation of the valley panels. It defaults to zero.
+    """
+    side_length = _finite_float(l, "l")
+    angle = _finite_float(theta, "theta")
+    base_height = _finite_float(valley_height, "valley_height")
+
+    if side_length <= 0.0:
+        raise ValueError("l must be positive.")
+
+    if unit == "deg":
+        angle = math.radians(angle)
+    elif unit != "rad":
+        raise ValueError("unit must be 'rad' or 'deg'.")
+
+    if not 0.0 <= angle <= math.pi:
+        raise ValueError("theta must be between 0 and 180 degrees, inclusive.")
+
+    return base_height + math.sqrt(3.0) / 2.0 * side_length * math.sin(angle)
+
+
 def calculate_cargo_size(
     l: float,
     theta: float,
@@ -98,4 +140,4 @@ def _finite_float(value: float, name: str) -> float:
     return result
 
 
-__all__ = ["CargoSize", "calculate_cargo_size"]
+__all__ = ["CargoSize", "calculate_cargo_height", "calculate_cargo_size"]
