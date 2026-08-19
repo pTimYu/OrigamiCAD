@@ -421,6 +421,7 @@ def hexagon_packaging(
     enable_hole_punch_cavity: float = 0.0,
     rotate_cavity_to_horizon: bool = False,
     fill_cavity: bool = False,
+    reverse: bool = False,
 ) -> list[HexUnit]:
     """
     Draw a packed lattice of hexagon unit chains with a rectangular cavity.
@@ -434,7 +435,9 @@ def hexagon_packaging(
     lines to the outer or cavity-side parallelograms, respectively. Set
     ``rotate_cavity_to_horizon=True`` to rotate the complete structure clockwise
     by 10.8934 degrees about the cavity center. Set ``fill_cavity=True`` to
-    populate the cavity region instead of leaving it empty.
+    populate the cavity region instead of leaving it empty. Set ``reverse=True``
+    to exchange every mountain and valley crease label, including the local
+    kinematic metadata.
     """
 
     if l <= 0:
@@ -470,6 +473,7 @@ def hexagon_packaging(
         "enable_bot_open": enable_bot_open,
         "rotate_cavity_to_horizon": rotate_cavity_to_horizon,
         "fill_cavity": fill_cavity,
+        "reverse": reverse,
     }.items():
         if not isinstance(enabled, bool):
             raise ValueError(f"{name} must be a boolean.")
@@ -514,6 +518,7 @@ def hexagon_packaging(
                     start_point=(unit_x, unit_y),
                     l=l,
                     count=len(units),
+                    reverse=reverse,
                 )
                 units.append(unit)
                 units_by_cell[(row, col)] = unit

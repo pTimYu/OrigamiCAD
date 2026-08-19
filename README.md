@@ -17,6 +17,9 @@ model = Cadder.from_drawer(pattern)
 solve_kinematics(model, final_dihedral=135.0)
 ```
 
+Pass `reverse=True` to `build_packaging` to exchange all mountain and valley
+crease labels and their kinematic metadata.
+
 Calculate the transverse and longitudinal cargo dimensions for a folded
 hexagon package (angles are in degrees by default):
 
