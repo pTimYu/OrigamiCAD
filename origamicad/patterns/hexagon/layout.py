@@ -332,6 +332,7 @@ def _add_packaging_hole_punches(
     l: float,
     outer_diameter: float,
     cavity_diameter: float,
+    cavity_holes_enabled: bool,
 ) -> None:
     """Add hole punches to boundary parallelograms of a packaging grid."""
     if outer_diameter == 0 and cavity_diameter == 0:
@@ -363,7 +364,12 @@ def _add_packaging_hole_punches(
                 not bool(draw_cell[peer_cell])
                 for peer_cell in peer_cells
             )
-            diameter = cavity_diameter if cavity_boundary else outer_diameter
+            if cavity_boundary:
+                if not cavity_holes_enabled:
+                    continue
+                diameter = cavity_diameter
+            else:
+                diameter = outer_diameter
             if diameter == 0:
                 continue
 
@@ -432,12 +438,13 @@ def hexagon_packaging(
     provide the wall thickness. The four ``enable_*_open`` flags independently
     remove the corresponding cavity-side wall. Set ``enable_hole_punch_outer``
     or ``enable_hole_punch_cavity`` to a positive diameter to add circular cut
-    lines to the outer or cavity-side parallelograms, respectively. Set
-    ``rotate_cavity_to_horizon=True`` to rotate the complete structure clockwise
-    by 10.8934 degrees about the cavity center. Set ``fill_cavity=True`` to
-    populate the cavity region instead of leaving it empty. Set ``reverse=True``
-    to exchange every mountain and valley crease label, including the local
-    kinematic metadata.
+    lines to the outer or cavity-side parallelograms, respectively. Cavity-side
+    hole punches are added only when at least one cavity-side wall is opened.
+    Set ``rotate_cavity_to_horizon=True`` to rotate the complete structure
+    clockwise by 10.8934 degrees about the cavity center. Set
+    ``fill_cavity=True`` to populate the cavity region instead of leaving it
+    empty. Set ``reverse=True`` to exchange every mountain and valley crease
+    label, including the local kinematic metadata.
     """
 
     if l <= 0:
@@ -538,6 +545,14 @@ def hexagon_packaging(
         l,
         outer_hole_diameter,
         cavity_hole_diameter,
+        cavity_holes_enabled=any(
+            (
+                enable_left_open,
+                enable_right_open,
+                enable_top_open,
+                enable_bot_open,
+            )
+        ),
     )
 
     if rotate_cavity_to_horizon:
