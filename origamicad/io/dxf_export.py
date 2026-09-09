@@ -569,24 +569,17 @@ def _layer_defs(
     include_rigid: bool,
     include_side: bool,
 ) -> list[tuple[str, int, str]]:
-    layers = []
-    if include_side:
-        layers.append(("CUT_SIDE", 7, "CONTINUOUS"))
-    if include_rigid:
-        layers.append(("RIGID", 8, "CONTINUOUS"))
-    if include_creases:
-        crease_linetype = (
-            "DASHED" if crease_style.name == "dashed" else "CONTINUOUS"
+    return [
+        _line_properties(kind, crease_style)
+        for kind, include in (
+            ("side", include_side),
+            ("rigid", include_rigid),
+            ("valley", include_creases),
+            ("mountain", include_creases),
+            ("construction", include_construction),
         )
-        layers.extend(
-            [
-                ("CREASE_VALLEY", 5, crease_linetype),
-                ("CREASE_MOUNTAIN", 1, crease_linetype),
-            ]
-        )
-    if include_construction:
-        layers.append(("CONSTRUCTION", 9, "DASHED"))
-    return layers
+        if include
+    ]
 
 
 def _parse_crease_style(crease_style: CreaseStyle) -> _CreaseStyleSpec:

@@ -19,6 +19,7 @@ from origamicad.patterns.hexagon import draw_hex_loops, solve_kinematics
 
 
 N_LOOPS = 3
+CAVITY_LOOPS = 0  # Set to 1 or 2 to open an inner cavity.
 SIDE_LENGTH = 15.0
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -30,13 +31,17 @@ def main() -> None:
         n=N_LOOPS,
         start_point=(0.0, 0.0),
         l=SIDE_LENGTH,
+        cavity_loops=CAVITY_LOOPS,
     )
 
     expected_units = 1 + 3 * N_LOOPS * (N_LOOPS - 1)
+    if CAVITY_LOOPS:
+        expected_units -= 1 + 3 * CAVITY_LOOPS * (CAVITY_LOOPS - 1)
     print(f"Generated {len(units)} unit cells (expected {expected_units}).")
     pattern.print_summary()
+    cavity_suffix = f"_cavity{CAVITY_LOOPS}" if CAVITY_LOOPS else ""
     pattern.save_dxf(
-            filename=f"{OUTPUT_DIR}/{N_LOOPS}loops_dxf.dxf",
+            filename=f"{OUTPUT_DIR}/{N_LOOPS}loops{cavity_suffix}_dxf.dxf",
             crease_style=["real dashed", 2, 2],
             profile="solidworks"
     )

@@ -427,6 +427,14 @@ def _interface_diagnostics(
         )
         for surface_id in lower_surface_ids
     }
+    lower_ids = list(lower_coordinates)
+    lower_bounds = np.array([
+        (coordinates.min(axis=0), coordinates.max(axis=0))
+        for coordinates in lower_coordinates.values()
+    ])
+    # The exact norm can underflow for extremely small separations. A loose
+    # bound in that range keeps the existing distance/tolerance decision.
+    bound_tolerance = max(np.nextafter(tolerance, np.inf), np.sqrt(np.finfo(float).tiny))
     unmatched_upper = []
     matched_errors = []
     adhesive_area = 0.0
@@ -436,8 +444,20 @@ def _interface_diagnostics(
         upper_coordinates = _surface_coordinates(assembly, stacked_upper_id)
         best_lower_id = None
         best_error = float("inf")
+        # A vertex match within tolerance requires both coordinate bounds to
+        # agree within tolerance. Keep the original set order for tie breaking.
+        upper_bounds = np.array((upper_coordinates.min(axis=0), upper_coordinates.max(axis=0)))
+        candidate_ids = {
+            lower_ids[index]
+            for index in np.flatnonzero(np.all(
+                np.abs(lower_bounds - upper_bounds) <= bound_tolerance,
+                axis=(1, 2),
+            ))
+        }
 
         for lower_surface_id in available_lower:
+            if lower_surface_id not in candidate_ids:
+                continue
             error = _unordered_vertex_error(
                 lower_coordinates[lower_surface_id],
                 upper_coordinates,
@@ -628,10 +648,11 @@ def stack_mixed_layers(
     if any(model.unit != model_unit for model in models[1:]):
         raise ValueError("All layer models must use the same unit.")
 
-    panel_levels = [
-        layer_panel_levels(model, tolerance=tolerance)
-        for model in models
-    ]
+    levels_by_model = {}
+    for model in models:
+        if id(model) not in levels_by_model:
+            levels_by_model[id(model)] = layer_panel_levels(model, tolerance=tolerance)
+    panel_levels = [levels_by_model[id(model)] for model in models]
     valley_levels = [levels["valley"] for levels in panel_levels]
     layer_heights = [
         levels["mountain"] - levels["valley"]

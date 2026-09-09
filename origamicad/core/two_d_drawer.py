@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Literal
 import json
@@ -63,6 +64,28 @@ class TwoDDrawer:
         self._point_count = 0
         self._line_count = 0
         self._surface_count = 0
+        self._geometry_indexes = None
+
+    @contextmanager
+    def _index_geometry(self):
+        """Index append-only layout construction, then discard the indexes.
+
+        Public geometry stays mutable: later direct dictionary or vertex edits
+        are observed by ordinary lookups and by the next layout operation.
+        """
+        if self._geometry_indexes is not None:
+            yield
+            return
+        line_index, surface_index = {}, {}
+        for lid, line in self.lines.items():
+            line_index.setdefault(self._canonical_line_key(line.start, line.end), lid)
+        for sid, surface in self.surfaces.items():
+            surface_index.setdefault(self._canonical_surface_key(surface.vertices), sid)
+        self._geometry_indexes = line_index, surface_index
+        try:
+            yield
+        finally:
+            self._geometry_indexes = None
 
     @classmethod
     def from_metadata(cls, metadata: dict) -> "TwoDDrawer":
@@ -271,6 +294,8 @@ class TwoDDrawer:
             Existing line ID if found; otherwise None.
         """
         target_key = self._canonical_line_key(start, end)
+        if self._geometry_indexes is not None:
+            return self._geometry_indexes[0].get(target_key)
 
         for lid, line in self.lines.items():
             line_key = self._canonical_line_key(line.start, line.end)
@@ -290,6 +315,8 @@ class TwoDDrawer:
             Existing surface ID if found; otherwise None.
         """
         target_key = self._canonical_surface_key(vertices)
+        if self._geometry_indexes is not None:
+            return self._geometry_indexes[1].get(target_key)
 
         for sid, surface in self.surfaces.items():
             surface_key = self._canonical_surface_key(surface.vertices)
@@ -400,6 +427,8 @@ class TwoDDrawer:
             raise ValueError(f"Line id '{line_id}' already exists.")
 
         self.lines[line_id] = Line2D(line_id, start, end, kind)
+        if self._geometry_indexes is not None:
+            self._geometry_indexes[0][self._canonical_line_key(start, end)] = line_id
         return line_id
 
     def add_surface(
@@ -456,6 +485,8 @@ class TwoDDrawer:
             raise ValueError(f"Surface id '{surface_id}' already exists.")
 
         self.surfaces[surface_id] = Surface2D(surface_id, list(vertices))
+        if self._geometry_indexes is not None:
+            self._geometry_indexes[1][self._canonical_surface_key(vertices)] = surface_id
 
         if auto_boundary:
             self._add_boundary_lines(vertices, boundary_kind)
@@ -643,7 +674,11 @@ class TwoDDrawer:
             "num_points": len(self.points),
             "num_lines": len(self.lines),
             "num_surfaces": len(self.surfaces),
-            "num_creases": self.count_creases(),
+            "num_creases": (
+                line_counts["valley"] + line_counts["mountain"]
+                if getattr(self.count_creases, "__func__", None) is TwoDDrawer.count_creases
+                else self.count_creases()
+            ),
             "num_valley_creases": line_counts["valley"],
             "num_mountain_creases": line_counts["mountain"],
             "line_counts": line_counts,

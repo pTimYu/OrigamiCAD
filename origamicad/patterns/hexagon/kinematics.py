@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 
 if TYPE_CHECKING:
-    from ...core.cadder import Cadder, SolveReport
+    from ...core.cadder import Cadder
 
 
 class _HexagonKinematics:
@@ -231,25 +231,6 @@ class _HexagonKinematics:
             f"{crease_kinds}."
         )
 
-    def _find_unique_triangle_quad_pair_adjacent_to_edge(
-        self,
-        p1: str,
-        p2: str,
-    ) -> Optional[Tuple[str, str]]:
-        adjacent = self.find_surfaces_adjacent_to_edge(p1, p2)
-        triangle_ids = [
-            sid for sid in adjacent
-            if len(self._surface_vertices(sid)) == 3
-        ]
-        quad_ids = [
-            sid for sid in adjacent
-            if len(self._surface_vertices(sid)) == 4
-        ]
-
-        if len(triangle_ids) == 1 and len(quad_ids) == 1:
-            return triangle_ids[0], quad_ids[0]
-        return None
-
     def _initial_guess(
         self,
         mountain_height: float,
@@ -292,8 +273,9 @@ class _HexagonKinematics:
 
             h = sqrt(3) / 2 * d * sin(theta).
 
-        The side length is measured from the ordered middle-hexagon vertices,
-        so callers do not need to repeat the pattern's ``l`` parameter.
+        The side length is measured from the middle-hexagon edges (using the
+        surviving panels for units cut by a cavity), so callers do not need
+        to repeat the pattern's ``l`` parameter.
         """
         if not self.hex_units:
             raise ValueError(
@@ -303,27 +285,38 @@ class _HexagonKinematics:
         side_lengths = []
         for unit_data in self.hex_units:
             mid_point_ids = list(unit_data.get("mid", []))
-            if len(mid_point_ids) != 6:
-                raise ValueError(
-                    "Each hex unit must provide six ordered 'mid' points to "
-                    "calculate its side length."
-                )
             if any(point_id not in self.points for point_id in mid_point_ids):
                 raise ValueError(
                     "Hex-unit metadata references a missing middle-hexagon point."
                 )
 
-            coordinates = [
-                self.point_array(point_id)
-                for point_id in mid_point_ids
-            ]
+            if len(mid_point_ids) == 6:
+                mid_edges = list(zip(
+                    mid_point_ids, mid_point_ids[1:] + mid_point_ids[:1]
+                ))
+            else:
+                # Cavity units have gaps in their middle hexagon. Closing the
+                # shortened point list would measure diagonals across the gap.
+                mid_edges = []
+                for surface_id in unit_data.get("parallelograms", []):
+                    vertices = self._surface_vertices(surface_id)
+                    mid_edges.extend(
+                        (start, end)
+                        for start, end in zip(vertices, vertices[1:] + vertices[:1])
+                        if start in mid_point_ids and end in mid_point_ids
+                    )
+                if not mid_edges:
+                    raise ValueError(
+                        "Each hex unit must provide middle-hexagon edges to "
+                        "calculate its side length."
+                    )
             side_lengths.extend(
                 float(
                     np.linalg.norm(
-                        coordinates[(index + 1) % 6] - coordinates[index]
+                        self.point_array(end) - self.point_array(start)
                     )
                 )
-                for index in range(6)
+                for start, end in mid_edges
             )
 
         side_length = float(np.mean(side_lengths))

@@ -1125,11 +1125,6 @@ def _segment_segment_distance(
     )
     epsilon = 1e-24
 
-    first_parameter = 0.0
-    second_parameter = 0.0
-    first_numerator = 0.0
-    second_numerator = denominator
-
     if first_length_squared <= epsilon:
         return _point_segment_distance(
             first_start,
@@ -1271,7 +1266,7 @@ def _point_triangle_distance(
     return float(np.linalg.norm(point - closest))
 
 
-def _segment_intersects_triangle(
+def _segment_triangle_intersections(
     segment_start: np.ndarray,
     segment_end: np.ndarray,
     first: np.ndarray,
@@ -1279,16 +1274,15 @@ def _segment_intersects_triangle(
     third: np.ndarray,
     *,
     tolerance: float = 1e-10,
-    proper_only: bool = False,
-) -> bool:
-    """Möller-Trumbore segment/triangle intersection test."""
+) -> tuple[bool, bool]:
+    """Return inclusive contact and proper intersection from one calculation."""
     direction = segment_end - segment_start
     first_edge = second - first
     second_edge = third - first
     cross_direction = np.cross(direction, second_edge)
     determinant = float(np.dot(first_edge, cross_direction))
     if abs(determinant) <= tolerance:
-        return False
+        return False, False
 
     inverse_determinant = 1.0 / determinant
     origin_offset = segment_start - first
@@ -1303,20 +1297,37 @@ def _segment_intersects_triangle(
         np.dot(second_edge, cross_offset) * inverse_determinant
     )
 
-    if proper_only:
-        return (
-            tolerance < segment_parameter < 1.0 - tolerance
-            and tolerance < first_barycentric < 1.0 - tolerance
-            and tolerance
-            < second_barycentric
-            < 1.0 - first_barycentric - tolerance
-        )
-    return (
+    proper = (
+        tolerance < segment_parameter < 1.0 - tolerance
+        and tolerance < first_barycentric < 1.0 - tolerance
+        and tolerance
+        < second_barycentric
+        < 1.0 - first_barycentric - tolerance
+    )
+    contact = (
         -tolerance <= segment_parameter <= 1.0 + tolerance
         and first_barycentric >= -tolerance
         and second_barycentric >= -tolerance
         and first_barycentric + second_barycentric <= 1.0 + tolerance
     )
+    return contact, proper
+
+
+def _segment_intersects_triangle(
+    segment_start: np.ndarray,
+    segment_end: np.ndarray,
+    first: np.ndarray,
+    second: np.ndarray,
+    third: np.ndarray,
+    *,
+    tolerance: float = 1e-10,
+    proper_only: bool = False,
+) -> bool:
+    """Möller-Trumbore segment/triangle intersection test."""
+    contact, proper = _segment_triangle_intersections(
+        segment_start, segment_end, first, second, third, tolerance=tolerance,
+    )
+    return proper if proper_only else contact
 
 
 def _triangle_distance(
@@ -1334,42 +1345,15 @@ def _triangle_distance(
         (second_triangle[2], second_triangle[0]),
     )
 
-    proper_intersection = any(
-        _segment_intersects_triangle(
-            edge_start,
-            edge_end,
-            *second_triangle,
-            proper_only=True,
-        )
-        for edge_start, edge_end in first_edges
-    ) or any(
-        _segment_intersects_triangle(
-            edge_start,
-            edge_end,
-            *first_triangle,
-            proper_only=True,
-        )
-        for edge_start, edge_end in second_edges
-    )
-
-    if proper_intersection:
-        return 0.0, True
-
-    intersects = any(
-        _segment_intersects_triangle(
-            edge_start,
-            edge_end,
-            *second_triangle,
-        )
-        for edge_start, edge_end in first_edges
-    ) or any(
-        _segment_intersects_triangle(
-            edge_start,
-            edge_end,
-            *first_triangle,
-        )
-        for edge_start, edge_end in second_edges
-    )
+    intersects = False
+    for edges, triangle in ((first_edges, second_triangle), (second_edges, first_triangle)):
+        for edge_start, edge_end in edges:
+            contact, proper = _segment_triangle_intersections(
+                edge_start, edge_end, *triangle,
+            )
+            if proper:
+                return 0.0, True
+            intersects = intersects or contact
     if intersects:
         return 0.0, False
 
@@ -1836,7 +1820,6 @@ def simulate_insertion(
         mountain_height=max(1.0, 0.15 * side_length),
         valley_height=0.0,
     )
-    maximum_residual = 0.0
     uniform_branch_angle = 180.0 - branch_acute_start_deg
     use_direct_panel_branch = (
         assignment_mode == "panel_sequence"
@@ -1872,10 +1855,6 @@ def simulate_insertion(
                 tol=solve_tolerance,
                 compute_rank=False,
             )
-            maximum_residual = max(
-                maximum_residual,
-                report.max_abs_residual,
-            )
             if report.max_abs_residual > feasibility_tolerance:
                 raise RuntimeError(
                     "Could not reach the uniform starting configuration: "
@@ -1894,6 +1873,7 @@ def simulate_insertion(
     branch_coordinates = coordinates.copy()
     attempts: list[CombinationAttempt] = []
     safe_coordinates: dict[int, np.ndarray] = {}
+    safe_clearances: dict[int, tuple[float, tuple[str, str] | None, bool]] = {}
 
     for combination_index, mask in enumerate(masks, start=1):
         candidate_coordinates = branch_coordinates.copy()
@@ -1942,10 +1922,6 @@ def simulate_insertion(
 
         if candidate_report is None:
             raise RuntimeError("No combination continuation steps were run.")
-        maximum_residual = max(
-            maximum_residual,
-            candidate_report.max_abs_residual,
-        )
         kinematically_valid = (
             candidate_report.max_abs_residual <= feasibility_tolerance
         )
@@ -1960,7 +1936,8 @@ def simulate_insertion(
                 top_view_pca_aspect,
                 top_view_bbox_aspect,
             ) = _top_view_compactness(model)
-            panel_gap, _, clipping = minimum_panel_clearance(model)
+            clearance = minimum_panel_clearance(model)
+            panel_gap, _, clipping = clearance
             analytical_reference_contact = (
                 assignment_mode == "regular_masks"
                 and contact_boundary_target
@@ -1975,6 +1952,7 @@ def simulate_insertion(
             )
             if not clipping:
                 safe_coordinates[mask] = candidate_coordinates.copy()
+                safe_clearances[mask] = clearance
 
         if assignment_mode == "panel_sequence":
             bit_pattern = "panel-sequence"
@@ -2145,7 +2123,13 @@ def simulate_insertion(
             obtuse_dihedral_deg=selected_obtuse_dihedral_deg,
         )
     loop_dihedrals = _loop_dihedral_stats(model)
-    final_gap, final_pair, final_clipping = minimum_panel_clearance(model)
+    # Target updates do not change the selected coordinates. Fallback geometry
+    # has not been checked and still needs its own clearance calculation.
+    final_gap, final_pair, final_clipping = (
+        safe_clearances[selected_attempt["mask"]]
+        if nonclipping_attempts
+        else minimum_panel_clearance(model)
+    )
     if final_clipping:
         raise RuntimeError(
             "Internal error: the selected final configuration clips panels."

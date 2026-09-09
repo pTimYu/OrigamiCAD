@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
+from functools import wraps
 
 import numpy as np
 
-from ...core.two_d_drawer import TwoDDrawer
+from ...core.two_d_drawer import LineKind, TwoDDrawer
 from .metadata import (
     Coordinate,
     CreaseKind,
@@ -16,6 +18,50 @@ from .metadata import (
 )
 
 
+def _indexed_layout(function):
+    @wraps(function)
+    def draw(pattern: TwoDDrawer, *args, **kwargs):
+        # Subclasses may override builders to mutate existing topology.
+        if type(pattern) is not TwoDDrawer:
+            return function(pattern, *args, **kwargs)
+        with pattern._index_geometry():
+            return function(pattern, *args, **kwargs)
+    return draw
+
+
+def _unit_coordinates(
+    start_point: Coordinate,
+    l: float,
+) -> tuple[list[Coordinate], list[Coordinate]]:
+    """Return the shared, ordered inner and outer coordinates of one cell."""
+    x0, y0 = start_point
+    h = float(l * np.sqrt(3) / 2)
+    mid_coords: list[Coordinate] = [
+        (x0, y0),
+        (x0 + l, y0),
+        (x0 + 1.5 * l, y0 - h),
+        (x0 + l, y0 - 2 * h),
+        (x0, y0 - 2 * h),
+        (x0 - 0.5 * l, y0 - h),
+    ]
+    side_coords: list[Coordinate] = [
+        (x0 - l, y0),
+        (x0 - 0.5 * l, y0 + h),
+        (x0 + 0.5 * l, y0 + h),
+        (x0 + 1.5 * l, y0 + h),
+        (x0 + 2 * l, y0),
+        (x0 + 2.5 * l, y0 - h),
+        (x0 + 2 * l, y0 - 2 * h),
+        (x0 + 1.5 * l, y0 - 3 * h),
+        (x0 + 0.5 * l, y0 - 3 * h),
+        (x0 - 0.5 * l, y0 - 3 * h),
+        (x0 - l, y0 - 2 * h),
+        (x0 - 1.5 * l, y0 - h),
+    ]
+    return mid_coords, side_coords
+
+
+@_indexed_layout
 def hex_unit_chain(
     pattern: TwoDDrawer,
     start_point: Coordinate = (0.0, 0.0),
@@ -42,8 +88,7 @@ def hex_unit_chain(
         Dictionary containing point IDs and surface IDs.
     """
 
-    x0, y0 = start_point
-    h: float = float(l * np.sqrt(3) / 2)
+    mid_coords, side_coords = _unit_coordinates(start_point, l)
     even_kind: CreaseKind = "valley" if reverse else "mountain"
     odd_kind: CreaseKind = "mountain" if reverse else "valley"
     crease_kinds: list[CreaseKind] = [
@@ -54,15 +99,6 @@ def hex_unit_chain(
     # ------------------------------------------------------------
     # Inner hexagonal void points
     # ------------------------------------------------------------
-
-    mid_coords: list[Coordinate] = [
-        (x0, y0),
-        (x0 + l, y0),
-        (x0 + 1.5 * l, y0 - h),
-        (x0 + l, y0 - 2 * h),
-        (x0, y0 - 2 * h),
-        (x0 - 0.5 * l, y0 - h),
-    ]
 
     mid_ids: list[PointID] = []
     for i, (x, y) in enumerate(mid_coords):
@@ -80,21 +116,6 @@ def hex_unit_chain(
     # ------------------------------------------------------------
     # Outer points
     # ------------------------------------------------------------
-
-    side_coords: list[Coordinate] = [
-        (x0 - l, y0),
-        (x0 - 0.5 * l, y0 + h),
-        (x0 + 0.5 * l, y0 + h),
-        (x0 + 1.5 * l, y0 + h),
-        (x0 + 2 * l, y0),
-        (x0 + 2.5 * l, y0 - h),
-        (x0 + 2 * l, y0 - 2 * h),
-        (x0 + 1.5 * l, y0 - 3 * h),
-        (x0 + 0.5 * l, y0 - 3 * h),
-        (x0 - 0.5 * l, y0 - 3 * h),
-        (x0 - l, y0 - 2 * h),
-        (x0 - 1.5 * l, y0 - h),
-    ]
 
     side_ids: list[PointID] = []
     for i, (x, y) in enumerate(side_coords):
@@ -260,46 +281,30 @@ def hex_unit_chain(
     }
 
 
+def _quad_coordinate_signatures(
+    start_point: Coordinate,
+    l: float,
+) -> list[tuple[tuple[float, float], ...]]:
+    """Return the six rounded quad signatures from one coordinate table."""
+    mid_coords, side_coords = _unit_coordinates(start_point, l)
+    return [
+        tuple(sorted((round(float(x), 10), round(float(y), 10)) for x, y in (
+            mid_coords[index],
+            mid_coords[(index + 1) % 6],
+            side_coords[(2 * index + 2) % 12],
+            side_coords[2 * index + 1],
+        )))
+        for index in range(6)
+    ]
+
+
 def _quad_coordinate_signature(
     start_point: Coordinate,
     l: float,
     index: int,
 ) -> tuple[tuple[float, float], ...]:
     """Return a rounded coordinate signature for one unit-chain quad."""
-    x0, y0 = start_point
-    h = float(l * np.sqrt(3) / 2)
-    mid_coords: list[Coordinate] = [
-        (x0, y0),
-        (x0 + l, y0),
-        (x0 + 1.5 * l, y0 - h),
-        (x0 + l, y0 - 2 * h),
-        (x0, y0 - 2 * h),
-        (x0 - 0.5 * l, y0 - h),
-    ]
-    side_coords: list[Coordinate] = [
-        (x0 - l, y0),
-        (x0 - 0.5 * l, y0 + h),
-        (x0 + 0.5 * l, y0 + h),
-        (x0 + 1.5 * l, y0 + h),
-        (x0 + 2 * l, y0),
-        (x0 + 2.5 * l, y0 - h),
-        (x0 + 2 * l, y0 - 2 * h),
-        (x0 + 1.5 * l, y0 - 3 * h),
-        (x0 + 0.5 * l, y0 - 3 * h),
-        (x0 - 0.5 * l, y0 - 3 * h),
-        (x0 - l, y0 - 2 * h),
-        (x0 - 1.5 * l, y0 - h),
-    ]
-    next_index = (index + 1) % 6
-    vertices = (
-        mid_coords[index],
-        mid_coords[next_index],
-        side_coords[(2 * index + 2) % 12],
-        side_coords[2 * index + 1],
-    )
-    return tuple(
-        sorted((round(float(x), 10), round(float(y), 10)) for x, y in vertices)
-    )
+    return _quad_coordinate_signatures(start_point, l)[index]
 
 
 def _validate_hole_punch_diameter(
@@ -338,22 +343,24 @@ def _add_packaging_hole_punches(
     if outer_diameter == 0 and cavity_diameter == 0:
         return
 
+    cell_signatures = {
+        cell: _quad_coordinate_signatures(start_point, l)
+        for cell, start_point in cell_start_points.items()
+    }
     quad_locations: dict[
         tuple[tuple[float, float], ...],
-        list[tuple[tuple[int, int], int]],
+        list[tuple[int, int]],
     ] = {}
-    for cell, start_point in cell_start_points.items():
-        for quad_index in range(6):
-            signature = _quad_coordinate_signature(start_point, l, quad_index)
-            quad_locations.setdefault(signature, []).append((cell, quad_index))
+    for cell, signatures in cell_signatures.items():
+        for signature in signatures:
+            quad_locations.setdefault(signature, []).append(cell)
 
     for cell, unit in units_by_cell.items():
-        start_point = cell_start_points[cell]
         for quad_index, surface_id in enumerate(unit["parallelograms"]):
-            signature = _quad_coordinate_signature(start_point, l, quad_index)
+            signature = cell_signatures[cell][quad_index]
             peer_cells = [
                 peer_cell
-                for peer_cell, peer_quad_index in quad_locations[signature]
+                for peer_cell in quad_locations[signature]
                 if peer_cell != cell
             ]
 
@@ -411,6 +418,7 @@ def _rotate_packaging_to_horizon(
         ]
 
 
+@_indexed_layout
 def hexagon_packaging(
     pattern: TwoDDrawer,
     l: float = 15.0,
@@ -579,12 +587,68 @@ def hexagon_packaging(
 build_packaging = hexagon_packaging
 
 
+def _remove_loop_panels(
+    pattern: TwoDDrawer,
+    surface_ids: set[SurfaceID],
+    original_points: set[PointID],
+    original_lines: dict[str, LineKind],
+) -> None:
+    """Cut out panels, keeping exposed edges and discarding unused geometry."""
+    removed_edges: set[tuple[str, str]] = set()
+    for surface_id in surface_ids:
+        surface = pattern.surfaces.pop(surface_id)
+        vertices = surface.vertices
+        removed_edges.update(
+            tuple(sorted((start, end)))
+            for start, end in zip(vertices, vertices[1:] + vertices[:1])
+        )
+        if pattern._geometry_indexes is not None:
+            pattern._geometry_indexes[1].pop(tuple(sorted(vertices)), None)
+
+    edge_counts = Counter(
+        tuple(sorted((start, end)))
+        for surface in pattern.surfaces.values()
+        for start, end in zip(
+            surface.vertices, surface.vertices[1:] + surface.vertices[:1]
+        )
+    )
+    for line_id, line in list(pattern.lines.items()):
+        edge = tuple(sorted((line.start, line.end)))
+        if edge not in removed_edges:
+            continue
+        if line_id in original_lines:
+            line.kind = original_lines[line_id]
+            continue
+        if edge_counts[edge] == 0:
+            del pattern.lines[line_id]
+            if pattern._geometry_indexes is not None:
+                pattern._geometry_indexes[0].pop(edge, None)
+        elif edge_counts[edge] == 1:
+            # A crease with material on only one side is now a cut boundary.
+            line.kind = "side"
+
+    used_points = {
+        point_id
+        for surface in pattern.surfaces.values()
+        for point_id in surface.vertices
+    }
+    used_points.update(
+        point_id
+        for line in pattern.lines.values()
+        for point_id in (line.start, line.end)
+    )
+    for point_id in set(pattern.points) - used_points - original_points:
+        del pattern.points[point_id]
+
+
+@_indexed_layout
 def draw_hex_loops(
     pattern: TwoDDrawer,
     n: int = 2,
     start_point: Coordinate = (0.0, 0.0),
     l: float = 15.0,
     reverse: bool = False,
+    cavity_loops: int = 0,
 ) -> list[HexUnit]:
     """
     Draw ``n`` concentric hexagonal loops of unit chains.
@@ -596,10 +660,20 @@ def draw_hex_loops(
     loop ``k >= 2`` has side length ``sqrt(7) * l * (k - 1)`` and is parallel
     to every other loop.
 
+    ``cavity_loops`` removes the panels of the innermost loops, including
+    panels shared with the next loop and strips attached to removed triangles,
+    to form one connected cavity. It must be an integer with
+    ``0 <= cavity_loops < n``; zero keeps the full pattern.
+    For ``n=3``, values 0, 1, and 2 keep all loops, loops 2–3, and only loop 3,
+    respectively. The outer size and placement stay unchanged. Exposed crease
+    edges become cut boundaries, and unused lines and points are removed.
+
     Set ``reverse=True`` to exchange all mountain and valley crease labels.
     The line geometry and the local kinematic metadata are reversed together.
 
-    The function also stores local unit-chain metadata in:
+    The returned units retain their original counts. Units bordering a cavity
+    contain only surviving panels and creases. The function also stores this
+    local unit-chain metadata in:
 
         pattern.hex_units
     """
@@ -610,10 +684,26 @@ def draw_hex_loops(
         raise ValueError("n must be a positive integer.") from exc
     if isinstance(n, bool) or integer_n != n or integer_n < 1:
         raise ValueError("n must be a positive integer.")
+    cavity_error = "cavity_loops must be an integer with 0 <= cavity_loops < n."
+    try:
+        integer_cavity = int(cavity_loops)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(cavity_error) from exc
+    if (
+        isinstance(cavity_loops, bool)
+        or integer_cavity != cavity_loops
+        or not 0 <= integer_cavity < integer_n
+    ):
+        raise ValueError(cavity_error)
     if not np.isfinite(l) or l <= 0:
         raise ValueError("l must be a finite positive value.")
 
     n = integer_n
+    cavity_loops = integer_cavity
+    if cavity_loops:
+        original_points = set(pattern.points)
+        original_lines = {lid: line.kind for lid, line in pattern.lines.items()}
+        original_surfaces = set(pattern.surfaces)
     x0, y0 = start_point
     h: float = float(l * np.sqrt(3) / 2)
 
@@ -667,6 +757,43 @@ def draw_hex_loops(
                         reverse=reverse,
                     )
                 )
+
+    if cavity_loops:
+        num_cavity_units = 1 + 3 * cavity_loops * (cavity_loops - 1)
+        cavity_surfaces = {
+            surface_id
+            for unit in units[:num_cavity_units]
+            for surface_id in unit["surfaces"]
+        }
+        # A quad attached to a removed triangle would leave a strip projecting
+        # into the cavity. Remove those strips to expose the next loop's wall.
+        cavity_surfaces.update(
+            crease["quad"]
+            for unit in units
+            for crease in unit["local_creases"]
+            if crease["triangle"] in cavity_surfaces
+        )
+        _remove_loop_panels(
+            pattern,
+            cavity_surfaces - original_surfaces,
+            original_points,
+            original_lines,
+        )
+        units = units[num_cavity_units:]
+        for unit in units:
+            for key in ("mid", "side"):
+                unit[key] = [pid for pid in unit[key] if pid in pattern.points]
+            for key in ("triangles", "parallelograms", "surfaces"):
+                unit[key] = [sid for sid in unit[key] if sid in pattern.surfaces]
+            unit["triangle_kinds"] = [
+                triangle for triangle in unit["triangle_kinds"]
+                if triangle["surface"] in pattern.surfaces
+            ]
+            unit["local_creases"] = [
+                crease for crease in unit["local_creases"]
+                if crease["triangle"] in pattern.surfaces
+                and crease["quad"] in pattern.surfaces
+            ]
 
     pattern.hex_units = units
     return units

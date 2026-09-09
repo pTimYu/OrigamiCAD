@@ -20,6 +20,23 @@ solve_kinematics(model, final_dihedral=135.0)
 Pass `reverse=True` to `build_packaging` to exchange all mountain and valley
 crease labels and their kinematic metadata.
 
+Draw concentric hexagonal loops with an optional central cavity:
+
+```python
+from origamicad.patterns.hexagon import draw_hex_loops
+
+pattern = TwoDDrawer()
+draw_hex_loops(pattern, n=3, cavity_loops=1)
+pattern.draw()
+```
+
+`cavity_loops` defaults to `0` and must satisfy `0 <= cavity_loops < n`.
+For a three-loop structure, `0` keeps the full pattern, `1` opens the innermost
+loop, and `2` leaves only the outer loop. Shared panels and strips projecting
+into the cavity are removed, and exposed edges become cut boundaries. The
+outer dimensions stay the same. Returned units retain their original numbering
+and reference only surviving geometry.
+
 Calculate the transverse and longitudinal cargo dimensions for a folded
 hexagon package (angles are in degrees by default):
 

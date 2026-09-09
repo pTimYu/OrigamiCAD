@@ -24,6 +24,15 @@ ConstraintKind = Literal[
     "surface_z_value",
 ]
 
+_RESIDUAL_METHODS = {
+    kind: f"_residual_{kind}"
+    for kind in (
+        "bar_length", "fixed_coordinate", "parallel_lines", "parallel_surfaces",
+        "dihedral_angle", "dihedral_cos", "dihedral_signed_increment",
+        "coplanar_points", "horizontal_surface", "surface_z_value",
+    )
+}
+
 @dataclass
 class Point3D:
     id: str
@@ -91,8 +100,9 @@ class Cadder(CadVisualizationMixin):
         for pid, point in drawer.points.items():
             model.add_point(pid, point.x, point.y, 0.0)
 
-        model.lines = drawer.to_dict()["lines"]
-        model.surfaces = drawer.to_dict()["surfaces"]
+        metadata = drawer.to_dict()
+        model.lines = metadata["lines"]
+        model.surfaces = metadata["surfaces"]
         model.surface_holes = copy.deepcopy(
             getattr(drawer, "surface_holes", {})
         )
@@ -227,15 +237,6 @@ class Cadder(CadVisualizationMixin):
             self.points[pid].x = X[3 * i + 0]
             self.points[pid].y = X[3 * i + 1]
             self.points[pid].z = X[3 * i + 2]
-
-    def _point_index(self, point_id: str) -> int:
-        """
-        Return the integer index of a point in the coordinate vector.
-        """
-        if point_id not in self.points:
-            raise ValueError(f"Point '{point_id}' does not exist.")
-
-        return self.point_ids().index(point_id)
 
     def point_array(self, point_id: str) -> np.ndarray:
         """
@@ -1341,21 +1342,8 @@ class Cadder(CadVisualizationMixin):
                 "fixed_point is implemented as three fixed_coordinate constraints."
             )
 
-        handlers = {
-            "bar_length": self._residual_bar_length,
-            "fixed_coordinate": self._residual_fixed_coordinate,
-            "parallel_lines": self._residual_parallel_lines,
-            "parallel_surfaces": self._residual_parallel_surfaces,
-            "dihedral_angle": self._residual_dihedral_angle,
-            "dihedral_cos": self._residual_dihedral_cos,
-            "dihedral_signed_increment": self._residual_dihedral_signed_increment,
-            "coplanar_points": self._residual_coplanar_points,
-            "horizontal_surface": self._residual_horizontal_surface,
-            "surface_z_value": self._residual_surface_z_value,
-        }
-
         try:
-            value = handlers[constraint.kind](constraint.data)
+            value = getattr(self, _RESIDUAL_METHODS[constraint.kind])(constraint.data)
         except KeyError:
             raise ValueError(f"Unknown constraint kind '{constraint.kind}'.") from None
 
