@@ -560,6 +560,7 @@ class TwoDDrawer:
         diameter: float,
         segments: int = 32,
         hole_id: Optional[str] = None,
+        surface_id: Optional[str] = None,
     ) -> str:
         """
         Add a polygonal circular hole-punch cut line.
@@ -567,6 +568,8 @@ class TwoDDrawer:
         The cut is represented by side lines around a regular polygon so it
         remains available to the existing 2D and CAD exporters. The hole
         metadata is also retained for drawing and JSON round-tripping.
+        Pass ``surface_id`` to attach the cut to a panel for folding and
+        export as an inner face boundary in 3D.
         """
         if not math.isfinite(float(diameter)) or float(diameter) <= 0:
             raise ValueError("diameter must be a finite positive value.")
@@ -575,6 +578,8 @@ class TwoDDrawer:
         segments = int(segments)
         if segments < 8:
             raise ValueError("segments must be at least 8.")
+        if surface_id is not None and surface_id not in self.surfaces:
+            raise ValueError(f"Surface '{surface_id}' does not exist.")
 
         if hole_id is None:
             hole_id = f"hole_{len(self.hole_punches)}"
@@ -609,6 +614,8 @@ class TwoDDrawer:
                 "segments": segments,
             }
         )
+        if surface_id is not None:
+            self.surface_holes.setdefault(surface_id, []).append(point_ids)
         return hole_id
 
     # ------------------------------------------------------------

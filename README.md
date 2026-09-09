@@ -37,6 +37,21 @@ into the cavity are removed, and exposed edges become cut boundaries. The
 outer dimensions stay the same. Returned units retain their original numbering
 and reference only surviving geometry.
 
+Set `enable_hole_punch_outer` to a hole diameter to punch the outer side
+parallelograms only, including when a cavity is present:
+
+```python
+draw_hex_loops(TwoDDrawer(), n=3, cavity_loops=1, enable_hole_punch_outer=2.5)
+```
+
+The default `0.0` disables holes. The diameter uses the pattern's length units
+and must be no larger than `sqrt(3) * l / 2` so it fits within the panel.
+Interior panels and panels bordering only the cavity are left unpunched.
+When using `Cadder.from_drawer(pattern)` and `solve_kinematics`, hole contours
+move with their panels without adding folding degrees of freedom. The 3D
+preview and zero-thickness STEP export preserve the openings, including in
+stacked layers.
+
 Calculate the transverse and longitudinal cargo dimensions for a folded
 hexagon package (angles are in degrees by default):
 

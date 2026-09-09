@@ -182,6 +182,7 @@ def _panel_model_from_pattern(pattern: TwoDDrawer) -> Cadder:
         if line["start"] in panel_point_ids
         and line["end"] in panel_point_ids
     }
+    model.surface_holes = {}
     return model
 
 

@@ -389,6 +389,7 @@ def _add_packaging_hole_punches(
                 center=(center_x, center_y),
                 diameter=diameter,
                 hole_id=f"hole_{boundary_name}_{row}_{col}_{quad_index}",
+                surface_id=surface_id,
             )
 
 
@@ -649,6 +650,7 @@ def draw_hex_loops(
     l: float = 15.0,
     reverse: bool = False,
     cavity_loops: int = 0,
+    enable_hole_punch_outer: float = 0.0,
 ) -> list[HexUnit]:
     """
     Draw ``n`` concentric hexagonal loops of unit chains.
@@ -667,6 +669,11 @@ def draw_hex_loops(
     For ``n=3``, values 0, 1, and 2 keep all loops, loops 2–3, and only loop 3,
     respectively. The outer size and placement stay unchanged. Exposed crease
     edges become cut boundaries, and unused lines and points are removed.
+
+    Set ``enable_hole_punch_outer`` to a positive diameter to add a centered
+    circular cut to each outer-boundary parallelogram. Zero disables holes.
+    Interior and cavity-only panels are never punched. The diameter uses the
+    pattern's length units and must not exceed ``sqrt(3) * l / 2``.
 
     Set ``reverse=True`` to exchange all mountain and valley crease labels.
     The line geometry and the local kinematic metadata are reversed together.
@@ -697,6 +704,9 @@ def draw_hex_loops(
         raise ValueError(cavity_error)
     if not np.isfinite(l) or l <= 0:
         raise ValueError("l must be a finite positive value.")
+    outer_hole_diameter = _validate_hole_punch_diameter(
+        "enable_hole_punch_outer", enable_hole_punch_outer, l,
+    )
 
     n = integer_n
     cavity_loops = integer_cavity
@@ -758,6 +768,14 @@ def draw_hex_loops(
                     )
                 )
 
+    if outer_hole_diameter:
+        # Classify the full lattice before cutting the cavity: interior quads
+        # are shared by two units, while outer quads belong to just one.
+        quad_uses = Counter(
+            surface_id for unit in units for surface_id in unit["parallelograms"]
+        )
+        outer_quad_ids = [sid for sid, uses in quad_uses.items() if uses == 1]
+
     if cavity_loops:
         num_cavity_units = 1 + 3 * cavity_loops * (cavity_loops - 1)
         cavity_surfaces = {
@@ -794,6 +812,21 @@ def draw_hex_loops(
                 if crease["triangle"] in pattern.surfaces
                 and crease["quad"] in pattern.surfaces
             ]
+
+    if outer_hole_diameter:
+        for surface_id in outer_quad_ids:
+            if surface_id not in pattern.surfaces:
+                continue
+            vertices = pattern.surfaces[surface_id].vertices
+            pattern.add_hole_punch(
+                center=(
+                    sum(pattern.points[pid].x for pid in vertices) / 4,
+                    sum(pattern.points[pid].y for pid in vertices) / 4,
+                ),
+                diameter=outer_hole_diameter,
+                hole_id=f"hole_outer_{surface_id}",
+                surface_id=surface_id,
+            )
 
     pattern.hex_units = units
     return units

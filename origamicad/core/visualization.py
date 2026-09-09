@@ -5,6 +5,7 @@ from typing import Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D as MplLine2D
+from matplotlib.path import Path
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
@@ -31,15 +32,29 @@ class CadVisualizationMixin:
         if show_surfaces:
             for surface_id, surface in self.surfaces.items():
                 coords = [self.point_array(pid) for pid in surface["vertices"]]
-                ax.add_collection3d(
-                    Poly3DCollection(
-                        [coords],
-                        alpha=0.18,
-                        facecolor="lightgray",
-                        edgecolor="black",
-                        linewidth=0.8,
-                    )
+                collection = Poly3DCollection(
+                    [coords],
+                    alpha=0.18,
+                    facecolor="lightgray",
+                    edgecolor="black",
+                    linewidth=0.8,
                 )
+                holes = self.surface_holes.get(surface_id, [])
+                if holes:
+                    # Opposite winding makes inner contours transparent in
+                    # the projected compound path, instead of filling them.
+                    outer_normal = np.cross(coords[1] - coords[0], coords[-1] - coords[0])
+                    path_vertices = coords + coords[:1]
+                    codes = [Path.MOVETO] + [Path.LINETO] * (len(coords) - 1) + [Path.CLOSEPOLY]
+                    for loop in holes:
+                        inner = [self.point_array(pid) for pid in loop]
+                        inner_normal = np.cross(inner[1] - inner[0], inner[-1] - inner[0])
+                        if np.dot(inner_normal, outer_normal) > 0:
+                            inner.reverse()
+                        path_vertices.extend(inner + inner[:1])
+                        codes.extend([Path.MOVETO] + [Path.LINETO] * (len(inner) - 1) + [Path.CLOSEPOLY])
+                    collection.set_verts_and_codes([path_vertices], [codes])
+                ax.add_collection3d(collection)
 
                 if show_surface_ids:
                     center = np.mean(np.array(coords), axis=0)

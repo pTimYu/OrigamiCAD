@@ -20,6 +20,7 @@ from origamicad.patterns.hexagon import draw_hex_loops, solve_kinematics
 
 N_LOOPS = 3
 CAVITY_LOOPS = 0  # Set to 1 or 2 to open an inner cavity.
+HOLE_PUNCH_DIAMETER = 0.0  # Set to e.g. 2.5 mm to punch outer side panels only.
 SIDE_LENGTH = 15.0
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -32,6 +33,7 @@ def main() -> None:
         start_point=(0.0, 0.0),
         l=SIDE_LENGTH,
         cavity_loops=CAVITY_LOOPS,
+        enable_hole_punch_outer=HOLE_PUNCH_DIAMETER,
     )
 
     expected_units = 1 + 3 * N_LOOPS * (N_LOOPS - 1)

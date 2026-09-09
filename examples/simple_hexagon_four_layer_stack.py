@@ -39,6 +39,7 @@ def main() -> None:
         start_point=(0.0, 0.0),
         l=SIDE_LENGTH,
         reverse=False,
+        enable_hole_punch_outer=2.5
     )
 
     base_model = Cadder.from_drawer(base_pattern)

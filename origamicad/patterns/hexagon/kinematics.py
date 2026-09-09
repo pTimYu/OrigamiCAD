@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 
+from ...core.panel_holes import panel_only_geometry
+
 if TYPE_CHECKING:
     from ...core.cadder import Cadder
 
@@ -604,29 +606,48 @@ def solve_kinematics(
     print_residual_warning: bool = False,
     dihedral_status_max_items: int = 20,
 ) -> dict:
-    """Add hexagon constraints and solve a generated pattern in 3D."""
-    return _HexagonKinematics(model).solve_kinematics(
-        final_dihedral=final_dihedral,
-        start_dihedral=start_dihedral,
-        steps=steps,
-        unit=unit,
-        fixed_triangle_surface_id=fixed_triangle_surface_id,
-        valley_z=valley_z,
-        strict_unique_edges=strict_unique_edges,
-        mountain_height=mountain_height,
-        valley_height=valley_height,
-        X0=X0,
-        max_nfev_per_step=max_nfev_per_step,
-        tol=tol,
-        residual_warning_tol=residual_warning_tol,
-        verbose=verbose,
-        print_metadata_summary=print_metadata_summary,
-        print_constraint_info=print_constraint_info,
-        print_solve_report=print_solve_report,
-        print_dihedral_status=print_dihedral_status,
-        print_residual_warning=print_residual_warning,
-        dihedral_status_max_items=dihedral_status_max_items,
-    )
+    """Add hexagon constraints and solve a generated pattern in 3D.
+
+    Hole contours move with their host panels and add no independent solver
+    variables. Rank and mobility describe the panel geometry; ``report.x``
+    includes the restored hole points in the model's original point order.
+    """
+    full_size = model.num_variables()
+    with panel_only_geometry(model) as coordinate_indices:
+        if coordinate_indices is not None and X0 is not None:
+            X0 = np.asarray(X0, dtype=float)
+            if X0.size == full_size:
+                X0 = X0.ravel()[coordinate_indices]
+            elif X0.size != model.num_variables():
+                raise ValueError(
+                    f"Expected X0 size {full_size} (with holes) or "
+                    f"{model.num_variables()} (panel points), but got {X0.size}."
+                )
+        result = _HexagonKinematics(model).solve_kinematics(
+            final_dihedral=final_dihedral,
+            start_dihedral=start_dihedral,
+            steps=steps,
+            unit=unit,
+            fixed_triangle_surface_id=fixed_triangle_surface_id,
+            valley_z=valley_z,
+            strict_unique_edges=strict_unique_edges,
+            mountain_height=mountain_height,
+            valley_height=valley_height,
+            X0=X0,
+            max_nfev_per_step=max_nfev_per_step,
+            tol=tol,
+            residual_warning_tol=residual_warning_tol,
+            verbose=verbose,
+            print_metadata_summary=print_metadata_summary,
+            print_constraint_info=print_constraint_info,
+            print_solve_report=print_solve_report,
+            print_dihedral_status=print_dihedral_status,
+            print_residual_warning=print_residual_warning,
+            dihedral_status_max_items=dihedral_status_max_items,
+        )
+    if coordinate_indices is not None:
+        result["report"].x = model.get_coordinate_vector()
+    return result
 
 
 # Compatibility name for code that imported the old solver operation directly.
