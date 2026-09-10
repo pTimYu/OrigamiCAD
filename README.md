@@ -70,11 +70,51 @@ from origamicad.patterns.hexagon import calculate_cargo_height
 height = calculate_cargo_height(l=15.0, theta=135.0)
 ```
 
+Analytic constraint Jacobians are available for the full model or one
+constraint. Build constraints first (for example by calling `solve_kinematics`),
+then use:
+
+```python
+from origamicad import JacobianBuilder
+
+builder = JacobianBuilder(model)
+J = builder.build()                         # SciPy CSR matrix
+constraint_id = next(iter(model.constraints))
+J_constraint = builder.for_constraint(constraint_id)
+J_dense = builder.build(sparse=False)        # NumPy array
+
+# Equivalent model methods; X optionally evaluates another configuration
+# without changing model.points.
+J = model.jacobian(X=model.get_coordinate_vector())
+J_constraint = model.constraint_jacobian(constraint_id, sparse=False)
+```
+
+Rows follow `residual_vector()` order. Columns follow the coordinate vector
+`[x0, y0, z0, x1, y1, z1, ...]`, including all model points for an individual
+constraint. The builder covers bar lengths, fixed coordinates, parallel lines
+and surfaces, all three dihedral residuals, coplanarity, horizontal surfaces,
+and surface heights. Fixed-point helpers create three fixed-coordinate rows.
+
+`Cadder.solve()` uses the sparse analytic Jacobian by default. Set
+`use_jac_sparsity=False` for dense derivatives or `use_analytic_jacobian=False`
+to use SciPy finite differences. `model.numerical_jacobian()` retains independent
+central differences for derivative checks. Rank and mobility diagnostics use
+the analytic Jacobian. Derivatives at degenerate geometry or the discontinuity
+of a wrapped angle residual raise `ValueError`; surface-normal derivatives
+assume the selected non-collinear vertex triplet stays the same locally.
+
+Run the derivative and solver checks with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 The reusable core is kept separate from pattern-specific code:
 
 ```text
 origamicad/
   core/                 # generic 2D/3D models and constraint solver
+    jacobian.py         # analytic per-constraint and assembled Jacobians
   patterns/
     hexagon/
       layout.py         # hexagon geometry and metadata generation

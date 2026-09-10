@@ -9,6 +9,7 @@ from scipy.sparse import csr_matrix
 from itertools import combinations
 
 from .visualization import CadVisualizationMixin
+from .jacobian import JacobianBuilder
 
 ConstraintKind = Literal[
     "bar_length",
@@ -1482,13 +1483,33 @@ class Cadder(CadVisualizationMixin):
     # Jacobian and mobility
     # ------------------------------------------------------------
 
+    def jacobian(
+        self, X: Optional[np.ndarray] = None, *, sparse: bool = True
+    ) -> csr_matrix | np.ndarray:
+        """Build the analytic residual Jacobian; see :class:`JacobianBuilder`.
+
+        Rows match residual_vector(), columns match get_coordinate_vector().
+        Supplied coordinates are evaluated without modifying this model.
+        """
+        return JacobianBuilder(self).build(X, sparse=sparse)
+
+    def constraint_jacobian(
+        self,
+        constraint: str | Constraint,
+        X: Optional[np.ndarray] = None,
+        *,
+        sparse: bool = True,
+    ) -> csr_matrix | np.ndarray:
+        """Build one constraint's analytic Jacobian with all 3N model columns."""
+        return JacobianBuilder(self).for_constraint(constraint, X, sparse=sparse)
+
     def numerical_jacobian(
         self,
         X: Optional[np.ndarray] = None,
         eps: float = 1e-6,
     ) -> np.ndarray:
         """
-        Compute numerical Jacobian of residuals with respect to coordinates.
+        Compute a central finite-difference Jacobian for independent validation.
 
         J[i, j] = d residual_i / d X_j
         """
@@ -1639,7 +1660,7 @@ class Cadder(CadVisualizationMixin):
         """
         Return numerical rank of the constraint Jacobian.
         """
-        J = self.numerical_jacobian()
+        J = self.jacobian(sparse=False)
         return int(np.linalg.matrix_rank(J, tol=tol))
 
     def mobility(
@@ -1668,7 +1689,7 @@ class Cadder(CadVisualizationMixin):
         Print basic constraint information.
         """
         residuals = self.residual_vector()
-        J = self.numerical_jacobian()
+        J = self.jacobian(sparse=False)
         rank = np.linalg.matrix_rank(J, tol=tol)
         mobility = self.num_variables() - rank
 
@@ -1702,6 +1723,7 @@ class Cadder(CadVisualizationMixin):
         verbose: int = 0,
         use_jac_sparsity: bool = True,
         compute_rank: bool = True,
+        use_analytic_jacobian: bool = True,
     ) -> SolveReport:
         """
         Solve the nonlinear constraint system.
@@ -1727,13 +1749,16 @@ class Cadder(CadVisualizationMixin):
                 1 -> final report
                 2 -> iteration report
             use_jac_sparsity:
-                If True, pass the constraint Jacobian sparsity pattern to
-                scipy. This usually accelerates large origami patterns because
-                each residual depends on only a few point coordinates.
+                If True, use a sparse analytic Jacobian (or sparse finite
+                differences when use_analytic_jacobian=False). If False,
+                use a dense Jacobian.
             compute_rank:
                 If False, skip Jacobian rank/mobility calculation in the
                 returned report. This is useful for intermediate continuation
                 steps where only the final rank is needed.
+            use_analytic_jacobian:
+                Use analytic constraint derivatives by default. Set False to
+                retain SciPy's finite-difference path for comparison/fallback.
 
         Returns:
             SolveReport
@@ -1752,7 +1777,12 @@ class Cadder(CadVisualizationMixin):
             )
 
         least_squares_kwargs = {}
-        if use_jac_sparsity:
+        if use_analytic_jacobian:
+            builder = JacobianBuilder(self)
+            least_squares_kwargs["jac"] = lambda X: builder.build(
+                X, sparse=use_jac_sparsity
+            )
+        elif use_jac_sparsity:
             least_squares_kwargs["jac_sparsity"] = self.constraint_jacobian_sparsity()
 
         result = least_squares(

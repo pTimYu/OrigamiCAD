@@ -1,12 +1,14 @@
 """Core geometry, drawing, and kinematic-solver classes."""
 
 from .cadder import Cadder, Constraint, ConstraintKind, Point3D, SolveReport
+from .jacobian import JacobianBuilder
 from .two_d_drawer import Line2D, Point2D, Surface2D, TwoDDrawer
 
 __all__ = [
     "Cadder",
     "Constraint",
     "ConstraintKind",
+    "JacobianBuilder",
     "Line2D",
     "Point2D",
     "Point3D",
