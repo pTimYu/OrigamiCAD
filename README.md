@@ -14,8 +14,25 @@ pattern = TwoDDrawer()
 build_packaging(pattern)
 
 model = Cadder.from_drawer(pattern)
-solve_kinematics(model, final_dihedral=135.0)
+result = solve_kinematics(model, final_dihedral=135.0)
 ```
+
+`solve_kinematics` returns after folding, without calculating Jacobian rank or
+mobility. Its `result["report"].rank` and `.mobility` fields are `-1`, meaning
+not computed. Calculate these diagnostics separately when needed:
+
+```python
+from origamicad.patterns.hexagon import analyze_kinematics
+
+analysis = analyze_kinematics(model, tol=1e-8)
+print(analysis["rank"], analysis["mobility"])
+```
+
+This analyzes the current coordinates without solving again or changing the
+model. It returns `rank`, `mobility`, `num_variables`, and `num_residuals`,
+excluding hole-contour-only points from the variable count. The diagnostic
+still uses a dense rank calculation, so it can take substantial time and
+memory for large models. It does not update the earlier solve report.
 
 Pass `reverse=True` to `build_packaging` to exchange all mountain and valley
 crease labels and their kinematic metadata.

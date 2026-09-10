@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import Cadder, TwoDDrawer
-from origamicad.patterns.hexagon import build_packaging, solve_kinematics
+from origamicad.patterns.hexagon import build_packaging, solve_kinematics, analyze_kinematics
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -36,6 +36,9 @@ def main() -> None:
     )
 
     model = Cadder.from_drawer(pattern)
+
+    # analysis = analyze_kinematics(model)
+    # print(analysis["rank"], analysis["mobility"])
 
     solve_kinematics(
         model,

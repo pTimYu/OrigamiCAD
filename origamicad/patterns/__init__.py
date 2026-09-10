@@ -2,6 +2,7 @@
 
 from .hexagon import (
     CargoSize,
+    analyze_kinematics,
     build_packaging,
     calculate_cargo_height,
     calculate_cargo_size,
@@ -12,6 +13,7 @@ from .hexagon import (
 
 __all__ = [
     "CargoSize",
+    "analyze_kinematics",
     "build_packaging",
     "calculate_cargo_height",
     "calculate_cargo_size",

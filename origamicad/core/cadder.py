@@ -50,6 +50,8 @@ class Constraint:
 
 @dataclass
 class SolveReport:
+    """Solver outcome; rank and mobility are -1 when not computed."""
+
     success: bool
     message: str
     nfev: int
@@ -1754,8 +1756,9 @@ class Cadder(CadVisualizationMixin):
                 use a dense Jacobian.
             compute_rank:
                 If False, skip Jacobian rank/mobility calculation in the
-                returned report. This is useful for intermediate continuation
-                steps where only the final rank is needed.
+                returned report and set both fields to -1. Hexagon
+                solve_kinematics disables this for every continuation step;
+                analyze_kinematics performs its rank analysis separately.
             use_analytic_jacobian:
                 Use analytic constraint derivatives by default. Set False to
                 retain SciPy's finite-difference path for comparison/fallback.
@@ -1871,6 +1874,10 @@ class Cadder(CadVisualizationMixin):
         print(f"Cost:               {report.cost}")
         print(f"Residual norm:      {report.residual_norm}")
         print(f"Max abs residual:   {report.max_abs_residual}")
+        if report.rank == -1 and report.mobility == -1:
+            print("Jacobian rank:      not computed")
+            print("Mobility:           not computed")
+            return
         print(f"Jacobian rank:      {report.rank}")
         print(f"Mobility:           {report.mobility}")
 

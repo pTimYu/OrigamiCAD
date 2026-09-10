@@ -417,7 +417,7 @@ class _HexagonKinematics:
                 update_model=True,
                 max_nfev=max_nfev_per_step,
                 tol=tol,
-                compute_rank=(k == steps - 1),
+                compute_rank=False,
             )
             X = report.x.copy()
             last_report = report
@@ -462,6 +462,10 @@ class _HexagonKinematics:
     ) -> dict:
         """
         Set up and solve a simple-hexagon model in one front-layer call.
+
+        Rank and mobility are not calculated during continuation. Call
+        ``analyze_kinematics(model)`` separately when these diagnostics are
+        needed. The returned SolveReport uses -1 for both uncomputed fields.
 
         The same start_dihedral is used to initialize the dihedral constraints
         and to start continuation, so the setup target and solver start target
@@ -609,8 +613,13 @@ def solve_kinematics(
     """Add hexagon constraints and solve a generated pattern in 3D.
 
     Hole contours move with their host panels and add no independent solver
-    variables. Rank and mobility describe the panel geometry; ``report.x``
-    includes the restored hole points in the model's original point order.
+    variables. ``report.x`` includes the restored hole points in the model's
+    original point order.
+
+    Rank and mobility are not calculated, including at the final continuation
+    step. Their SolveReport fields are -1 (not computed). Use
+    ``analyze_kinematics(model)`` separately to evaluate them at the solved
+    configuration; that diagnostic does not perform another solve.
     """
     full_size = model.num_variables()
     with panel_only_geometry(model) as coordinate_indices:
@@ -648,6 +657,49 @@ def solve_kinematics(
     if coordinate_indices is not None:
         result["report"].x = model.get_coordinate_vector()
     return result
+
+
+def analyze_kinematics(model: Cadder, tol: float = 1e-8) -> dict[str, int]:
+    """Calculate rank and local mobility at the model's current configuration.
+
+    Build constraints first, normally by calling ``solve_kinematics``. This
+    explicit diagnostic builds the analytical Jacobian and computes its dense
+    numerical rank, which can require substantial time and memory for large
+    models. ``tol`` is the absolute singular-value cutoff for rank.
+
+    Return ``rank``, ``mobility``, ``num_variables``, and ``num_residuals``.
+    Mobility is the number of variables minus rank. Hole-contour-only points
+    are excluded, matching the folding solver's degrees of freedom. Other
+    unconstrained points remain included. The model and any previous
+    SolveReport are left unchanged; no optimization is run.
+    """
+    jacobian = model.jacobian()
+    if model.surface_holes:
+        panel_points = {
+            pid for sid in model.surfaces for pid in model._surface_vertices(sid)
+        }
+        cut_points = {
+            pid for loops in model.surface_holes.values() for loop in loops
+            for pid in loop
+        } - panel_points
+        columns = [
+            3 * index + axis
+            for index, pid in enumerate(model.point_ids()) if pid not in cut_points
+            for axis in range(3)
+        ]
+        jacobian = jacobian[:, columns]
+
+    num_residuals, num_variables = jacobian.shape
+    rank = (
+        int(np.linalg.matrix_rank(jacobian.toarray(), tol=tol))
+        if num_residuals and num_variables else 0
+    )
+    return {
+        "rank": rank,
+        "mobility": num_variables - rank,
+        "num_variables": num_variables,
+        "num_residuals": num_residuals,
+    }
 
 
 # Compatibility name for code that imported the old solver operation directly.

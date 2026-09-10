@@ -4,7 +4,11 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 from .cargo import CargoSize, calculate_cargo_height, calculate_cargo_size
-from .kinematics import solve_kinematics, solve_simple_hexagon_kinematics
+from .kinematics import (
+    analyze_kinematics,
+    solve_kinematics,
+    solve_simple_hexagon_kinematics,
+)
 from .layout import (
     build_packaging,
     draw_hex_loops,
@@ -86,6 +90,7 @@ __all__ = [
     "LayerStackResult",
     "LoopDihedralStats",
     "MixedLayerStackResult",
+    "analyze_kinematics",
     "build_packaging",
     "calculate_cargo_height",
     "calculate_cargo_size",
