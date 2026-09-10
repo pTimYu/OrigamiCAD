@@ -67,16 +67,8 @@ def main() -> None:
         include_hole_punches=True,
         solve_options={
             "final_dihedral": TARGET_DIHEDRAL_DEG,
-            "start_dihedral": 175.0,
             "steps": 4,
-            "unit": "deg",
-            "fixed_triangle_surface_id": "tri_0_1",
-            "valley_z": 0.0,
-            "strict_unique_edges": False,
-            "valley_height": 0.0,
-            "max_nfev_per_step": 8000,
             "tol": 1e-10,
-            "verbose": True,
         },
     )
     assembly = stack["model"]
