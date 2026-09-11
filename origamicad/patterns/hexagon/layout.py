@@ -15,6 +15,10 @@ from .metadata import (
     PointID,
     SurfaceID,
     TriangleKind,
+    indexed_creases,
+    iter_local_creases,
+    normalize_hex_creases,
+    register_crease,
 )
 
 
@@ -22,10 +26,11 @@ def _indexed_layout(function):
     @wraps(function)
     def draw(pattern: TwoDDrawer, *args, **kwargs):
         # Subclasses may override builders to mutate existing topology.
-        if type(pattern) is not TwoDDrawer:
-            return function(pattern, *args, **kwargs)
-        with pattern._index_geometry():
-            return function(pattern, *args, **kwargs)
+        with indexed_creases(pattern):
+            if type(pattern) is not TwoDDrawer:
+                return function(pattern, *args, **kwargs)
+            with pattern._index_geometry():
+                return function(pattern, *args, **kwargs)
     return draw
 
 
@@ -277,7 +282,7 @@ def hex_unit_chain(
         "parallelograms": parallelogram_ids,
         "surfaces": triangle_ids + parallelogram_ids,
         "triangle_kinds": triangle_kinds,
-        "local_creases": local_creases,
+        "local_creases": [register_crease(pattern, crease) for crease in local_creases],
     }
 
 
@@ -580,7 +585,8 @@ def hexagon_packaging(
         _rotate_packaging_to_horizon(pattern, cavity_center)
 
     pattern.hex_units = units
-    return units
+    normalize_hex_creases(pattern)
+    return pattern.hex_units
 
 
 # Clearer public name. Keep ``hexagon_packaging`` as a compatibility alias for
@@ -788,7 +794,7 @@ def draw_hex_loops(
         cavity_surfaces.update(
             crease["quad"]
             for unit in units
-            for crease in unit["local_creases"]
+            for crease in iter_local_creases(pattern, unit)
             if crease["triangle"] in cavity_surfaces
         )
         _remove_loop_panels(
@@ -809,8 +815,8 @@ def draw_hex_loops(
             ]
             unit["local_creases"] = [
                 crease for crease in unit["local_creases"]
-                if crease["triangle"] in pattern.surfaces
-                and crease["quad"] in pattern.surfaces
+                if pattern.hex_creases[crease["crease"]]["triangle"] in pattern.surfaces
+                and pattern.hex_creases[crease["crease"]]["quad"] in pattern.surfaces
             ]
 
     if outer_hole_diameter:
@@ -829,4 +835,5 @@ def draw_hex_loops(
             )
 
     pattern.hex_units = units
-    return units
+    normalize_hex_creases(pattern)
+    return pattern.hex_units

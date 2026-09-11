@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 import numpy as np
 
 from ...core.panel_holes import panel_only_geometry
+from .metadata import normalize_hex_creases
 
 if TYPE_CHECKING:
     from ...core.cadder import Cadder
@@ -31,6 +32,7 @@ class _HexagonKinematics:
         target_dihedral: float = 110.0,
         unit: Literal["rad", "deg"] = "deg",
         valley_sign: int = +1,
+        _plan=None,
     ) -> dict:
         if not self.hex_units:
             raise ValueError(
@@ -46,83 +48,85 @@ class _HexagonKinematics:
         if not (0.0 < theta < np.pi):
             raise ValueError("target_dihedral must be between 0 and 180 degrees.")
 
-        added, skipped, duplicate = [], [], []
-        used_keys = set()
+        entries, skipped, shared = self._crease_plan() if _plan is None else _plan
+        added = []
         fold_amount = np.pi - theta
 
-        for unit_data in self.hex_units:
-            unit_count = unit_data.get("count", "unknown")
-
-            for crease_data in unit_data.get("local_creases", []):
-                edge_start, edge_end = crease_data["edge"]
-                tri_id = crease_data["triangle"]
-                quad_id = crease_data["quad"]
-                local_index = crease_data["local_index"]
-                side = crease_data["side"]
-                crease_kind = crease_data["kind"]
-                label = (unit_count, local_index, side)
-
-                if tri_id not in self.surfaces:
-                    skipped.append((*label, "missing triangle", tri_id))
-                    continue
-                if quad_id not in self.surfaces:
-                    skipped.append((*label, "missing quad", quad_id))
-                    continue
-                if edge_start not in self.points or edge_end not in self.points:
-                    skipped.append((*label, "missing edge points"))
-                    continue
-
-                key = (tuple(sorted((edge_start, edge_end))), tri_id, quad_id)
-                if key in used_keys:
-                    duplicate.append((*label, tri_id, quad_id))
-                    continue
-                used_keys.add(key)
-
-                tri_vertices = self._surface_vertices(tri_id)
-                quad_vertices = self._surface_vertices(quad_id)
-                triangle_point = self._first_non_edge_vertex(
-                    tri_vertices,
-                    edge_start,
-                    edge_end,
-                )
-                quad_point = self._first_non_edge_vertex(
-                    quad_vertices,
-                    edge_start,
-                    edge_end,
-                )
-                edge_start, edge_end = self._orient_flat_crease_triangle_right(
-                    edge_start,
-                    edge_end,
-                    triangle_point,
-                )
-
-                if crease_kind not in {"valley", "mountain"}:
-                    skipped.append((*label, "not mountain/valley", crease_kind))
-                    continue
-
-                sign = valley_sign if crease_kind == "valley" else -valley_sign
-                added.append(
-                    self.add_dihedral_signed_increment_constraint(
-                        edge_start=edge_start,
-                        edge_end=edge_end,
-                        point_left=triangle_point,
-                        point_right=quad_point,
-                        target_increment=sign * fold_amount,
-                        unit="rad",
-                        sign=sign,
-                        crease_kind=crease_kind,
-                        constraint_id=f"dihedral_signed_u{unit_count}_i{local_index}_{side}",
-                    )
-                )
+        for crease_data, label in entries:
+            unit_count, local_index, side = label
+            edge_start, edge_end = crease_data["edge"]
+            triangle_point = self._first_non_edge_vertex(
+                self._surface_vertices(crease_data["triangle"]), edge_start, edge_end)
+            quad_point = self._first_non_edge_vertex(
+                self._surface_vertices(crease_data["quad"]), edge_start, edge_end)
+            edge_start, edge_end = self._orient_flat_crease_triangle_right(
+                edge_start, edge_end, triangle_point)
+            crease_kind = crease_data["kind"]
+            sign = valley_sign if crease_kind == "valley" else -valley_sign
+            added.append(self.add_dihedral_signed_increment_constraint(
+                edge_start=edge_start, edge_end=edge_end,
+                point_left=triangle_point, point_right=quad_point,
+                target_increment=sign * fold_amount, unit="rad", sign=sign,
+                crease_kind=crease_kind,
+                constraint_id=f"dihedral_signed_u{unit_count}_i{local_index}_{side}",
+            ))
 
         return {
             "num_added": len(added),
             "num_skipped": len(skipped),
-            "num_duplicate": len(duplicate),
+            "num_shared": len(shared),
+            "shared": shared,
+            # Retained keys now describe actual duplicate equations, not sharing.
+            "num_duplicate": 0,
             "added": added,
             "skipped": skipped,
-            "duplicate": duplicate,
+            "duplicate": [],
         }
+
+    def _crease_plan(self):
+        """Validate local ownership, then visit each physical hinge once."""
+        if not self.hex_units:
+            raise ValueError("No hex-unit metadata found. Build a hexagon pattern first.")
+        normalize_hex_creases(self._model)
+        owners = {}
+        for unit in self.hex_units:
+            for ref in unit.get("local_creases", []):
+                owners.setdefault(ref["crease"], []).append(
+                    (unit["count"], ref["local_index"], ref["side"]))
+        line_kinds = {tuple(sorted((a, b))): kind
+                      for a, b, kind in (self._line_info(lid) for lid in self.lines)}
+        entries, skipped, shared = [], [], []
+        edge_panels = {}
+        for cid, labels in owners.items():
+            crease = self.hex_creases[cid]
+            a, b = crease["edge"]
+            tri, quad = crease["triangle"], crease["quad"]
+            missing = None
+            if tri not in self.surfaces:
+                missing = "missing triangle", tri
+            elif quad not in self.surfaces:
+                missing = "missing quad", quad
+            elif a not in self.points or b not in self.points:
+                missing = ("missing edge points",)
+            if missing:
+                skipped.extend((*label, *missing) for label in labels)
+                continue
+            edge = tuple(sorted((a, b)))
+            for sid, size in ((tri, 3), (quad, 4)):
+                vertices = self._surface_vertices(sid)
+                boundary = {tuple(sorted((p, vertices[(i + 1) % len(vertices)])))
+                            for i, p in enumerate(vertices)}
+                if len(vertices) != size or edge not in boundary:
+                    raise ValueError(f"Crease '{cid}' is not a boundary edge of panel '{sid}'.")
+            if edge in edge_panels and edge_panels[edge] != (tri, quad):
+                raise ValueError(f"Conflicting adjacent panels for crease edge {edge}.")
+            edge_panels[edge] = tri, quad
+            if (line_kinds.get(edge) in {"mountain", "valley"}
+                    and line_kinds[edge] != crease["kind"]):
+                raise ValueError(f"Conflicting mountain/valley assignment for crease '{cid}'.")
+            entries.append((crease, labels[0]))
+            shared.extend((*label, tri, quad) for label in labels[1:])
+        return entries, skipped, shared
 
     def _add_kinematic_constraints(
         self,
@@ -132,6 +136,9 @@ class _HexagonKinematics:
         valley_z: float = 0.0,
         strict_unique_edges: bool = False,
     ) -> dict:
+        plan = self._crease_plan()
+        if strict_unique_edges and plan[1]:
+            raise ValueError(f"Invalid hexagon crease metadata: {len(plan[1])} skipped references.")
         self.add_panel_rigidity_constraints_from_surfaces()
 
         triangle_ids = self._triangle_surface_ids()
@@ -176,21 +183,15 @@ class _HexagonKinematics:
         dihedral_info = self._add_dihedral_constraints_from_metadata(
             target_dihedral=target_dihedral,
             unit=unit,
+            _plan=plan,
         )
-
-        if strict_unique_edges and (
-            dihedral_info["skipped"] or dihedral_info["duplicate"]
-        ):
-            raise ValueError(
-                "Simple-hexagon crease metadata is not unique: "
-                f"{dihedral_info['num_skipped']} skipped and "
-                f"{dihedral_info['num_duplicate']} duplicate entries."
-            )
 
         return {
             "fixed_triangle": fixed_triangle_surface_id,
             "num_dihedral_constraints": len(dihedral_info["added"]),
             "num_skipped_crease_edges": len(dihedral_info["skipped"]),
+            "num_shared_crease_references": dihedral_info["num_shared"],
+            "shared_crease_references": dihedral_info["shared"],
             "num_duplicate_dihedral_constraints": dihedral_info["num_duplicate"],
             "skipped_crease_edges": dihedral_info["skipped"],
             "duplicate_dihedral_constraints": dihedral_info["duplicate"],
@@ -352,6 +353,7 @@ class _HexagonKinematics:
             print("No hex-unit metadata found.")
             return
 
+        normalize_hex_creases(self._model)
         totals = {"triangles": 0, "quads": 0, "creases": 0}
         for unit_data in self.hex_units:
             unit_count = unit_data.get("count", "unknown")
@@ -370,9 +372,10 @@ class _HexagonKinematics:
 
         print("")
         print(f"Total units:         {len(self.hex_units)}")
-        print(f"Total triangles:     {totals['triangles']}")
-        print(f"Total quads:         {totals['quads']}")
-        print(f"Total local creases: {totals['creases']}")
+        print(f"Triangle references: {totals['triangles']}")
+        print(f"Quad references:     {totals['quads']}")
+        print(f"Local crease refs:   {totals['creases']}")
+        print(f"Physical creases:    {len(self.hex_creases)}")
 
     def _update_dihedral_target(
         self,
@@ -630,6 +633,12 @@ def solve_kinematics(
     the outer stopping tolerance. Set ``adaptive_tolerance=False`` to use
     SciPy's fixed inner accuracy. The automatic initial guess already keeps
     the flat pattern's XY coordinates and sets triangle heights only.
+
+    Shared unit references to a physical crease are valid, including with
+    ``strict_unique_edges=True``. Strict mode rejects missing geometry;
+    conflicting crease definitions always raise before adding constraints.
+    ``constraint_info`` reports sharing via ``num_shared_crease_references``.
+    The older duplicate-constraint fields remain present and are zero/empty.
     """
     full_size = model.num_variables()
     with panel_only_geometry(model) as coordinate_indices:

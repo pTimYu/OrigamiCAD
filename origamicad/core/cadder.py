@@ -85,6 +85,7 @@ class Cadder(CadVisualizationMixin):
         self.constraints: Dict[str, Constraint] = {}
 
         self.hex_units = []
+        self.hex_creases: dict[str, dict] = {}
 
         self._constraint_count = 0
 
@@ -111,7 +112,8 @@ class Cadder(CadVisualizationMixin):
             getattr(drawer, "surface_holes", {})
         )
 
-        model.hex_units = getattr(drawer, "hex_units", [])
+        from ..patterns.hexagon.metadata import load_hex_metadata
+        load_hex_metadata(model, metadata)
 
         return model
 
@@ -135,7 +137,8 @@ class Cadder(CadVisualizationMixin):
         model.surface_holes = copy.deepcopy(
             metadata.get("surface_holes", {})
         )
-        model.hex_units = metadata.get("hex_units", [])
+        from ..patterns.hexagon.metadata import load_hex_metadata
+        load_hex_metadata(model, metadata)
 
         return model
 
@@ -174,6 +177,7 @@ class Cadder(CadVisualizationMixin):
             )
 
         drawer.hex_units = copy.deepcopy(self.hex_units)
+        drawer.hex_creases = copy.deepcopy(self.hex_creases)
         drawer.surface_holes = copy.deepcopy(self.surface_holes)
         drawer._point_count = len(drawer.points)
         drawer._line_count = len(drawer.lines)

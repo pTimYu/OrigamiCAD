@@ -60,6 +60,7 @@ class TwoDDrawer:
         self.surfaces: Dict[str, Surface2D] = {}
         self.hole_punches: list[dict] = []
         self.surface_holes: dict[str, list[list[str]]] = {}
+        self.hex_creases: dict[str, dict] = {}
 
         self._point_count = 0
         self._line_count = 0
@@ -133,7 +134,8 @@ class TwoDDrawer:
             for surface_id, loops in metadata.get("surface_holes", {}).items()
         }
 
-        drawer.hex_units = metadata.get("hex_units", [])
+        from ..patterns.hexagon.metadata import load_hex_metadata
+        load_hex_metadata(drawer, metadata)
         drawer._point_count = len(drawer.points)
         drawer._line_count = len(drawer.lines)
         drawer._surface_count = len(drawer.surfaces)
@@ -745,6 +747,7 @@ class TwoDDrawer:
 
         if hasattr(self, "hex_units"):
             data["hex_units"] = self.hex_units
+            data["hex_creases"] = self.hex_creases
 
         if self.hole_punches:
             data["hole_punches"] = self.hole_punches

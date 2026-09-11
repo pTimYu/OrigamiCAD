@@ -15,7 +15,7 @@ from .layout import (
     hex_unit_chain,
     hexagon_packaging,
 )
-from .metadata import HexUnit
+from .metadata import HexUnit, iter_local_creases
 from .stacking import (
     LayerInterfaceResult,
     LayerStackResult,
@@ -100,6 +100,7 @@ __all__ = [
     "draw_insertion_stack_3d",
     "hex_unit_chain",
     "hexagon_packaging",
+    "iter_local_creases",
     "layer_panel_levels",
     "minimum_panel_clearance",
     "print_insertion_report",

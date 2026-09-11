@@ -34,6 +34,35 @@ The automatic initial guess already retains the flat pattern's XY
 coordinates and assigns triangle heights. A partially folded state also
 requires XY contraction, which the nonlinear solver determines.
 
+Hexagon patterns store each physical hinge once in `pattern.hex_creases`
+(and `model.hex_creases` after conversion). Each unit's `local_creases` list
+contains references with its local index, side, and edge direction. To read
+the resolved crease geometry, including the original local orientation, use:
+
+```python
+from origamicad.patterns.hexagon import iter_local_creases
+
+for unit in pattern.hex_units:
+    for crease in iter_local_creases(pattern, unit):
+        print(crease["edge"], crease["triangle"], crease["quad"], crease["kind"])
+```
+
+The iterator returns snapshots; edit physical definitions through
+`hex_creases`. JSON export includes the registry and local references. The
+loaders also accept older files with inline crease records and convert them
+automatically. Projection and model conversion preserve the registry and unit
+memberships. Custom code that read `unit["local_creases"]` directly for physical
+fields should use `iter_local_creases` instead.
+
+Consistent shared references are valid even with `strict_unique_edges=True`.
+Conflicting fold assignments or adjacent panels raise before constraints are
+added; strict mode also rejects missing geometry. `constraint_info` reports
+`num_shared_crease_references` and `shared_crease_references`, counting
+references beyond the first owner. The older
+duplicate-constraint fields remain available and are zero/empty because no
+duplicate equations are created. Local ownership is retained for cavity,
+hole-boundary, and insertion operations.
+
 `solve_kinematics` returns after folding, without calculating Jacobian rank or
 mobility. Its `result["report"].rank` and `.mobility` fields are `-1`, meaning
 not computed. Calculate these diagnostics separately when needed:

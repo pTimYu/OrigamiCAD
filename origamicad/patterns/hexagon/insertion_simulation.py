@@ -40,6 +40,7 @@ from ...core.cadder import Cadder
 from ...core.two_d_drawer import TwoDDrawer
 from .kinematics import _HexagonKinematics
 from .layout import draw_hex_loops
+from .metadata import iter_local_creases
 from .stacking import stack_layers
 
 
@@ -285,7 +286,7 @@ def _classify_outer_mode_groups(
     records: list[tuple[int, int, tuple, str]] = []
     for unit in pattern.hex_units:
         unit_index = int(unit["count"])
-        for crease in unit["local_creases"]:
+        for crease in iter_local_creases(pattern, unit):
             edge_start, edge_end = crease["edge"]
             start = pattern.points[edge_start]
             end = pattern.points[edge_end]
@@ -472,7 +473,7 @@ def classify_insertion_panel_states(
     }
     quad_triangles: dict[str, set[str]] = defaultdict(set)
     for unit in pattern.hex_units:
-        for crease in unit["local_creases"]:
+        for crease in iter_local_creases(pattern, unit):
             quad_triangles[crease["quad"]].add(crease["triangle"])
 
     states: dict[str, InsertionPanelState] = {}
@@ -593,7 +594,7 @@ def _unit_panel_width_vectors(
 ) -> dict[str, np.ndarray]:
     """Return each local panel's flat vector between its two triangle edges."""
     vectors: dict[str, np.ndarray] = {}
-    local_creases = unit["local_creases"]
+    local_creases = list(iter_local_creases(pattern, unit))
     for local_index, surface_id in enumerate(unit["parallelograms"]):
         first_triangle = unit["triangles"][local_index]
         second_triangle = unit["triangles"][(local_index + 1) % 6]
@@ -794,7 +795,7 @@ def _constraint_panel_ids(
     panel_by_constraint: dict[str, str] = {}
     for unit in pattern.hex_units:
         unit_count = int(unit["count"])
-        for crease in unit["local_creases"]:
+        for crease in iter_local_creases(pattern, unit):
             constraint_id = (
                 f"dihedral_signed_u{unit_count}_"
                 f"i{crease['local_index']}_{crease['side']}"
@@ -854,7 +855,7 @@ def _panel_sequence_branch_guess(
     """Construct an inside-out coordinate seed on the requested snap branch."""
     quad_records: dict[str, dict[str, list[str]]] = defaultdict(dict)
     for unit in pattern.hex_units:
-        for crease in unit["local_creases"]:
+        for crease in iter_local_creases(pattern, unit):
             quad_records[crease["quad"]][crease["triangle"]] = crease["edge"]
 
     fold_angle_rad = np.deg2rad(180.0 - contact_dihedral_deg)

@@ -56,6 +56,7 @@ def model_to_dict(model) -> dict:
 
     if model.hex_units:
         data["hex_units"] = _json_ready(model.hex_units)
+        data["hex_creases"] = _json_ready(model.hex_creases)
     if getattr(model, "surface_holes", None):
         data["surface_holes"] = _json_ready(model.surface_holes)
 
