@@ -17,6 +17,23 @@ model = Cadder.from_drawer(pattern)
 result = solve_kinematics(model, final_dihedral=135.0)
 ```
 
+Sparse solves adapt LSMR's inner accuracy by default. The outer stopping
+tolerance remains `tol=1e-10`. LSMR starts with `atol=btol=1e-6`; if a stage
+has not converged within eight evaluations, it resumes from its latest
+coordinates with 100 times tighter inner tolerances. An early `ftol`/`xtol`
+exit without satisfying `gtol` also triggers tightening. At the inner
+accuracy floor (`max(10 * eps, min(1e-6, tol))`), the solver
+uses the remaining evaluation budget without further restarts. All stages
+share `max_nfev` (or `max_nfev_per_step` for each continuation angle), and
+`report.nfev` includes their combined evaluations. Set
+`adaptive_tolerance=False` in `Cadder.solve` or `solve_kinematics` to use
+SciPy's original fixed inner tolerance. Dense solves are unaffected.
+The kinematics report still describes the final continuation angle.
+
+The automatic initial guess already retains the flat pattern's XY
+coordinates and assigns triangle heights. A partially folded state also
+requires XY contraction, which the nonlinear solver determines.
+
 `solve_kinematics` returns after folding, without calculating Jacobian rank or
 mobility. Its `result["report"].rank` and `.mobility` fields are `-1`, meaning
 not computed. Calculate these diagnostics separately when needed:

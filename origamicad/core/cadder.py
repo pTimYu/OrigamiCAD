@@ -10,6 +10,7 @@ from itertools import combinations
 
 from .visualization import CadVisualizationMixin
 from .jacobian import JacobianBuilder
+from ._solver import adaptive_sparse_solve
 
 ConstraintKind = Literal[
     "bar_length",
@@ -1726,6 +1727,7 @@ class Cadder(CadVisualizationMixin):
         use_jac_sparsity: bool = True,
         compute_rank: bool = True,
         use_analytic_jacobian: bool = True,
+        adaptive_tolerance: bool = True,
     ) -> SolveReport:
         """
         Solve the nonlinear constraint system.
@@ -1762,6 +1764,12 @@ class Cadder(CadVisualizationMixin):
             use_analytic_jacobian:
                 Use analytic constraint derivatives by default. Set False to
                 retain SciPy's finite-difference path for comparison/fallback.
+            adaptive_tolerance:
+                For sparse solves, start LSMR at 1e-6 and tighten its atol/btol
+                by 100 after each unfinished eight-evaluation stage, down to
+                tol (at least ten machine epsilons). Warm starts share the
+                max_nfev budget. Outer tolerances stay at tol. Set False for
+                SciPy's fixed inner tolerance; dense solves are unaffected.
 
         Returns:
             SolveReport
@@ -1788,16 +1796,21 @@ class Cadder(CadVisualizationMixin):
         elif use_jac_sparsity:
             least_squares_kwargs["jac_sparsity"] = self.constraint_jacobian_sparsity()
 
-        result = least_squares(
+        solve_kwargs = dict(
             fun=lambda X: self.residual_vector(X),
             x0=X0,
-            xtol=tol,
-            ftol=tol,
-            gtol=tol,
-            max_nfev=max_nfev,
             verbose=verbose,
             **least_squares_kwargs,
         )
+        if adaptive_tolerance and use_jac_sparsity:
+            result = adaptive_sparse_solve(
+                least_squares, tol=tol, max_nfev=max_nfev, **solve_kwargs
+            )
+        else:
+            result = least_squares(
+                xtol=tol, ftol=tol, gtol=tol, max_nfev=max_nfev,
+                **solve_kwargs,
+            )
 
         residuals = self.residual_vector(result.x)
         residual_norm = float(np.linalg.norm(residuals))

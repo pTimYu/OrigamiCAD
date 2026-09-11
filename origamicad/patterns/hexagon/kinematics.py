@@ -401,6 +401,7 @@ class _HexagonKinematics:
         tol: float = 1e-10,
         residual_warning_tol: float = 1e-5,
         verbose: bool = False,
+        adaptive_tolerance: bool = True,
     ):
         if steps < 2:
             raise ValueError("steps must be at least 2.")
@@ -418,6 +419,7 @@ class _HexagonKinematics:
                 max_nfev=max_nfev_per_step,
                 tol=tol,
                 compute_rank=False,
+                adaptive_tolerance=adaptive_tolerance,
             )
             X = report.x.copy()
             last_report = report
@@ -459,6 +461,7 @@ class _HexagonKinematics:
         print_dihedral_status: bool = False,
         print_residual_warning: bool = False,
         dihedral_status_max_items: int = 20,
+        adaptive_tolerance: bool = True,
     ) -> dict:
         """
         Set up and solve a simple-hexagon model in one front-layer call.
@@ -510,6 +513,7 @@ class _HexagonKinematics:
             tol=tol,
             residual_warning_tol=residual_warning_tol,
             verbose=verbose,
+            adaptive_tolerance=adaptive_tolerance,
         )
 
         if print_solve_report:
@@ -609,6 +613,7 @@ def solve_kinematics(
     print_dihedral_status: bool = False,
     print_residual_warning: bool = False,
     dihedral_status_max_items: int = 20,
+    adaptive_tolerance: bool = True,
 ) -> dict:
     """Add hexagon constraints and solve a generated pattern in 3D.
 
@@ -620,6 +625,11 @@ def solve_kinematics(
     step. Their SolveReport fields are -1 (not computed). Use
     ``analyze_kinematics(model)`` separately to evaluate them at the solved
     configuration; that diagnostic does not perform another solve.
+
+    Sparse inner-solver accuracy adapts automatically while ``tol`` remains
+    the outer stopping tolerance. Set ``adaptive_tolerance=False`` to use
+    SciPy's fixed inner accuracy. The automatic initial guess already keeps
+    the flat pattern's XY coordinates and sets triangle heights only.
     """
     full_size = model.num_variables()
     with panel_only_geometry(model) as coordinate_indices:
@@ -653,6 +663,7 @@ def solve_kinematics(
             print_dihedral_status=print_dihedral_status,
             print_residual_warning=print_residual_warning,
             dihedral_status_max_items=dihedral_status_max_items,
+            adaptive_tolerance=adaptive_tolerance,
         )
     if coordinate_indices is not None:
         result["report"].x = model.get_coordinate_vector()
