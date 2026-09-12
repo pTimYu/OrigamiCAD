@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 import numpy as np
 
 from ...core.panel_holes import panel_only_geometry
-from .metadata import normalize_hex_creases
+from .metadata import hex_constraint_plan, normalize_hex_creases
 
 if TYPE_CHECKING:
     from ...core.cadder import Cadder
@@ -84,49 +84,18 @@ class _HexagonKinematics:
         }
 
     def _crease_plan(self):
-        """Validate local ownership, then visit each physical hinge once."""
+        """Read the ordered physical hinges prepared by the 2D metadata."""
         if not self.hex_units:
             raise ValueError("No hex-unit metadata found. Build a hexagon pattern first.")
-        normalize_hex_creases(self._model)
-        owners = {}
-        for unit in self.hex_units:
-            for ref in unit.get("local_creases", []):
-                owners.setdefault(ref["crease"], []).append(
-                    (unit["count"], ref["local_index"], ref["side"]))
-        line_kinds = {tuple(sorted((a, b))): kind
-                      for a, b, kind in (self._line_info(lid) for lid in self.lines)}
-        entries, skipped, shared = [], [], []
-        edge_panels = {}
-        for cid, labels in owners.items():
-            crease = self.hex_creases[cid]
-            a, b = crease["edge"]
-            tri, quad = crease["triangle"], crease["quad"]
-            missing = None
-            if tri not in self.surfaces:
-                missing = "missing triangle", tri
-            elif quad not in self.surfaces:
-                missing = "missing quad", quad
-            elif a not in self.points or b not in self.points:
-                missing = ("missing edge points",)
-            if missing:
-                skipped.extend((*label, *missing) for label in labels)
-                continue
-            edge = tuple(sorted((a, b)))
-            for sid, size in ((tri, 3), (quad, 4)):
-                vertices = self._surface_vertices(sid)
-                boundary = {tuple(sorted((p, vertices[(i + 1) % len(vertices)])))
-                            for i, p in enumerate(vertices)}
-                if len(vertices) != size or edge not in boundary:
-                    raise ValueError(f"Crease '{cid}' is not a boundary edge of panel '{sid}'.")
-            if edge in edge_panels and edge_panels[edge] != (tri, quad):
-                raise ValueError(f"Conflicting adjacent panels for crease edge {edge}.")
-            edge_panels[edge] = tri, quad
-            if (line_kinds.get(edge) in {"mountain", "valley"}
-                    and line_kinds[edge] != crease["kind"]):
-                raise ValueError(f"Conflicting mountain/valley assignment for crease '{cid}'.")
-            entries.append((crease, labels[0]))
-            shared.extend((*label, tri, quad) for label in labels[1:])
-        return entries, skipped, shared
+        plan = hex_constraint_plan(self._model)
+        return list(plan.crease_entries), list(plan.skipped), list(plan.shared)
+
+    def _triangle_metadata(self):
+        plan = hex_constraint_plan(self._model)
+        missing = set(plan.triangles) - plan.triangle_kinds.keys()
+        if missing:
+            raise ValueError(f"Missing triangle_kinds metadata for {sorted(missing)}. Rebuild the 2D metadata.")
+        return plan.triangles, plan.triangle_kinds
 
     def _add_kinematic_constraints(
         self,
@@ -139,15 +108,14 @@ class _HexagonKinematics:
         plan = self._crease_plan()
         if strict_unique_edges and plan[1]:
             raise ValueError(f"Invalid hexagon crease metadata: {len(plan[1])} skipped references.")
-        self.add_panel_rigidity_constraints_from_surfaces()
 
-        triangle_ids = self._triangle_surface_ids()
+        triangle_ids, triangle_kinds = self._triangle_metadata()
         if not triangle_ids:
             raise ValueError("No triangle surfaces found.")
 
         valley_triangle_ids = [
             sid for sid in triangle_ids
-            if self._triangle_crease_kind(sid) == "valley"
+            if triangle_kinds[sid] == "valley"
         ]
 
         fixed_triangle_surface_id = fixed_triangle_surface_id or (
@@ -158,7 +126,7 @@ class _HexagonKinematics:
                 f"Fixed surface '{fixed_triangle_surface_id}' is not a triangle."
             )
 
-        fixed_kind = self._triangle_crease_kind(fixed_triangle_surface_id)
+        fixed_kind = triangle_kinds[fixed_triangle_surface_id]
         if valley_triangle_ids and fixed_kind != "valley":
             raise ValueError(
                 f"Fixed surface '{fixed_triangle_surface_id}' is {fixed_kind}, "
@@ -166,6 +134,7 @@ class _HexagonKinematics:
                 f"triangle such as '{valley_triangle_ids[0]}'."
             )
 
+        self.add_panel_rigidity_constraints_from_surfaces()
         self.add_fixed_surface_constraint(fixed_triangle_surface_id)
 
         for tri_id in triangle_ids:
@@ -173,7 +142,7 @@ class _HexagonKinematics:
                 tri_id,
                 constraint_id=f"horizontal_{tri_id}",
             )
-            if self._triangle_crease_kind(tri_id) == "valley":
+            if triangle_kinds[tri_id] == "valley":
                 self.add_surface_z_value_constraint(
                     tri_id,
                     z_value=valley_z,
@@ -208,31 +177,10 @@ class _HexagonKinematics:
         return None
 
     def _triangle_crease_kind(self, surface_id: str) -> Optional[str]:
-        vertices = self._surface_vertices(surface_id)
-        if len(vertices) != 3:
+        triangle_ids, triangle_kinds = self._triangle_metadata()
+        if surface_id not in triangle_ids:
             raise ValueError(f"Surface '{surface_id}' is not a triangle.")
-
-        crease_kinds = []
-        for i, a in enumerate(vertices):
-            b = vertices[(i + 1) % 3]
-            line_id = self._find_line_by_points(a, b)
-            if line_id is None:
-                continue
-
-            _, _, kind = self._line_info(line_id)
-            if kind in {"valley", "mountain"}:
-                crease_kinds.append(kind)
-
-        unique_kinds = set(crease_kinds)
-        if not unique_kinds:
-            return None
-        if len(unique_kinds) == 1:
-            return crease_kinds[0]
-
-        raise ValueError(
-            f"Triangle surface '{surface_id}' has mixed crease kinds: "
-            f"{crease_kinds}."
-        )
+        return triangle_kinds[surface_id]
 
     def _initial_guess(
         self,
@@ -243,11 +191,9 @@ class _HexagonKinematics:
         point_to_index = {pid: i for i, pid in enumerate(self.point_ids())}
         proposed_z = {}
 
-        for surface_id in self._triangle_surface_ids():
-            kind = self._triangle_crease_kind(surface_id)
-            if kind not in {"valley", "mountain"}:
-                continue
-
+        triangle_ids, triangle_kinds = self._triangle_metadata()
+        for surface_id in triangle_ids:
+            kind = triangle_kinds[surface_id]
             z_target = valley_height if kind == "valley" else mountain_height
             for pid in self._surface_vertices(surface_id):
                 if pid in proposed_z and abs(proposed_z[pid] - z_target) > 1e-9:

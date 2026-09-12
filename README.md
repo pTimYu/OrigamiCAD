@@ -63,6 +63,21 @@ duplicate-constraint fields remain available and are zero/empty because no
 duplicate equations are created. Local ownership is retained for cavity,
 hole-boundary, and insertion operations.
 
+Mountain/valley classifications come from the 2D builder's `triangle_kinds`
+and physical crease metadata. Build/import validates these records and prepares
+an ordered constraint plan. Kinematics and initialization read the stored
+labels directly; they do not rediscover them by searching the drawing's lines.
+Missing or conflicting triangle labels require correcting/rebuilding the 2D
+metadata. Older inline crease records with triangle labels remain supported.
+
+Panel rigidity uses combinations of vertices within each panel, deduplicated
+by unordered endpoint IDs. The plan preserves the first constraint ID and
+insertion order. A temporary index of existing bar constraints handles repeated
+setup and conflicting reference lengths. Plans contain connectivity rather
+than coordinates or angle targets: folding reuses them, while edits to public
+geometry or metadata trigger validation and rebuilding before reuse. Plan
+snapshots are private, derived data; JSON retains the existing metadata format.
+
 `solve_kinematics` returns after folding, without calculating Jacobian rank or
 mobility. Its `result["report"].rank` and `.mobility` fields are `-1`, meaning
 not computed. Calculate these diagnostics separately when needed:

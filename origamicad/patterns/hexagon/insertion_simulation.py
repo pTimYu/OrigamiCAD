@@ -939,9 +939,10 @@ def _panel_sequence_branch_guess(
     mean_crease_axis_distance = float(np.mean(crease_axis_distances))
     mountain_height = mean_crease_axis_distance * float(np.sin(fold_angle_rad))
     kinematics = _HexagonKinematics(model)
+    _, triangle_kinds = kinematics._triangle_metadata()
     proposed_by_point: dict[str, list[np.ndarray]] = defaultdict(list)
     for triangle_id, translation in translations.items():
-        triangle_kind = kinematics._triangle_crease_kind(triangle_id)
+        triangle_kind = triangle_kinds[triangle_id]
         z_value = 0.0 if triangle_kind == "valley" else mountain_height
         for point_id in pattern.surfaces[triangle_id].vertices:
             flat_point = pattern.points[point_id]

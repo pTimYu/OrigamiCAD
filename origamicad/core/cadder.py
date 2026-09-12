@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Literal, Tuple
 import numpy as np
@@ -11,6 +12,7 @@ from itertools import combinations
 from .visualization import CadVisualizationMixin
 from .jacobian import JacobianBuilder
 from ._solver import adaptive_sparse_solve
+from .topology import panel_rigidity_plan
 
 ConstraintKind = Literal[
     "bar_length",
@@ -88,6 +90,7 @@ class Cadder(CadVisualizationMixin):
         self.hex_creases: dict[str, dict] = {}
 
         self._constraint_count = 0
+        self._bar_constraint_index = None
 
     # ------------------------------------------------------------
     # Constructors
@@ -385,6 +388,8 @@ class Cadder(CadVisualizationMixin):
         Direction does not matter.
         """
         target_pair = self._canonical_point_pair(p1, p2)
+        if self._bar_constraint_index is not None:
+            return self._bar_constraint_index.get(target_pair)
 
         for cid, constraint in self.constraints.items():
             if constraint.kind != "bar_length":
@@ -397,6 +402,23 @@ class Cadder(CadVisualizationMixin):
                 return cid
 
         return None
+
+    @contextmanager
+    def _index_bar_constraints(self):
+        """Index one append-only batch; later public edits cannot stale it."""
+        if self._bar_constraint_index is not None:
+            yield
+            return
+        index = {}
+        for cid, constraint in self.constraints.items():
+            if constraint.kind == "bar_length":
+                data = constraint.data
+                index.setdefault(self._canonical_point_pair(data["p1"], data["p2"]), cid)
+        self._bar_constraint_index = index
+        try:
+            yield
+        finally:
+            self._bar_constraint_index = None
 
     def add_bar_length_constraint(
         self,
@@ -460,6 +482,10 @@ class Cadder(CadVisualizationMixin):
                 "length": float(length),
             },
         )
+        if self._bar_constraint_index is not None:
+            self._bar_constraint_index.setdefault(
+                self._canonical_point_pair(p1, p2), constraint_id
+            )
 
         return constraint_id
 
@@ -1294,24 +1320,15 @@ class Cadder(CadVisualizationMixin):
             all 6 pairwise distances are fixed.
 
         This is simple and robust for the first version.
-        Duplicate bars are automatically merged by add_bar_length_constraint().
+        A reusable topology plan contains each endpoint pair once. An index
+        of existing constraints preserves duplicate/length validation without
+        scanning all previous bars for every new pair.
         """
-        for surface_id, surface in self.surfaces.items():
-            vertices = surface["vertices"]
-
-            n = len(vertices)
-
-            for i in range(n):
-                for j in range(i + 1, n):
-                    p1 = vertices[i]
-                    p2 = vertices[j]
-
-                    self.add_bar_length_constraint(
-                        p1,
-                        p2,
-                        constraint_id=f"panel_{surface_id}_{p1}_{p2}",
-                        merge_if_duplicate=True,
-                    )
+        with self._index_bar_constraints():
+            for constraint_id, p1, p2 in panel_rigidity_plan(self):
+                self.add_bar_length_constraint(
+                    p1, p2, constraint_id=constraint_id, merge_if_duplicate=True
+                )
 
     # ------------------------------------------------------------
     # Residual evaluation
