@@ -46,7 +46,6 @@ def main() -> None:
     solve_kinematics(
         base_model,
         final_dihedral=TARGET_DIHEDRAL_DEG,
-        steps=4,
         tol=1e-10,
     )
 
@@ -59,11 +58,11 @@ def main() -> None:
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     output_path = OUTPUT_DIR / "simple_hexagon_four_layer_stack.step"
-    save_cad(
-        assembly,
-        output_path,
-        separate_layer_parts=True,
-    )
+    # save_cad(
+    #     assembly,
+    #     output_path,
+    #     separate_layer_parts=True,
+    # )
 
     print(f"Solved layer height:     {stack['layer_height']:.6f} mm")
     print(f"Maximum interface error: {stack['max_interface_error']:.3e} mm")

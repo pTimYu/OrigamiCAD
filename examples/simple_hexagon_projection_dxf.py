@@ -27,7 +27,6 @@ def main() -> None:
     solve_kinematics(
         model,
         final_dihedral=120,
-        steps=4,
         tol=1e-10,
     )
 

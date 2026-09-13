@@ -26,10 +26,10 @@ def main() -> None:
     build_packaging(
         pattern,
         l=15,
-        alpha=2,
-        beta=2,
-        gamma=2,
-        delta=3,
+        alpha=10,
+        beta=10,
+        gamma=10,
+        delta=10,
         enable_left_open=True,
         rotate_cavity_to_horizon=True,
         fill_cavity=True
@@ -43,7 +43,6 @@ def main() -> None:
     solve_kinematics(
         model,
         final_dihedral=135.0,
-        steps=2,
         tol=1e-10,
     )
 

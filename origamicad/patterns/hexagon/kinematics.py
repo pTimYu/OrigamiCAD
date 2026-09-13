@@ -339,60 +339,9 @@ class _HexagonKinematics:
                     constraint.data["sign"] * fold_amount
                 )
 
-    def _solve_continuation(
-        self,
-        final_dihedral: float = 110.0,
-        start_dihedral: float = 175.0,
-        steps: int = 14,
-        unit: Literal["rad", "deg"] = "deg",
-        X0: Optional[np.ndarray] = None,
-        max_nfev_per_step: int = 5000,
-        tol: float = 1e-10,
-        residual_warning_tol: float = 1e-5,
-        verbose: bool = False,
-        adaptive_tolerance: bool = True,
-    ):
-        if steps < 2:
-            raise ValueError("steps must be at least 2.")
-        if unit not in {"deg", "rad"}:
-            raise ValueError("unit must be 'deg' or 'rad'.")
-
-        X = self.get_coordinate_vector() if X0 is None else np.asarray(X0, dtype=float)
-        last_report = None
-
-        for k, theta in enumerate(np.linspace(start_dihedral, final_dihedral, steps)):
-            self._update_dihedral_target(theta, unit=unit)
-            report = self.solve(
-                X0=X,
-                update_model=True,
-                max_nfev=max_nfev_per_step,
-                tol=tol,
-                compute_rank=False,
-                adaptive_tolerance=adaptive_tolerance,
-            )
-            X = report.x.copy()
-            last_report = report
-
-            if verbose:
-                print(
-                    f"[step {k + 1:02d}/{steps}] "
-                    f"target_dihedral={theta:.3f} {unit}, "
-                    f"max_residual={report.max_abs_residual:.3e}, "
-                    f"success={report.success}"
-                )
-                if report.max_abs_residual > residual_warning_tol:
-                    print(
-                        "  warning: residual is still large at this step; "
-                        "continuing anyway."
-                    )
-
-        return last_report
-
     def solve_kinematics(
         self,
         final_dihedral: float = 110.0,
-        start_dihedral: float = 175.0,
-        steps: int = 14,
         unit: Literal["rad", "deg"] = "deg",
         fixed_triangle_surface_id: Optional[str] = None,
         valley_z: float = 0.0,
@@ -400,7 +349,7 @@ class _HexagonKinematics:
         mountain_height: Optional[float] = None,
         valley_height: float = 0.0,
         X0: Optional[np.ndarray] = None,
-        max_nfev_per_step: int = 5000,
+        max_nfev: int = 5000,
         tol: float = 1e-10,
         residual_warning_tol: float = 1e-5,
         verbose: bool = True,
@@ -413,24 +362,27 @@ class _HexagonKinematics:
         adaptive_tolerance: bool = True,
     ) -> dict:
         """
-        Set up and solve a simple-hexagon model in one front-layer call.
+        Set up and solve a simple-hexagon model directly at the final angle.
 
-        Rank and mobility are not calculated during continuation. Call
+        Rank and mobility are not calculated during solving. Call
         ``analyze_kinematics(model)`` separately when these diagnostics are
         needed. The returned SolveReport uses -1 for both uncomputed fields.
 
-        The same start_dihedral is used to initialize the dihedral constraints
-        and to start continuation, so the setup target and solver start target
-        cannot drift apart accidentally. If ``mountain_height`` is omitted,
+        The constraints and automatic height guess use ``final_dihedral``;
+        no intermediate angles are solved. If ``mountain_height`` is omitted,
         its initial value is calculated as
-        ``valley_height + sqrt(3) / 2 * d * sin(start_dihedral)``, where ``d``
+        ``valley_height + sqrt(3) / 2 * d * sin(final_dihedral)``, where ``d``
         is measured directly from the hexagon pattern.
         """
+        theta = self._angle_to_rad(final_dihedral, unit=unit)
+        if not (0.0 < theta < np.pi):
+            raise ValueError("final_dihedral must be between 0 and 180 degrees.")
+
         if print_metadata_summary:
             self._print_metadata_summary()
 
         constraint_info = self._add_kinematic_constraints(
-            target_dihedral=start_dihedral,
+            target_dihedral=final_dihedral,
             unit=unit,
             fixed_triangle_surface_id=fixed_triangle_surface_id,
             valley_z=valley_z,
@@ -443,7 +395,7 @@ class _HexagonKinematics:
         if X0 is None:
             if mountain_height is None:
                 mountain_height = self._automatic_mountain_height(
-                    dihedral_angle=start_dihedral,
+                    dihedral_angle=final_dihedral,
                     unit=unit,
                     valley_height=valley_height,
                 )
@@ -452,19 +404,21 @@ class _HexagonKinematics:
                 valley_height=valley_height,
             )
 
-        report = self._solve_continuation(
-            final_dihedral=final_dihedral,
-            start_dihedral=start_dihedral,
-            steps=steps,
-            unit=unit,
+        report = self.solve(
             X0=X0,
-            max_nfev_per_step=max_nfev_per_step,
+            update_model=True,
+            max_nfev=max_nfev,
             tol=tol,
-            residual_warning_tol=residual_warning_tol,
-            verbose=verbose,
+            compute_rank=False,
             adaptive_tolerance=adaptive_tolerance,
         )
 
+        if verbose:
+            print(
+                f"[solve] target_dihedral={final_dihedral:.3f} {unit}, "
+                f"max_residual={report.max_abs_residual:.3e}, "
+                f"success={report.success}"
+            )
         if print_solve_report:
             self.print_solve_report(report)
         if print_dihedral_status:
@@ -472,7 +426,7 @@ class _HexagonKinematics:
                 max_items=dihedral_status_max_items,
                 unit=unit,
             )
-        if print_residual_warning and report.max_abs_residual > residual_warning_tol:
+        if (verbose or print_residual_warning) and report.max_abs_residual > residual_warning_tol:
             print("WARNING: constraints are not sufficiently satisfied.")
 
         return {
@@ -543,8 +497,6 @@ class _HexagonKinematics:
 def solve_kinematics(
     model: Cadder,
     final_dihedral: float = 110.0,
-    start_dihedral: float = 175.0,
-    steps: int = 14,
     unit: Literal["rad", "deg"] = "deg",
     fixed_triangle_surface_id: Optional[str] = None,
     valley_z: float = 0.0,
@@ -552,7 +504,7 @@ def solve_kinematics(
     mountain_height: Optional[float] = None,
     valley_height: float = 0.0,
     X0: Optional[np.ndarray] = None,
-    max_nfev_per_step: int = 5000,
+    max_nfev: int = 5000,
     tol: float = 1e-10,
     residual_warning_tol: float = 1e-5,
     verbose: bool = True,
@@ -564,21 +516,29 @@ def solve_kinematics(
     dihedral_status_max_items: int = 20,
     adaptive_tolerance: bool = True,
 ) -> dict:
-    """Add hexagon constraints and solve a generated pattern in 3D.
+    """Add hexagon constraints and solve directly at ``final_dihedral``.
 
     Hole contours move with their host panels and add no independent solver
     variables. ``report.x`` includes the restored hole points in the model's
     original point order.
 
-    Rank and mobility are not calculated, including at the final continuation
-    step. Their SolveReport fields are -1 (not computed). Use
+    Rank and mobility are not calculated. Their SolveReport fields are -1
+    (not computed). Use
     ``analyze_kinematics(model)`` separately to evaluate them at the solved
     configuration; that diagnostic does not perform another solve.
 
     Sparse inner-solver accuracy adapts automatically while ``tol`` remains
     the outer stopping tolerance. Set ``adaptive_tolerance=False`` to use
     SciPy's fixed inner accuracy. The automatic initial guess already keeps
-    the flat pattern's XY coordinates and sets triangle heights only.
+    the flat pattern's XY coordinates and sets triangle heights only, using
+    ``valley_height + sqrt(3) / 2 * d * sin(final_dihedral)`` for mountain
+    height unless ``mountain_height`` or ``X0`` is supplied. ``d`` is measured
+    from the pattern, and ``unit`` applies to ``final_dihedral``.
+
+    ``max_nfev`` (default 5000) is the total evaluation budget, including
+    adaptive inner-accuracy restarts. ``report.nfev`` counts all of them.
+    The former ``steps``, ``start_dihedral`` and ``max_nfev_per_step``
+    parameters have been removed; no angle continuation is performed.
 
     Shared unit references to a physical crease are valid, including with
     ``strict_unique_edges=True``. Strict mode rejects missing geometry;
@@ -599,8 +559,6 @@ def solve_kinematics(
                 )
         result = _HexagonKinematics(model).solve_kinematics(
             final_dihedral=final_dihedral,
-            start_dihedral=start_dihedral,
-            steps=steps,
             unit=unit,
             fixed_triangle_surface_id=fixed_triangle_surface_id,
             valley_z=valley_z,
@@ -608,7 +566,7 @@ def solve_kinematics(
             mountain_height=mountain_height,
             valley_height=valley_height,
             X0=X0,
-            max_nfev_per_step=max_nfev_per_step,
+            max_nfev=max_nfev,
             tol=tol,
             residual_warning_tol=residual_warning_tol,
             verbose=verbose,

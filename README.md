@@ -14,8 +14,13 @@ pattern = TwoDDrawer()
 build_packaging(pattern)
 
 model = Cadder.from_drawer(pattern)
-result = solve_kinematics(model, final_dihedral=135.0)
+result = solve_kinematics(model, final_dihedral=135.0, tol=1e-10)
 ```
+
+`solve_kinematics` solves directly at `final_dihedral`, with no intermediate
+angle steps. Remove `steps` and `start_dihedral` from older calls, and rename
+`max_nfev_per_step` to `max_nfev` if specifying an evaluation limit. The
+default budget is 5000 evaluations for the entire direct solve.
 
 Sparse solves adapt LSMR's inner accuracy by default. The outer stopping
 tolerance remains `tol=1e-10`. LSMR starts with `atol=btol=1e-6`; if a stage
@@ -24,15 +29,18 @@ coordinates with 100 times tighter inner tolerances. An early `ftol`/`xtol`
 exit without satisfying `gtol` also triggers tightening. At the inner
 accuracy floor (`max(10 * eps, min(1e-6, tol))`), the solver
 uses the remaining evaluation budget without further restarts. All stages
-share `max_nfev` (or `max_nfev_per_step` for each continuation angle), and
+share `max_nfev`, and
 `report.nfev` includes their combined evaluations. Set
 `adaptive_tolerance=False` in `Cadder.solve` or `solve_kinematics` to use
 SciPy's original fixed inner tolerance. Dense solves are unaffected.
-The kinematics report still describes the final continuation angle.
+The kinematics report describes the direct solve at the requested angle.
 
 The automatic initial guess already retains the flat pattern's XY
-coordinates and assigns triangle heights. A partially folded state also
-requires XY contraction, which the nonlinear solver determines.
+coordinates and assigns triangle heights. Unless `mountain_height` or `X0`
+is supplied, mountain height is `valley_height + sqrt(3)/2 * d * sin(final_dihedral)`,
+using the measured hexagon side length `d` and the requested angle unit.
+A partially folded state also requires XY contraction, which the nonlinear
+solver determines.
 
 Hexagon patterns store each physical hinge once in `pattern.hex_creases`
 (and `model.hex_creases` after conversion). Each unit's `local_creases` list

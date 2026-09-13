@@ -67,7 +67,6 @@ def main() -> None:
         include_hole_punches=True,
         solve_options={
             "final_dihedral": TARGET_DIHEDRAL_DEG,
-            "steps": 4,
             "tol": 1e-10,
         },
     )

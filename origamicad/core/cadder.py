@@ -1780,7 +1780,7 @@ class Cadder(CadVisualizationMixin):
             compute_rank:
                 If False, skip Jacobian rank/mobility calculation in the
                 returned report and set both fields to -1. Hexagon
-                solve_kinematics disables this for every continuation step;
+                solve_kinematics disables this for its direct solve;
                 analyze_kinematics performs its rank analysis separately.
             use_analytic_jacobian:
                 Use analytic constraint derivatives by default. Set False to
