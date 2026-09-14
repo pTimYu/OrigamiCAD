@@ -66,6 +66,7 @@ class TwoDDrawer:
         self._line_count = 0
         self._surface_count = 0
         self._geometry_indexes = None
+        self._point_index = None
 
     @contextmanager
     def _index_geometry(self):
@@ -82,11 +83,29 @@ class TwoDDrawer:
             line_index.setdefault(self._canonical_line_key(line.start, line.end), lid)
         for sid, surface in self.surfaces.items():
             surface_index.setdefault(self._canonical_surface_key(surface.vertices), sid)
+        point_index = None
+        if math.isfinite(self.point_tol) and self.point_tol > 0:
+            buckets = {}
+            for order, (pid, point) in enumerate(self.points.items()):
+                bucket = self._point_bucket(point.x, point.y, self.point_tol)
+                if bucket is not None:
+                    buckets.setdefault(bucket, []).append((order, pid))
+            point_index = self.point_tol, buckets
         self._geometry_indexes = line_index, surface_index
+        self._point_index = point_index
         try:
             yield
         finally:
             self._geometry_indexes = None
+            self._point_index = None
+
+    @staticmethod
+    def _point_bucket(x, y, width):
+        """Return a spatial cell, or use ordinary lookup for extreme values."""
+        scaled_x, scaled_y = x / width, y / width
+        if not (math.isfinite(scaled_x) and math.isfinite(scaled_y)):
+            return None
+        return math.floor(scaled_x), math.floor(scaled_y)
 
     @classmethod
     def from_metadata(cls, metadata: dict) -> "TwoDDrawer":
@@ -277,6 +296,27 @@ class TwoDDrawer:
         if tol is None:
             tol = self.point_tol
 
+        if self._point_index is not None and tol == self._point_index[0]:
+            bucket = self._point_bucket(x, y, tol)
+            if bucket is not None:
+                # Nearby cells include points across cell boundaries. Keep the
+                # exact circular tolerance and the first inserted match, even
+                # when candidates are visited in a different spatial order.
+                buckets = self._point_index[1]
+                best = None
+                bx, by = bucket
+                # A second neighboring cell covers floating-point rounding at
+                # exact tolerance boundaries (e.g. -tiny versus +tol).
+                for ix in range(bx - 2, bx + 3):
+                    for iy in range(by - 2, by + 3):
+                        for order, pid in buckets.get((ix, iy), ()):
+                            if best is not None and order >= best[0]:
+                                continue
+                            point = self.points[pid]
+                            if math.hypot(point.x - x, point.y - y) <= tol:
+                                best = order, pid
+                return None if best is None else best[1]
+
         for pid, point in self.points.items():
             distance = math.hypot(point.x - x, point.y - y)
 
@@ -374,6 +414,11 @@ class TwoDDrawer:
             raise ValueError(f"Point id '{point_id}' already exists.")
 
         self.points[point_id] = Point2D(point_id, x, y)
+        if self._point_index is not None:
+            width, buckets = self._point_index
+            bucket = self._point_bucket(x, y, width)
+            if bucket is not None:
+                buckets.setdefault(bucket, []).append((len(self.points) - 1, point_id))
         return point_id
 
     def add_line(

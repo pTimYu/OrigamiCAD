@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from itertools import combinations
 from typing import TYPE_CHECKING
 
@@ -40,9 +41,11 @@ class JacobianBuilder:
 
     By default results are SciPy CSR matrices; ``sparse=False`` returns a dense
     NumPy array. ``X`` optionally supplies coordinates without mutating the model.
-    Point order and constraints are read afresh on each call, so builders can be
-    reused after model edits. Local blocks use analytic chain rules, with no
-    finite differences or additional differentiation dependencies.
+    Point order and constraints are read afresh on each public call, so builders
+    can be reused after model edits. Within ``compiled()``, topology and sparse
+    assembly are reused until that solve scope exits; structural edits must wait
+    until afterward. Common constraints use batched analytic chain rules, with
+    no finite differences or additional differentiation dependencies.
 
     Derivatives are undefined at zero-length geometric vectors and at the
     +/-pi discontinuity of a wrapped angle *residual*; these raise ValueError.
@@ -52,11 +55,38 @@ class JacobianBuilder:
 
     def __init__(self, model: Cadder):
         self.model = model
+        self._compiled = None
+
+    @contextmanager
+    def compiled(self):
+        """Reuse topology and geometry for one solve with no structural edits.
+
+        Residual calls through the model share this plan, including overridden
+        ``residual_vector`` methods used for instrumentation. Restore any outer
+        scope even if evaluation or the solver raises an exception.
+        """
+        from ._evaluation import CompiledConstraints
+
+        previous_builder = self._compiled
+        previous_model = getattr(self.model, "_compiled_constraints", None)
+        plan = CompiledConstraints(self.model, self)
+        self._compiled = plan
+        self.model._compiled_constraints = plan
+        try:
+            yield self
+        finally:
+            self._compiled = previous_builder
+            if previous_model is None:
+                del self.model._compiled_constraints
+            else:
+                self.model._compiled_constraints = previous_model
 
     def build(
         self, X: np.ndarray | None = None, *, sparse: bool = True
     ) -> csr_matrix | np.ndarray:
         """Return the full (number of scalar residuals, 3N) Jacobian."""
+        if self._compiled is not None:
+            return self._compiled.jacobian(X, sparse=sparse)
         return self._assemble(self.model.constraints.values(), X, sparse)
 
     def for_constraint(
@@ -78,39 +108,9 @@ class JacobianBuilder:
         return self._assemble((constraint,), X, sparse)
 
     def _assemble(self, constraints, X, sparse):
-        point_ids = self.model.point_ids()
-        point_index = {pid: index for index, pid in enumerate(point_ids)}
-        n_vars = 3 * len(point_ids)
-        coordinates = np.asarray(
-            self.model.get_coordinate_vector() if X is None else X, dtype=float
-        )
-        if coordinates.ndim != 1 or coordinates.size != n_vars:
-            raise ValueError(f"Expected a one-dimensional coordinate vector of size {n_vars}.")
-        if not np.all(np.isfinite(coordinates)):
-            raise ValueError("Coordinate vector must contain only finite values.")
-        points = dict(zip(point_ids, coordinates.reshape(-1, 3)))
-        rows, cols, values = [], [], []
-        row_offset = 0
+        from ._evaluation import CompiledConstraints
 
-        for constraint in constraints:
-            local_ids, block = self._constraint_block(constraint, points)
-            local_rows, local_cols = np.nonzero(block)
-            global_columns = np.array([
-                3 * point_index[pid] + axis
-                for pid in local_ids for axis in range(3)
-            ], dtype=int)
-            rows.extend(row_offset + local_rows)
-            cols.extend(global_columns[local_cols])
-            values.extend(block[local_rows, local_cols])
-            row_offset += block.shape[0]
-
-        # CSR construction sums duplicate entries when a point appears in more
-        # than one local role (e.g. two lines with a shared endpoint).
-        result = csr_matrix(
-            (values, (rows, cols)), shape=(row_offset, n_vars), dtype=float
-        )
-        result.eliminate_zeros()
-        return result if sparse else result.toarray()
+        return CompiledConstraints(self.model, self, constraints).jacobian(X, sparse=sparse)
 
     def _constraint_block(self, constraint, points):
         kind = constraint.kind

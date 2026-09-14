@@ -135,19 +135,36 @@ class _HexagonKinematics:
             )
 
         self.add_panel_rigidity_constraints_from_surfaces()
-        self.add_fixed_surface_constraint(fixed_triangle_surface_id)
+        frame_constraint_ids = self.add_fixed_surface_constraint(fixed_triangle_surface_id)
 
+        pinned_z = {}
         for tri_id in triangle_ids:
-            self.add_horizontal_surface_constraint(
-                tri_id,
-                constraint_id=f"horizontal_{tri_id}",
-            )
             if triangle_kinds[tri_id] == "valley":
-                self.add_surface_z_value_constraint(
+                cid = self.add_surface_z_value_constraint(
                     tri_id,
                     z_value=valley_z,
                     constraint_id=f"valley_z_{tri_id}",
                 )
+                constraint = self.constraints[cid]
+                if (constraint.kind == "surface_z_value"
+                        and constraint.data["surface"] == tri_id):
+                    # Equal absolute vertex heights already imply every
+                    # horizontal-surface equation for this triangle.
+                    for pid in self._surface_vertices(tri_id):
+                        pinned_z[pid] = constraint.data["z_value"]
+                    continue
+            self.add_horizontal_surface_constraint(
+                tri_id,
+                constraint_id=f"horizontal_{tri_id}",
+            )
+
+        for cid in frame_constraint_ids:
+            data = self.constraints[cid].data
+            if (data["axis"] == "z" and data["point"] in pinned_z
+                    and data["value"] == pinned_z[data["point"]]):
+                # Only remove exact duplicates created for this frame.
+                # Different target heights must retain their conflict.
+                del self.constraints[cid]
 
         dihedral_info = self._add_dihedral_constraints_from_metadata(
             target_dihedral=target_dihedral,
@@ -360,6 +377,7 @@ class _HexagonKinematics:
         print_residual_warning: bool = False,
         dihedral_status_max_items: int = 20,
         adaptive_tolerance: bool = True,
+        x_scale: float | np.ndarray | Literal["jac"] = "jac",
     ) -> dict:
         """
         Set up and solve a simple-hexagon model directly at the final angle.
@@ -411,6 +429,7 @@ class _HexagonKinematics:
             tol=tol,
             compute_rank=False,
             adaptive_tolerance=adaptive_tolerance,
+            x_scale=x_scale,
         )
 
         if verbose:
@@ -515,6 +534,7 @@ def solve_kinematics(
     print_residual_warning: bool = False,
     dihedral_status_max_items: int = 20,
     adaptive_tolerance: bool = True,
+    x_scale: float | np.ndarray | Literal["jac"] = "jac",
 ) -> dict:
     """Add hexagon constraints and solve directly at ``final_dihedral``.
 
@@ -540,6 +560,11 @@ def solve_kinematics(
     The former ``steps``, ``start_dihedral`` and ``max_nfev_per_step``
     parameters have been removed; no angle continuation is performed.
 
+    ``x_scale`` defaults to ``"jac"`` to scale variables by inverse Jacobian
+    column norms. Use ``1.0`` to disable scaling, or positive per-coordinate
+    scales in full-model or panel-only point order. Scaling does not change
+    the residual equations or their weights.
+
     Shared unit references to a physical crease are valid, including with
     ``strict_unique_edges=True``. Strict mode rejects missing geometry;
     conflicting crease definitions always raise before adding constraints.
@@ -556,6 +581,15 @@ def solve_kinematics(
                 raise ValueError(
                     f"Expected X0 size {full_size} (with holes) or "
                     f"{model.num_variables()} (panel points), but got {X0.size}."
+                )
+        if coordinate_indices is not None and np.ndim(x_scale) > 0:
+            x_scale = np.asarray(x_scale, dtype=float)
+            if x_scale.size == full_size:
+                x_scale = x_scale.ravel()[coordinate_indices]
+            elif x_scale.size != model.num_variables():
+                raise ValueError(
+                    f"Expected x_scale size {full_size} (with holes) or "
+                    f"{model.num_variables()} (panel points), but got {x_scale.size}."
                 )
         result = _HexagonKinematics(model).solve_kinematics(
             final_dihedral=final_dihedral,
@@ -577,6 +611,7 @@ def solve_kinematics(
             print_residual_warning=print_residual_warning,
             dihedral_status_max_items=dihedral_status_max_items,
             adaptive_tolerance=adaptive_tolerance,
+            x_scale=x_scale,
         )
     if coordinate_indices is not None:
         result["report"].x = model.get_coordinate_vector()

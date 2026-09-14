@@ -35,6 +35,11 @@ share `max_nfev`, and
 SciPy's original fixed inner tolerance. Dense solves are unaffected.
 The kinematics report describes the direct solve at the requested angle.
 
+`Cadder.solve` and `solve_kinematics` use `x_scale="jac"` by default to scale
+coordinate updates using Jacobian column norms. Pass `x_scale=1.0` to disable
+variable scaling, or supply positive per-coordinate scales. Residual equations,
+their physical units, and the stopping tolerances are unchanged by this option.
+
 The automatic initial guess already retains the flat pattern's XY
 coordinates and assigns triangle heights. Unless `mountain_height` or `X0`
 is supplied, mountain height is `valley_height + sqrt(3)/2 * d * sin(final_dihedral)`,
@@ -85,6 +90,11 @@ setup and conflicting reference lengths. Plans contain connectivity rather
 than coordinates or angle targets: folding reuses them, while edits to public
 geometry or metadata trigger validation and rebuilding before reuse. Plan
 snapshots are private, derived data; JSON retains the existing metadata format.
+
+Valley triangles use absolute vertex-height constraints, which also enforce
+their horizontality. The solver omits the implied horizontal equations and any
+new reference-frame Z equations with exactly the same target. Existing user
+constraints and conflicting height targets are retained.
 
 `solve_kinematics` returns after folding, without calculating Jacobian rank or
 mobility. Its `result["report"].rank` and `.mobility` fields are `-1`, meaning
@@ -189,6 +199,12 @@ the analytic Jacobian. Derivatives at degenerate geometry or the discontinuity
 of a wrapped angle residual raise `ValueError`; surface-normal derivatives
 assume the selected non-collinear vertex triplet stays the same locally.
 
+Each solve compiles point indices and sparse assembly structure once. Residuals
+and Jacobians batch common constraint types and share geometry at identical trial
+coordinates, without writing those coordinates into the model. Other constraint
+types retain their scalar formulas. The plan is discarded after solving; public
+evaluations outside a solve observe direct edits to points and constraints.
+
 Run the derivative and solver checks with:
 
 ```bash
@@ -201,6 +217,7 @@ The reusable core is kept separate from pattern-specific code:
 origamicad/
   core/                 # generic 2D/3D models and constraint solver
     jacobian.py         # analytic per-constraint and assembled Jacobians
+    _evaluation.py      # solve-scoped constraint batches and sparse assembly
   patterns/
     hexagon/
       layout.py         # hexagon geometry and metadata generation

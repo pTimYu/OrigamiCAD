@@ -1338,28 +1338,16 @@ class Cadder(CadVisualizationMixin):
         """
         Evaluate all scalar constraint residuals.
 
-        If X is provided, residuals are evaluated at X without permanently
-        modifying the model.
+        If X is provided, residuals are evaluated directly from its coordinates
+        without modifying the model. During solve(), indexed constraint batches
+        and geometry are shared with the analytic Jacobian.
         """
-        old_X = None
+        from ._evaluation import CompiledConstraints
 
-        if X is not None:
-            old_X = self.get_coordinate_vector()
-            self.set_coordinate_vector(X)
-
-        try:
-            residuals = [
-                self._residual_for_constraint(constraint)
-                for constraint in self.constraints.values()
-            ]
-        finally:
-            if old_X is not None:
-                self.set_coordinate_vector(old_X)
-
-        if not residuals:
-            return np.array([], dtype=float)
-
-        return np.concatenate(residuals)
+        plan = getattr(self, "_compiled_constraints", None)
+        if plan is None:
+            plan = CompiledConstraints(self, JacobianBuilder(self))
+        return plan.residual(X)
 
     def _residual_for_constraint(self, constraint: Constraint) -> np.ndarray:
         if constraint.kind == "fixed_point":
@@ -1749,6 +1737,7 @@ class Cadder(CadVisualizationMixin):
         compute_rank: bool = True,
         use_analytic_jacobian: bool = True,
         adaptive_tolerance: bool = True,
+        x_scale: float | np.ndarray | Literal["jac"] = "jac",
     ) -> SolveReport:
         """
         Solve the nonlinear constraint system.
@@ -1791,6 +1780,11 @@ class Cadder(CadVisualizationMixin):
                 tol (at least ten machine epsilons). Warm starts share the
                 max_nfev budget. Outer tolerances stay at tol. Set False for
                 SciPy's fixed inner tolerance; dense solves are unaffected.
+            x_scale:
+                Variable scales passed to scipy least_squares. The default
+                "jac" adapts scales to inverse Jacobian column norms. Use
+                1.0 for unscaled variables, or supply positive scales in
+                coordinate-vector order. This does not weight residual rows.
 
         Returns:
             SolveReport
@@ -1809,8 +1803,8 @@ class Cadder(CadVisualizationMixin):
             )
 
         least_squares_kwargs = {}
+        builder = JacobianBuilder(self)
         if use_analytic_jacobian:
-            builder = JacobianBuilder(self)
             least_squares_kwargs["jac"] = lambda X: builder.build(
                 X, sparse=use_jac_sparsity
             )
@@ -1821,19 +1815,21 @@ class Cadder(CadVisualizationMixin):
             fun=lambda X: self.residual_vector(X),
             x0=X0,
             verbose=verbose,
+            x_scale=x_scale,
             **least_squares_kwargs,
         )
-        if adaptive_tolerance and use_jac_sparsity:
-            result = adaptive_sparse_solve(
-                least_squares, tol=tol, max_nfev=max_nfev, **solve_kwargs
-            )
-        else:
-            result = least_squares(
-                xtol=tol, ftol=tol, gtol=tol, max_nfev=max_nfev,
-                **solve_kwargs,
-            )
+        with builder.compiled():
+            if adaptive_tolerance and use_jac_sparsity:
+                result = adaptive_sparse_solve(
+                    least_squares, tol=tol, max_nfev=max_nfev, **solve_kwargs
+                )
+            else:
+                result = least_squares(
+                    xtol=tol, ftol=tol, gtol=tol, max_nfev=max_nfev,
+                    **solve_kwargs,
+                )
 
-        residuals = self.residual_vector(result.x)
+            residuals = self.residual_vector(result.x)
         residual_norm = float(np.linalg.norm(residuals))
         max_abs_residual = float(np.max(np.abs(residuals))) if residuals.size else 0.0
 

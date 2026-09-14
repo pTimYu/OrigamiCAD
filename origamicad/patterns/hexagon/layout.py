@@ -408,6 +408,9 @@ def _rotate_packaging_to_horizon(
     sine = math.sin(angle)
     center_x, center_y = cavity_center
 
+    # The append-only layout index describes the coordinates before rotation.
+    # Later lookups in an enclosing layout context must see the moved points.
+    pattern._point_index = None
     for point in pattern.points.values():
         relative_x = point.x - center_x
         relative_y = point.y - center_y
@@ -644,7 +647,12 @@ def _remove_loop_panels(
         for line in pattern.lines.values()
         for point_id in (line.start, line.end)
     )
-    for point_id in set(pattern.points) - used_points - original_points:
+    removed_points = set(pattern.points) - used_points - original_points
+    if removed_points:
+        # Point buckets and insertion ordinals describe append-only geometry.
+        # A surrounding layout can still add points after this cavity cut.
+        pattern._point_index = None
+    for point_id in removed_points:
         del pattern.points[point_id]
 
 
