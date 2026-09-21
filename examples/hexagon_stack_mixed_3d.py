@@ -38,10 +38,10 @@ def build_layer_pattern(*, fill_cavity: bool) -> TwoDDrawer:
     build_packaging(
         pattern,
         l=15,
-        alpha=2,
-        beta=2,
-        gamma=2,
-        delta=3,
+        alpha=5,
+        beta=5,
+        gamma=5,
+        delta=5,
         # Keep this True for both patterns. fill_cavity=True overrides the
         # opening in the bottom pattern, while the common flag makes the
         # horizon rotation use the same center for both patterns.
@@ -76,8 +76,8 @@ def main() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     step_path = OUTPUT_DIR / "hexagon_stack_mixed_3d.step"
     json_path = OUTPUT_DIR / "hexagon_stack_mixed_3d.json"
-    save_cad(assembly, step_path, separate_layer_parts=True)
-    save_cad(assembly, json_path)
+    # save_cad(assembly, step_path, separate_layer_parts=True)
+    # save_cad(assembly, json_path)
 
     print(f"Filled bottom layers:           {BOTTOM_FILLED_LAYERS}")
     print(f"Open-cavity top layers:        {TOP_CAVITY_LAYERS}")

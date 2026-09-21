@@ -14,38 +14,45 @@ pattern = TwoDDrawer()
 build_packaging(pattern)
 
 model = Cadder.from_drawer(pattern)
-result = solve_kinematics(model, final_dihedral=135.0, tol=1e-10)
+result = solve_kinematics(model, final_dihedral=135.0, steps=3, tol=1e-10)
 ```
 
-`solve_kinematics` solves directly at `final_dihedral`, with no intermediate
-angle steps. Remove `steps` and `start_dihedral` from older calls, and rename
-`max_nfev_per_step` to `max_nfev` if specifying an evaluation limit. The
-default budget is 5000 evaluations for the entire direct solve.
+`solve_kinematics` uses a hybrid algorithm by default: take `steps=3` tangent
+steps from the flat 180-degree coordinates toward `final_dihedral`, then refine
+the predicted coordinates with the nonlinear solver. There is no nonlinear
+starting-pose solve. Set `steps` to any nonnegative integer; `steps=0` runs the
+original direct nonlinear solve at the requested angle. Each tangent step uses
+the sparse analytic Jacobian to solve the first-order constraint equations,
+without nonlinear correction between steps. If tangent prediction fails, the
+solver falls back to the direct endpoint guess.
 
-Sparse solves adapt LSMR's inner accuracy by default. The outer stopping
-tolerance remains `tol=1e-10`. LSMR starts with `atol=btol=1e-6`; if a stage
-has not converged within eight evaluations, it resumes from its latest
-coordinates with 100 times tighter inner tolerances. An early `ftol`/`xtol`
-exit without satisfying `gtol` also triggers tightening. At the inner
-accuracy floor (`max(10 * eps, min(1e-6, tol))`), the solver
-uses the remaining evaluation budget without further restarts. All stages
-share `max_nfev`, and
-`report.nfev` includes their combined evaluations. Set
-`adaptive_tolerance=False` in `Cadder.solve` or `solve_kinematics` to use
-SciPy's original fixed inner tolerance. Dense solves are unaffected.
-The kinematics report describes the direct solve at the requested angle.
+`max_nfev` defaults to 5000 evaluations for final refinement.
+`result["report"].nfev` counts that nonlinear stage; tangent LSMR iterations
+are counted separately. `result["hybrid"]` contains `requested_steps`,
+`completed_steps`, `initial_nfev`, `refinement_nfev`, `linear_iterations`,
+and `fallback_reason` (`None` when no fallback was needed). `initial_nfev` is
+retained for compatibility and is always zero.
+
+Sparse solves use fixed LSMR inner settings: `atol=btol=1e-10` and
+`maxiter=5000`. The outer stopping tolerance remains `tol=1e-10` by default,
+and final refinement owns the full `max_nfev` budget. Dense solves are
+unaffected. The kinematics report describes final refinement at the requested
+angle. `Cadder.solve` remains the generic nonlinear solver.
 
 `Cadder.solve` and `solve_kinematics` use `x_scale="jac"` by default to scale
 coordinate updates using Jacobian column norms. Pass `x_scale=1.0` to disable
-variable scaling, or supply positive per-coordinate scales. Residual equations,
-their physical units, and the stopping tolerances are unchanged by this option.
+variable scaling, or supply positive per-coordinate scales. Hybrid tangent
+prediction uses the same scaling option. Residual equations, their physical
+units, and the stopping tolerances are unchanged by this option.
 
-The automatic initial guess already retains the flat pattern's XY
+For `steps=0`, the automatic initial guess retains the flat pattern's XY
 coordinates and assigns triangle heights. Unless `mountain_height` or `X0`
-is supplied, mountain height is `valley_height + sqrt(3)/2 * d * sin(final_dihedral)`,
-using the measured hexagon side length `d` and the requested angle unit.
-A partially folded state also requires XY contraction, which the nonlinear
-solver determines.
+is supplied, mountain height is
+`valley_height + sqrt(3)/2 * d * sin(final_dihedral)`, using the measured
+hexagon side length `d`. A partially folded state also requires XY contraction,
+which the nonlinear solver determines. Positive-step solves instead begin at
+the model's flat 180-degree coordinates; an explicit `X0` may supply those
+starting coordinates.
 
 Hexagon patterns store each physical hinge once in `pattern.hex_creases`
 (and `model.hex_creases` after conversion). Each unit's `local_creases` list

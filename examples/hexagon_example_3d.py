@@ -44,6 +44,7 @@ def main() -> None:
         model,
         final_dihedral=135.0,
         tol=1e-10,
+        steps=0
     )
 
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -53,7 +54,7 @@ def main() -> None:
         # save_path=f"{OUTPUT_DIR}/3D_hexagon.png"
     )
 
-    model.save_cad(filename=f"{OUTPUT_DIR}/3D_hexagon.step")
+    # model.save_cad(filename=f"{OUTPUT_DIR}/3D_hexagon.step")
 
 if __name__ == "__main__":
     main()

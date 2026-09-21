@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 
+from ...core._tangent import predict_dihedral_tangent
 from ...core.panel_holes import panel_only_geometry
 from .metadata import hex_constraint_plan, normalize_hex_creases
 
@@ -175,6 +177,7 @@ class _HexagonKinematics:
         return {
             "fixed_triangle": fixed_triangle_surface_id,
             "num_dihedral_constraints": len(dihedral_info["added"]),
+            "dihedral_constraint_ids": tuple(dihedral_info["added"]),
             "num_skipped_crease_edges": len(dihedral_info["skipped"]),
             "num_shared_crease_references": dihedral_info["num_shared"],
             "shared_crease_references": dihedral_info["shared"],
@@ -376,22 +379,29 @@ class _HexagonKinematics:
         print_dihedral_status: bool = False,
         print_residual_warning: bool = False,
         dihedral_status_max_items: int = 20,
-        adaptive_tolerance: bool = True,
         x_scale: float | np.ndarray | Literal["jac"] = "jac",
+        steps: int = 3,
     ) -> dict:
         """
-        Set up and solve a simple-hexagon model directly at the final angle.
+        Solve using tangent prediction followed by nonlinear refinement.
 
         Rank and mobility are not calculated during solving. Call
         ``analyze_kinematics(model)`` separately when these diagnostics are
         needed. The returned SolveReport uses -1 for both uncomputed fields.
 
-        The constraints and automatic height guess use ``final_dihedral``;
-        no intermediate angles are solved. If ``mountain_height`` is omitted,
-        its initial value is calculated as
-        ``valley_height + sqrt(3) / 2 * d * sin(final_dihedral)``, where ``d``
-        is measured directly from the hexagon pattern.
+        Positive ``steps`` take that many equal tangent increments from the
+        flat 180-degree coordinates to the requested angle before nonlinear
+        refinement. There is no nonlinear starting-pose solve. ``steps=0``
+        uses the original direct solve and its exact target-angle height guess.
+        For positive steps, ``X0`` may supply the flat starting coordinates;
+        otherwise the model's current coordinates are used.
         """
+        if isinstance(steps, bool) or not isinstance(steps, Integral) or steps < 0:
+            raise ValueError("steps must be a nonnegative integer.")
+        if max_nfev is not None and (
+            isinstance(max_nfev, bool) or not isinstance(max_nfev, Integral) or max_nfev < 1
+        ):
+            raise ValueError("max_nfev must be a positive integer or None.")
         theta = self._angle_to_rad(final_dihedral, unit=unit)
         if not (0.0 < theta < np.pi):
             raise ValueError("final_dihedral must be between 0 and 180 degrees.")
@@ -410,27 +420,67 @@ class _HexagonKinematics:
         if print_constraint_info:
             print(constraint_info)
 
-        if X0 is None:
-            if mountain_height is None:
-                mountain_height = self._automatic_mountain_height(
-                    dihedral_angle=final_dihedral,
-                    unit=unit,
-                    valley_height=valley_height,
+        def endpoint_guess():
+            if X0 is not None:
+                return np.asarray(X0, dtype=float).copy()
+            height = mountain_height
+            if height is None:
+                height = self._automatic_mountain_height(
+                    dihedral_angle=theta, unit="rad", valley_height=valley_height,
                 )
-            X0 = self._initial_guess(
-                mountain_height=mountain_height,
+            return self._initial_guess(
+                mountain_height=height,
                 valley_height=valley_height,
             )
 
+        hybrid = {
+            "requested_steps": int(steps), "completed_steps": 0,
+            "initial_nfev": 0, "refinement_nfev": 0,
+            "linear_iterations": 0, "fallback_reason": None,
+        }
+        guess = None
+        if steps:
+            start_theta = np.pi
+            driven_ids = constraint_info["dihedral_constraint_ids"]
+            final_targets = {
+                cid: self.constraints[cid].data["target_increment"] for cid in driven_ids
+            }
+            try:
+                for cid in driven_ids:
+                    data = self.constraints[cid].data
+                    data["target_increment"] = float(data["sign"] * (np.pi - start_theta))
+                start_coordinates = (
+                    np.asarray(X0, dtype=float).copy()
+                    if X0 is not None else self.get_coordinate_vector().copy()
+                )
+                prediction = predict_dihedral_tangent(
+                    self._model, np.linspace(start_theta, theta, int(steps) + 1),
+                    X0=start_coordinates, constraint_ids=driven_ids,
+                    linear_tol=1e-10, maxiter=5000, x_scale=x_scale,
+                )
+                hybrid["completed_steps"] = prediction.completed_steps
+                hybrid["linear_iterations"] = prediction.linear_iterations
+                if prediction.success:
+                    guess = prediction.x
+                else:
+                    hybrid["fallback_reason"] = prediction.failure_reason
+            finally:
+                # A failed predictor must never leave the public model
+                # configured for an intermediate angle.
+                for cid, target in final_targets.items():
+                    self.constraints[cid].data["target_increment"] = target
+
+        if guess is None:
+            guess = endpoint_guess()
         report = self.solve(
-            X0=X0,
+            X0=guess,
             update_model=True,
             max_nfev=max_nfev,
             tol=tol,
             compute_rank=False,
-            adaptive_tolerance=adaptive_tolerance,
             x_scale=x_scale,
         )
+        hybrid["refinement_nfev"] = report.nfev
 
         if verbose:
             print(
@@ -451,6 +501,7 @@ class _HexagonKinematics:
         return {
             "constraint_info": constraint_info,
             "report": report,
+            "hybrid": hybrid,
         }
 
     def _print_dihedral_status(
@@ -533,10 +584,17 @@ def solve_kinematics(
     print_dihedral_status: bool = False,
     print_residual_warning: bool = False,
     dihedral_status_max_items: int = 20,
-    adaptive_tolerance: bool = True,
     x_scale: float | np.ndarray | Literal["jac"] = "jac",
+    steps: int = 3,
 ) -> dict:
-    """Add hexagon constraints and solve directly at ``final_dihedral``.
+    """Add hexagon constraints and solve using hybrid tangent/nonlinear steps.
+
+    ``steps`` is a nonnegative integer, defaulting to 3. Positive values take
+    ``steps`` equal tangent increments from the flat 180-degree coordinates
+    to ``final_dihedral``, then refine with the nonlinear solver. No nonlinear
+    starting-pose solve is performed. ``steps=0`` uses the original direct
+    nonlinear solve at the final angle. If tangent prediction fails, the
+    endpoint solve falls back to its target-angle height guess.
 
     Hole contours move with their host panels and add no independent solver
     variables. ``report.x`` includes the restored hole points in the model's
@@ -547,23 +605,27 @@ def solve_kinematics(
     ``analyze_kinematics(model)`` separately to evaluate them at the solved
     configuration; that diagnostic does not perform another solve.
 
-    Sparse inner-solver accuracy adapts automatically while ``tol`` remains
-    the outer stopping tolerance. Set ``adaptive_tolerance=False`` to use
-    SciPy's fixed inner accuracy. The automatic initial guess already keeps
-    the flat pattern's XY coordinates and sets triangle heights only, using
+    Sparse nonlinear refinement uses fixed LSMR settings ``atol=btol=1e-10``
+    and ``maxiter=5000``. ``tol`` remains the outer stopping tolerance. For
+    ``steps=0``, the automatic initial guess keeps the flat pattern's XY
+    coordinates and sets triangle heights using
     ``valley_height + sqrt(3) / 2 * d * sin(final_dihedral)`` for mountain
-    height unless ``mountain_height`` or ``X0`` is supplied. ``d`` is measured
-    from the pattern, and ``unit`` applies to ``final_dihedral``.
+    height. ``d`` is measured from the pattern and ``unit`` applies to
+    ``final_dihedral``. ``mountain_height`` overrides this formula. For
+    positive steps, ``X0`` supplies the flat 180-degree coordinates when
+    provided; otherwise the model's current coordinates are used.
 
-    ``max_nfev`` (default 5000) is the total evaluation budget, including
-    adaptive inner-accuracy restarts. ``report.nfev`` counts all of them.
-    The former ``steps``, ``start_dihedral`` and ``max_nfev_per_step``
-    parameters have been removed; no angle continuation is performed.
+    ``max_nfev`` (default 5000) is the evaluation budget for final refinement.
+    ``result["hybrid"]`` records requested/completed tangent steps, refinement
+    evaluations, linear iterations, and any fallback reason. Its compatibility
+    field ``initial_nfev`` is always zero. Tangent LSMR iterations do not
+    consume ``max_nfev``.
 
     ``x_scale`` defaults to ``"jac"`` to scale variables by inverse Jacobian
     column norms. Use ``1.0`` to disable scaling, or positive per-coordinate
-    scales in full-model or panel-only point order. Scaling does not change
-    the residual equations or their weights.
+    scales in full-model or panel-only point order. The same scaling applies
+    to tangent prediction. Scaling does not change the residual equations
+    or their weights.
 
     Shared unit references to a physical crease are valid, including with
     ``strict_unique_edges=True``. Strict mode rejects missing geometry;
@@ -610,8 +672,8 @@ def solve_kinematics(
             print_dihedral_status=print_dihedral_status,
             print_residual_warning=print_residual_warning,
             dihedral_status_max_items=dihedral_status_max_items,
-            adaptive_tolerance=adaptive_tolerance,
             x_scale=x_scale,
+            steps=steps,
         )
     if coordinate_indices is not None:
         result["report"].x = model.get_coordinate_vector()
