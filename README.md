@@ -54,6 +54,17 @@ which the nonlinear solver determines. Positive-step solves instead begin at
 the model's flat 180-degree coordinates; an explicit `X0` may supply those
 starting coordinates.
 
+A solved model can be solved again at another angle:
+
+```python
+solve_kinematics(model, final_dihedral=150.0)
+solve_kinematics(model, final_dihedral=120.0)   # continues from 150 degrees
+```
+
+The second call retargets the existing constraints instead of adding them
+again, and its tangent steps start from the angle the model is currently
+folded to. `valley_z` is fixed by the first solve.
+
 Hexagon patterns store each physical hinge once in `pattern.hex_creases`
 (and `model.hex_creases` after conversion). Each unit's `local_creases` list
 contains references with its local index, side, and edge direction. To read

@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 
+from ...core._evaluation import CompiledConstraints
 from ...core._tangent import predict_dihedral_tangent
+from ...core.jacobian import JacobianBuilder
 from ...core.panel_holes import panel_only_geometry
 from .metadata import hex_constraint_plan, normalize_hex_creases
 
@@ -56,6 +58,17 @@ class _HexagonKinematics:
 
         for crease_data, label in entries:
             unit_count, local_index, side = label
+            constraint_id = f"dihedral_signed_u{unit_count}_i{local_index}_{side}"
+            existing = self.constraints.get(constraint_id)
+            if existing is not None and existing.kind == "dihedral_signed_increment":
+                # Repeated setup on a model that may already be folded: keep
+                # the hinge's flat reference angle and orientation, and move
+                # only its target to the newly requested angle.
+                existing.data["target_increment"] = float(
+                    existing.data["sign"] * fold_amount
+                )
+                added.append(constraint_id)
+                continue
             edge_start, edge_end = crease_data["edge"]
             triangle_point = self._first_non_edge_vertex(
                 self._surface_vertices(crease_data["triangle"]), edge_start, edge_end)
@@ -70,7 +83,7 @@ class _HexagonKinematics:
                 point_left=triangle_point, point_right=quad_point,
                 target_increment=sign * fold_amount, unit="rad", sign=sign,
                 crease_kind=crease_kind,
-                constraint_id=f"dihedral_signed_u{unit_count}_i{local_index}_{side}",
+                constraint_id=constraint_id,
             ))
 
         return {
@@ -91,6 +104,62 @@ class _HexagonKinematics:
             raise ValueError("No hex-unit metadata found. Build a hexagon pattern first.")
         plan = hex_constraint_plan(self._model)
         return list(plan.crease_entries), list(plan.skipped), list(plan.shared)
+
+    def _add_frame_constraints(self, surface_id: str) -> list[str]:
+        """Pin the reference triangle once; return the constraints just added.
+
+        The IDs name the triangle, so repeated setup keeps the existing frame
+        (and its original coordinates) instead of stacking a second one. A
+        different reference triangle replaces the previous frame.
+        """
+        prefix = f"hex_frame_{surface_id}_"
+        previous = [cid for cid in self.constraints if cid.startswith("hex_frame_")]
+        if any(cid.startswith(prefix) for cid in previous):
+            return []
+        for cid in previous:
+            del self.constraints[cid]
+        p0, p1, p2 = self._non_collinear_triplet_from_surface(surface_id)
+        return [
+            self.add_fixed_coordinate_constraint(
+                pid, axis, constraint_id=f"{prefix}{pid}_{axis}"
+            )
+            for pid, axis in (
+                (p0, "x"), (p0, "y"), (p0, "z"), (p1, "y"), (p1, "z"), (p2, "z"),
+            )
+        ]
+
+    def _starting_fold_angle(
+        self,
+        constraint_ids,
+        coordinates: np.ndarray,
+    ) -> Optional[float]:
+        """Return the dihedral angle the hinges share at ``coordinates``.
+
+        A model that has never been folded is at pi. A model that an earlier
+        solve already folded is at that solve's angle, which is where tangent
+        prediction has to start. Return None when the hinges disagree, because
+        no single starting angle describes such a state.
+        """
+        constraints = [self.constraints[cid] for cid in constraint_ids]
+        if not constraints:
+            return float(np.pi)
+        try:
+            residual = CompiledConstraints(
+                self._model, JacobianBuilder(self._model), constraints
+            ).residual(coordinates)
+        except ValueError:
+            # Unusable coordinates are reported by the predictor itself.
+            return float(np.pi)
+        targets = np.array([c.data["target_increment"] for c in constraints])
+        signs = np.array([c.data["sign"] for c in constraints], dtype=float)
+        increments = (residual + targets + np.pi) % (2.0 * np.pi) - np.pi
+        angles = np.pi - signs * increments
+        if float(np.ptp(angles)) > 1e-5:
+            return None
+        angle = float(np.mean(angles))
+        if abs(angle - np.pi) <= 1e-9:
+            return float(np.pi)
+        return angle if 0.0 < angle < np.pi else None
 
     def _triangle_metadata(self):
         plan = hex_constraint_plan(self._model)
@@ -137,7 +206,7 @@ class _HexagonKinematics:
             )
 
         self.add_panel_rigidity_constraints_from_surfaces()
-        frame_constraint_ids = self.add_fixed_surface_constraint(fixed_triangle_surface_id)
+        frame_constraint_ids = self._add_frame_constraints(fixed_triangle_surface_id)
 
         pinned_z = {}
         for tri_id in triangle_ids:
@@ -395,6 +464,10 @@ class _HexagonKinematics:
         uses the original direct solve and its exact target-angle height guess.
         For positive steps, ``X0`` may supply the flat starting coordinates;
         otherwise the model's current coordinates are used.
+
+        The model may be solved again at another angle. Existing constraints
+        are retargeted rather than added twice, and tangent steps then start
+        from the angle the model is currently folded to.
         """
         if isinstance(steps, bool) or not isinstance(steps, Integral) or steps < 0:
             raise ValueError("steps must be a nonnegative integer.")
@@ -440,19 +513,27 @@ class _HexagonKinematics:
         }
         guess = None
         if steps:
-            start_theta = np.pi
             driven_ids = constraint_info["dihedral_constraint_ids"]
             final_targets = {
                 cid: self.constraints[cid].data["target_increment"] for cid in driven_ids
             }
+            start_coordinates = (
+                np.asarray(X0, dtype=float).copy()
+                if X0 is not None else self.get_coordinate_vector().copy()
+            )
+            # pi for a flat model; the previous angle when re-solving a model
+            # that is already folded.
+            start_theta = self._starting_fold_angle(driven_ids, start_coordinates)
+        if steps and start_theta is None:
+            hybrid["fallback_reason"] = (
+                "The starting coordinates are not at one uniform dihedral "
+                "angle, so tangent prediction was skipped."
+            )
+        elif steps:
             try:
                 for cid in driven_ids:
                     data = self.constraints[cid].data
                     data["target_increment"] = float(data["sign"] * (np.pi - start_theta))
-                start_coordinates = (
-                    np.asarray(X0, dtype=float).copy()
-                    if X0 is not None else self.get_coordinate_vector().copy()
-                )
                 prediction = predict_dihedral_tangent(
                     self._model, np.linspace(start_theta, theta, int(steps) + 1),
                     X0=start_coordinates, constraint_ids=driven_ids,
@@ -595,6 +676,14 @@ def solve_kinematics(
     starting-pose solve is performed. ``steps=0`` uses the original direct
     nonlinear solve at the final angle. If tangent prediction fails, the
     endpoint solve falls back to its target-angle height guess.
+
+    A solved model can be passed again with a different ``final_dihedral``.
+    Its existing constraints are retargeted instead of being added a second
+    time, and the tangent steps start from the angle the model is currently
+    folded to rather than from 180 degrees. If the hinges of the starting
+    coordinates are not at one common angle, prediction is skipped and
+    ``result["hybrid"]["fallback_reason"]`` says so. ``valley_z`` is fixed by
+    the first solve; later calls do not change it.
 
     Hole contours move with their host panels and add no independent solver
     variables. ``report.x`` includes the restored hole points in the model's

@@ -1325,6 +1325,17 @@ class Cadder(CadVisualizationMixin):
         """
         with self._index_bar_constraints():
             for constraint_id, p1, p2 in panel_rigidity_plan(self):
+                existing = self.constraints.get(constraint_id)
+                if (
+                    existing is not None
+                    and existing.kind == "bar_length"
+                    and {existing.data["p1"], existing.data["p2"]} == {p1, p2}
+                ):
+                    # Repeated setup: this panel bar already holds its
+                    # reference length. Re-measuring it from coordinates that
+                    # an earlier solve moved would report solver error as a
+                    # length conflict.
+                    continue
                 self.add_bar_length_constraint(
                     p1, p2, constraint_id=constraint_id, merge_if_duplicate=True
                 )
