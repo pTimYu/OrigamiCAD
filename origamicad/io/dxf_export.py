@@ -9,9 +9,10 @@ from typing import Literal
 import ezdxf
 from ezdxf import bbox, units
 
+from .._validation import finite
+
 
 CreaseStyle = Literal["solid", "dashed"] | list[object] | tuple[object, ...]
-DxfProfile = Literal["solidworks"]
 _MAX_REAL_DASH_SEGMENTS = 1_000_000
 _DASH_LENGTH_MM = 3.0
 _CONNECTING_DOT_LENGTH_MM = 0.6
@@ -25,30 +26,14 @@ class _CreaseStyleSpec:
     gap_length: float | None = None
 
 
-def save_dxf(
-    metadata: dict,
-    filename: str | Path,
-    include_creases: bool = True,
-    crease_style: CreaseStyle = "dashed",
-    include_construction: bool = False,
-    include_rigid: bool = True,
-    include_side: bool = True,
-    profile: DxfProfile = "solidworks",
-    connecting_dots: bool = False,
-) -> Path:
-    """Save 2D metadata as an AutoCAD/SolidWorks-compatible ASCII DXF file."""
+def save_dxf(metadata: dict, filename: str | Path, **options) -> Path:
+    """Save 2D metadata as an AutoCAD/SolidWorks-compatible ASCII DXF file.
+
+    ``options`` are the keyword options of :func:`dxf_string_from_metadata`.
+    """
     path = Path(filename)
     path.write_text(
-        dxf_string_from_metadata(
-            metadata,
-            include_creases=include_creases,
-            crease_style=crease_style,
-            include_construction=include_construction,
-            include_rigid=include_rigid,
-            include_side=include_side,
-            profile=profile,
-            connecting_dots=connecting_dots,
-        ),
+        dxf_string_from_metadata(metadata, **options),
         encoding="ascii",
         newline="",
     )
@@ -62,7 +47,6 @@ def dxf_string_from_metadata(
     include_construction: bool = False,
     include_rigid: bool = True,
     include_side: bool = True,
-    profile: DxfProfile = "solidworks",
     connecting_dots: bool = False,
 ) -> str:
     """Convert 2D metadata to a complete AutoCAD 2000 DXF document.
@@ -76,18 +60,10 @@ def dxf_string_from_metadata(
     as solid cut lines. The total blank length is calculated to cover
     approximately 1% of the outer figure's perimeter. Inner cavity and
     hole-punch boundaries remain continuous.
-
-    The only supported profile is ``"solidworks"``. It is retained as an
-    argument for source compatibility.
     """
     crease_style_spec = _parse_crease_style(crease_style)
     if not isinstance(connecting_dots, bool):
         raise ValueError("connecting_dots must be a boolean.")
-    if profile != "solidworks":
-        raise ValueError(
-            "The 'standard' DXF profile has been removed because it emitted "
-            "invalid AC1015 tables. The only supported profile is 'solidworks'."
-        )
 
     source_unit = metadata.get("metadata", {}).get("unit", "mm")
     document_unit = _dxf_unit(source_unit)
@@ -583,15 +559,9 @@ def _layer_defs(
 
 
 def _parse_crease_style(crease_style: CreaseStyle) -> _CreaseStyleSpec:
-    if isinstance(crease_style, str):
-        if crease_style in {"solid", "dashed"}:
-            return _CreaseStyleSpec(crease_style)
-        raise ValueError(
-            "crease_style must be 'solid', 'dashed', or "
-            "['real dashed', dash_length, gap_length]."
-        )
-
-    if not isinstance(crease_style, (list, tuple)):
+    if crease_style in ("solid", "dashed"):
+        return _CreaseStyleSpec(crease_style)
+    if isinstance(crease_style, str) or not isinstance(crease_style, (list, tuple)):
         raise ValueError(
             "crease_style must be 'solid', 'dashed', or "
             "['real dashed', dash_length, gap_length]."
@@ -601,24 +571,11 @@ def _parse_crease_style(crease_style: CreaseStyle) -> _CreaseStyleSpec:
             "A real dashed crease_style must have the form "
             "['real dashed', dash_length, gap_length]."
         )
-
-    dash_length = _positive_finite_length(crease_style[1], "dash_length")
-    gap_length = _positive_finite_length(crease_style[2], "gap_length")
-    return _CreaseStyleSpec("real dashed", dash_length, gap_length)
-
-
-def _positive_finite_length(value, name: str) -> float:
-    if isinstance(value, (str, bytes, bool)):
-        raise ValueError(f"{name} must be a positive finite number; got {value!r}.")
-    try:
-        result = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            f"{name} must be a positive finite number; got {value!r}."
-        ) from exc
-    if not math.isfinite(result) or result <= 0.0:
-        raise ValueError(f"{name} must be a positive finite number; got {value!r}.")
-    return result
+    return _CreaseStyleSpec(
+        "real dashed",
+        finite("dash_length", crease_style[1], positive=True),
+        finite("gap_length", crease_style[2], positive=True),
+    )
 
 
 def _real_dash_segments(

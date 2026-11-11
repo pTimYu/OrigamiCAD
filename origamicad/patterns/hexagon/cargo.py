@@ -5,12 +5,27 @@ from __future__ import annotations
 import math
 from typing import Literal, NamedTuple
 
+from ..._validation import finite
+
 
 class CargoSize(NamedTuple):
     """Transverse and longitudinal cargo lengths."""
 
     transverse: float
     longitudinal: float
+
+
+def _side_and_angle(l: float, theta: float, unit: str) -> tuple[float, float]:
+    """Validate the side length and return the dihedral angle in radians."""
+    side_length = finite("l", l, positive=True)
+    angle = finite("theta", theta)
+    if unit == "deg":
+        angle = math.radians(angle)
+    elif unit != "rad":
+        raise ValueError("unit must be 'rad' or 'deg'.")
+    if not 0.0 <= angle <= math.pi:
+        raise ValueError("theta must be between 0 and 180 degrees, inclusive.")
+    return side_length, angle
 
 
 def calculate_cargo_height(
@@ -37,22 +52,10 @@ def calculate_cargo_height(
     valley_height:
         Elevation of the valley panels. It defaults to zero.
     """
-    side_length = _finite_float(l, "l")
-    angle = _finite_float(theta, "theta")
-    base_height = _finite_float(valley_height, "valley_height")
-
-    if side_length <= 0.0:
-        raise ValueError("l must be positive.")
-
-    if unit == "deg":
-        angle = math.radians(angle)
-    elif unit != "rad":
-        raise ValueError("unit must be 'rad' or 'deg'.")
-
-    if not 0.0 <= angle <= math.pi:
-        raise ValueError("theta must be between 0 and 180 degrees, inclusive.")
-
-    return base_height + math.sqrt(3.0) / 2.0 * side_length * math.sin(angle)
+    side_length, angle = _side_and_angle(l, theta, unit)
+    return finite("valley_height", valley_height) + (
+        math.sqrt(3.0) / 2.0 * side_length * math.sin(angle)
+    )
 
 
 def calculate_cargo_size(
@@ -84,21 +87,9 @@ def calculate_cargo_size(
         A tuple-like result whose fields are ``transverse`` and
         ``longitudinal``. Both lengths use the same unit as ``l``.
     """
-    side_length = _finite_float(l, "l")
-    angle = _finite_float(theta, "theta")
-    transverse_parameter = _finite_float(gamma, "gamma")
-    longitudinal_parameter = _finite_float(delta, "delta")
-
-    if side_length <= 0.0:
-        raise ValueError("l must be positive.")
-
-    if unit == "deg":
-        angle = math.radians(angle)
-    elif unit != "rad":
-        raise ValueError("unit must be 'rad' or 'deg'.")
-
-    if not 0.0 <= angle <= math.pi:
-        raise ValueError("theta must be between 0 and 180 degrees, inclusive.")
+    side_length, angle = _side_and_angle(l, theta, unit)
+    transverse_parameter = finite("gamma", gamma)
+    longitudinal_parameter = finite("delta", delta)
 
     cosine = math.cos(angle)
     d = 7.0 - 12.0 * cosine + 9.0 * cosine**2
@@ -127,17 +118,6 @@ def calculate_cargo_size(
     )
 
     return CargoSize(transverse=transverse, longitudinal=longitudinal)
-
-
-def _finite_float(value: float, name: str) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a finite number.") from exc
-
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be a finite number.")
-    return result
 
 
 __all__ = ["CargoSize", "calculate_cargo_height", "calculate_cargo_size"]

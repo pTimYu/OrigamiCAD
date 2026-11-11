@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from numbers import Integral
 from typing import TYPE_CHECKING, Iterable, Literal
 
 import numpy as np
 from scipy.sparse.linalg import lsmr
 
+from .._validation import finite, integer
+from ._direct import solve_normal_equations
 from .jacobian import JacobianBuilder
 
 if TYPE_CHECKING:
@@ -21,7 +22,8 @@ class TangentPrediction:
 
     Success means that all linear solves terminated normally. Finite tangent
     steps still accumulate constraint drift, which the nonlinear solver must
-    correct. Iteration counts include an attempted step that failed.
+    correct. ``linear_iterations`` counts LSMR iterations, including those of
+    an attempted step that failed; direct solves do not iterate and add none.
     """
 
     x: np.ndarray
@@ -43,6 +45,7 @@ def predict_dihedral_tangent(
     linear_tol: float = 1e-10,
     maxiter: int = 5000,
     x_scale: float | np.ndarray | Literal["jac"] = "jac",
+    linear_solver: Literal["direct", "lsmr"] = "direct",
 ) -> TangentPrediction:
     """Predict coordinates along absolute unsigned dihedral angles in radians.
 
@@ -62,6 +65,12 @@ def predict_dihedral_tangent(
     scalar or per-coordinate scales. ``"jac"`` uses inverse column norms,
     retaining their running maxima as in SciPy's least-squares solver.
 
+    ``linear_solver="direct"`` (the default) solves each step's least-squares
+    problem by factorizing the sparse normal equations. ``"lsmr"`` uses the
+    iterative LSMR solver with ``atol = btol = linear_tol`` and at most
+    ``maxiter`` iterations per step; those two options apply only to it. A
+    direct step whose factorization fails is retried with LSMR.
+
     Model coordinates are never changed. Signed targets in the model and the
     temporary compiled plan advance through completed steps. If a derivative
     or linear solve fails, the returned coordinates and targets correspond to
@@ -70,75 +79,57 @@ def predict_dihedral_tangent(
     """
     try:
         angles = np.asarray(list(angles_rad), dtype=float)
+        x = np.array(model.get_coordinate_vector() if X0 is None else X0, dtype=float)
+        fixed_scale = None
+        if not isinstance(x_scale, str):
+            fixed_scale = np.broadcast_to(np.asarray(x_scale, dtype=float), x.shape)
     except (TypeError, ValueError) as error:
-        raise ValueError("angles_rad must be a one-dimensional sequence of angles.") from error
-    if angles.ndim != 1 or angles.size == 0:
-        raise ValueError("angles_rad must contain at least the starting angle.")
-    if (not np.all(np.isfinite(angles)) or angles[0] <= 0 or angles[0] > np.pi
+        raise ValueError(
+            "angles_rad and X0 must be numeric vectors, and x_scale a scalar "
+            "or one scale per coordinate."
+        ) from error
+    if (angles.ndim != 1 or angles.size == 0 or not np.all(np.isfinite(angles))
+            or not 0 < angles[0] <= np.pi
             or np.any((angles[1:] <= 0) | (angles[1:] >= np.pi))):
         raise ValueError(
-            "angles_rad must be finite and positive; only the first angle may equal pi."
+            "angles_rad must hold finite positive angles, starting with the "
+            "current one; only that first angle may equal pi."
         )
-    try:
-        tolerance = float(linear_tol)
-    except (TypeError, ValueError) as error:
-        raise ValueError("linear_tol must be finite and positive.") from error
-    if not np.isfinite(tolerance) or tolerance <= 0:
-        raise ValueError("linear_tol must be finite and positive.")
-    if not isinstance(maxiter, Integral) or isinstance(maxiter, bool) or maxiter <= 0:
-        raise ValueError("maxiter must be a positive integer.")
-
-    try:
-        x = np.asarray(model.get_coordinate_vector() if X0 is None else X0, dtype=float).copy()
-    except (TypeError, ValueError) as error:
-        raise ValueError("X0 must be a one-dimensional coordinate vector.") from error
+    if linear_solver not in ("direct", "lsmr"):
+        raise ValueError("linear_solver must be 'direct' or 'lsmr'.")
+    tolerance = finite("linear_tol", linear_tol, positive=True)
+    maxiter = integer("maxiter", maxiter, minimum=1)
     if x.ndim != 1 or x.size == 0 or x.size != model.num_variables():
         raise ValueError(f"X0 must be a one-dimensional vector of size {model.num_variables()}.")
     if X0 is not None and not np.all(np.isfinite(x)):
         raise ValueError("X0 must contain only finite values.")
-    if isinstance(x_scale, str):
-        if x_scale != "jac":
-            raise ValueError("x_scale must be 'jac' or finite positive coordinate scales.")
-        fixed_scale = None
-    else:
-        try:
-            fixed_scale = np.asarray(x_scale, dtype=float)
-        except (TypeError, ValueError) as error:
-            raise ValueError("x_scale must be 'jac' or finite positive coordinate scales.") from error
-        if fixed_scale.ndim == 0:
-            fixed_scale = np.full(x.shape, float(fixed_scale))
-        if fixed_scale.shape != x.shape:
-            raise ValueError(f"x_scale must be a scalar or have shape {x.shape}.")
-        if not np.all(np.isfinite(fixed_scale)) or np.any(fixed_scale <= 0):
-            raise ValueError("x_scale must contain finite positive values.")
+    if fixed_scale is None and x_scale != "jac":
+        raise ValueError("x_scale must be 'jac' or finite positive coordinate scales.")
+    if fixed_scale is not None and not (
+        np.all(np.isfinite(fixed_scale)) and np.all(fixed_scale > 0)
+    ):
+        raise ValueError("x_scale must contain finite positive values.")
 
-    signed_constraints = [
-        (key, constraint) for key, constraint in model.constraints.items()
+    signed_ids = [
+        key for key, constraint in model.constraints.items()
         if constraint.kind == "dihedral_signed_increment"
     ]
     if constraint_ids is None:
-        selected_ids = {key for key, _ in signed_constraints}
+        selected_ids = set(signed_ids)
     else:
-        if isinstance(constraint_ids, (str, bytes)):
-            raise ValueError("constraint_ids must be a sequence of constraint identifiers.")
-        try:
-            requested_ids = list(constraint_ids)
-        except TypeError as error:
-            raise ValueError("constraint_ids must be a sequence of constraint identifiers.") from error
-        if not all(isinstance(key, str) for key in requested_ids):
-            raise ValueError("constraint_ids must contain string identifiers.")
+        requested_ids = [constraint_ids] if isinstance(constraint_ids, (str, bytes)) else list(constraint_ids)
         selected_ids = set(requested_ids)
-        if len(selected_ids) != len(requested_ids):
-            raise ValueError("constraint_ids must not contain duplicate identifiers.")
-        for key in requested_ids:
-            if key not in model.constraints:
-                raise ValueError(f"Constraint '{key}' does not exist.")
-            if model.constraints[key].kind != "dihedral_signed_increment":
-                raise ValueError(f"Constraint '{key}' must be a signed-increment dihedral.")
+        if (isinstance(constraint_ids, (str, bytes))
+                or len(selected_ids) != len(requested_ids)
+                or not selected_ids <= set(signed_ids)):
+            raise ValueError(
+                "constraint_ids must be distinct IDs of existing signed-increment "
+                "dihedral constraints."
+            )
     driven_positions = np.asarray([
-        index for index, (key, _) in enumerate(signed_constraints) if key in selected_ids
+        index for index, key in enumerate(signed_ids) if key in selected_ids
     ], dtype=int)
-    driven = [constraint for key, constraint in signed_constraints if key in selected_ids]
+    driven = [model.constraints[key] for key in signed_ids if key in selected_ids]
     if not driven:
         raise ValueError("The model must contain signed-increment dihedral constraints.")
     signs = np.asarray([constraint.data["sign"] for constraint in driven], dtype=float)
@@ -177,22 +168,28 @@ def predict_dihedral_tangent(
                     scale = fixed_scale
                 scaled_jacobian = jacobian.multiply(scale).tocsr()
                 rhs[group["rows"][driven_positions]] = -signs * (next_theta - theta)
-                scaled_dx, status, iterations, *_ = lsmr(
-                    scaled_jacobian, rhs, atol=tolerance, btol=tolerance,
-                    maxiter=int(maxiter),
-                )
-                linear_iterations += int(iterations)
+                scaled_dx = None
+                if linear_solver == "direct":
+                    scaled_dx = solve_normal_equations(
+                        scaled_jacobian, scaled_jacobian.T @ rhs,
+                    )
+                if scaled_dx is None:
+                    scaled_dx, status, iterations, *_ = lsmr(
+                        scaled_jacobian, rhs, atol=tolerance, btol=tolerance,
+                        maxiter=maxiter,
+                    )
+                    linear_iterations += int(iterations)
+                    if not np.all(np.isfinite(scaled_dx)):
+                        failure_reason = f"Step {step}: LSMR returned a nonfinite displacement."
+                        break
+                    if status not in {0, 1, 2, 4, 5}:
+                        description = {
+                            3: "condition-number limit", 6: "machine-precision condition limit",
+                            7: "iteration budget exhausted",
+                        }.get(int(status), "unrecognized termination")
+                        failure_reason = f"Step {step}: LSMR status {status} ({description})."
+                        break
                 dx = scale * scaled_dx
-                if not np.all(np.isfinite(dx)):
-                    failure_reason = f"Step {step}: LSMR returned a nonfinite displacement."
-                    break
-                if status not in {0, 1, 2, 4, 5}:
-                    description = {
-                        3: "condition-number limit", 6: "machine-precision condition limit",
-                        7: "iteration budget exhausted",
-                    }.get(int(status), "unrecognized termination")
-                    failure_reason = f"Step {step}: LSMR status {status} ({description})."
-                    break
                 next_x = x + dx
                 if not np.all(np.isfinite(next_x)):
                     failure_reason = f"Step {step}: the coordinate update is nonfinite."

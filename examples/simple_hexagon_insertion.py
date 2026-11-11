@@ -26,11 +26,6 @@ SIDE_LENGTH = 15.0
 REQUESTED_INNER_DIHEDRAL_DEG = 135.0
 NUM_LOOPS = 2
 NUM_LAYERS = 4
-ASSIGNMENT_MODE = "panel_sequence"
-REFERENCE_A2O_MASK = 0b111111
-# This is unused by panel_sequence. In regular_masks mode, use None for the
-# exhaustive search or [REFERENCE_A2O_MASK] for the sixfold paper state.
-COMBINATION_MASKS = None
 
 
 def main() -> None:
@@ -39,8 +34,6 @@ def main() -> None:
         num_loops=NUM_LOOPS,
         num_layers=NUM_LAYERS,
         side_length=SIDE_LENGTH,
-        assignment_mode=ASSIGNMENT_MODE,
-        combination_masks=COMBINATION_MASKS,
         verbose=False,
     )
     print("")

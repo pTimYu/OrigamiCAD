@@ -15,6 +15,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
+from .._validation import finite
 
 HoleLoopGeometry = tuple[tuple[str, ...], np.ndarray]
 PanelGeometry = tuple[
@@ -122,7 +123,7 @@ def save_step(
     ``model.surface_holes`` are exported as true inner face boundaries for
     zero-thickness shell surfaces.
     """
-    thickness = _validate_thickness(thickness)
+    thickness = finite("thickness", thickness, nonnegative=True)
     if separate_layer_parts and thickness != 0.0:
         raise ValueError(
             "separate_layer_parts requires thickness=0.0 so each layer can "
@@ -279,19 +280,11 @@ def _panel_geometry(
         yield surface_id, point_ids, polygon, hole_loops
 
 
-def _panel_polygons(model) -> Iterable[tuple[str, np.ndarray]]:
-    for surface_id, _, polygon, _ in _panel_geometry(model):
-        yield surface_id, polygon
-
-
 def _layer_part_groups(
     model,
 ) -> list[tuple[str, list[PanelGeometry]]]:
     """Group stacked panel polygons into zero-based, contiguous layer parts."""
-    groups: dict[
-        int,
-        list[PanelGeometry],
-    ] = {}
+    groups: dict[int, list[PanelGeometry]] = {}
     layer_pattern = re.compile(r"^layer_(\d+)::(.+)$")
 
     for surface_id, point_ids, polygon, hole_loops in _panel_geometry(model):
@@ -303,48 +296,34 @@ def _layer_part_groups(
                 f"got {surface_id!r}."
             )
         layer_index = int(match.group(1))
-        local_surface_id = match.group(2)
 
-        for point_id in point_ids:
+        boundary_points = [("Surface", point_id) for point_id in point_ids] + [
+            ("Hole in", point_id)
+            for hole_point_ids, _ in hole_loops
+            for point_id in hole_point_ids
+        ]
+        for owner, point_id in boundary_points:
             point_match = layer_pattern.fullmatch(point_id)
-            if (
-                point_match is None
-                or int(point_match.group(1)) != layer_index
-            ):
+            if point_match is None or int(point_match.group(1)) != layer_index:
                 raise ValueError(
-                    f"Surface {surface_id!r} references point {point_id!r} "
+                    f"{owner} {surface_id!r} references point {point_id!r} "
                     "outside its layer."
                 )
 
-        for hole_point_ids, _ in hole_loops:
-            for point_id in hole_point_ids:
-                point_match = layer_pattern.fullmatch(point_id)
-                if (
-                    point_match is None
-                    or int(point_match.group(1)) != layer_index
-                ):
-                    raise ValueError(
-                        f"Hole in {surface_id!r} references point "
-                        f"{point_id!r} outside its layer."
-                    )
-
         groups.setdefault(layer_index, []).append(
-            (local_surface_id, point_ids, polygon, hole_loops)
+            (match.group(2), point_ids, polygon, hole_loops)
         )
 
     if not groups:
         raise ValueError(
             "separate_layer_parts requires at least one stacked surface."
         )
-
     layer_indices = sorted(groups)
-    expected_indices = list(range(len(layer_indices)))
-    if layer_indices != expected_indices:
+    if layer_indices != list(range(len(layer_indices))):
         raise ValueError(
             "Layer indices must be contiguous and start at zero; "
             f"got {layer_indices}."
         )
-
     return [
         (f"Layer_{layer_index + 1}", groups[layer_index])
         for layer_index in layer_indices
@@ -541,8 +520,22 @@ def _connected_shell_geometry(
         )
 
     point_indices: dict[str, int] = {}
-    point_coordinates: dict[str, np.ndarray] = {}
     coordinates: list[np.ndarray] = []
+
+    def shared_indices(loop_point_ids, loop_coordinates) -> list[int]:
+        """Index a loop's vertices, reusing points already in the shell."""
+        indices = []
+        for point_id, coordinate in zip(loop_point_ids, loop_coordinates):
+            if point_id not in point_indices:
+                point_indices[point_id] = len(coordinates)
+                coordinates.append(coordinate)
+            elif not np.array_equal(coordinates[point_indices[point_id]], coordinate):
+                raise ValueError(
+                    f"Point {point_id!r} has inconsistent coordinates."
+                )
+            indices.append(point_indices[point_id])
+        return indices
+
     face_indices = []
     face_names = []
     face_inner_indices = []
@@ -557,19 +550,7 @@ def _connected_shell_geometry(
             point_ids = tuple(reversed(point_ids))
             polygon = polygon[::-1]
 
-        indices = []
-        for point_id, coordinate in zip(point_ids, polygon):
-            if point_id not in point_indices:
-                point_indices[point_id] = len(coordinates)
-                point_coordinates[point_id] = coordinate
-                coordinates.append(coordinate)
-            elif not np.array_equal(point_coordinates[point_id], coordinate):
-                raise ValueError(
-                    f"Point {point_id!r} has inconsistent coordinates."
-                )
-            indices.append(point_indices[point_id])
-
-        face_indices.append(indices)
+        face_indices.append(shared_indices(point_ids, polygon))
         face_names.append(surface_id)
 
         inner_indices = []
@@ -589,28 +570,17 @@ def _connected_shell_geometry(
                 hole_point_ids = tuple(reversed(hole_point_ids))
                 hole_polygon = hole_polygon[::-1]
 
-            loop_indices = []
-            for point_id, coordinate in zip(hole_point_ids, hole_polygon):
-                if point_id not in point_indices:
-                    point_indices[point_id] = len(coordinates)
-                    point_coordinates[point_id] = coordinate
-                    coordinates.append(coordinate)
-                elif not np.array_equal(point_coordinates[point_id], coordinate):
-                    raise ValueError(
-                        f"Point {point_id!r} has inconsistent coordinates."
-                    )
-                loop_indices.append(point_indices[point_id])
-            inner_indices.append(loop_indices)
+            inner_indices.append(shared_indices(hole_point_ids, hole_polygon))
         face_inner_indices.append(inner_indices)
 
     return np.array(coordinates), face_indices, face_names, face_inner_indices
 
 
 def _mesh_triangles(model, thickness: float) -> list[np.ndarray]:
-    thickness = _validate_thickness(thickness)
+    thickness = finite("thickness", thickness, nonnegative=True)
     triangles = []
 
-    for _, polygon in _panel_polygons(model):
+    for _, _, polygon, _ in _panel_geometry(model):
         if thickness == 0.0:
             triangles.extend(_triangulate_fan(polygon))
             continue
@@ -664,13 +634,6 @@ def _triangle_normal(triangle: np.ndarray) -> np.ndarray:
     if magnitude < 1e-12:
         raise ValueError("Cannot export a degenerate triangle with zero area.")
     return normal / magnitude
-
-
-def _validate_thickness(thickness: float) -> float:
-    thickness = float(thickness)
-    if not np.isfinite(thickness) or thickness < 0.0:
-        raise ValueError("thickness must be a finite value greater than or equal to 0.")
-    return thickness
 
 
 def _json_ready(value: Any) -> Any:

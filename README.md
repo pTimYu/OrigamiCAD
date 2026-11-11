@@ -20,24 +20,29 @@ result = solve_kinematics(model, final_dihedral=135.0, steps=3, tol=1e-10)
 `solve_kinematics` uses a hybrid algorithm by default: take `steps=3` tangent
 steps from the flat 180-degree coordinates toward `final_dihedral`, then refine
 the predicted coordinates with the nonlinear solver. There is no nonlinear
-starting-pose solve. Set `steps` to any nonnegative integer; `steps=0` runs the
-original direct nonlinear solve at the requested angle. Each tangent step uses
+starting-pose solve. Set `steps` to any nonnegative integer; `steps=0` solves
+directly at the requested angle from a height guess. Each tangent step uses
 the sparse analytic Jacobian to solve the first-order constraint equations,
 without nonlinear correction between steps. If tangent prediction fails, the
 solver falls back to the direct endpoint guess.
 
 `max_nfev` defaults to 5000 evaluations for final refinement.
-`result["report"].nfev` counts that nonlinear stage; tangent LSMR iterations
-are counted separately. `result["hybrid"]` contains `requested_steps`,
-`completed_steps`, `initial_nfev`, `refinement_nfev`, `linear_iterations`,
-and `fallback_reason` (`None` when no fallback was needed). `initial_nfev` is
-retained for compatibility and is always zero.
+`result["report"].nfev` counts that nonlinear stage; tangent steps are not
+counted in it. `result["hybrid"]` contains `requested_steps`,
+`completed_steps`, `refinement_nfev`, `linear_iterations`, and
+`fallback_reason` (`None` when no fallback was needed). `linear_iterations`
+counts tangent LSMR iterations and is zero with the default direct solver.
 
-Sparse solves use fixed LSMR inner settings: `atol=btol=1e-10` and
-`maxiter=5000`. The outer stopping tolerance remains `tol=1e-10` by default,
-and final refinement owns the full `max_nfev` budget. Dense solves are
-unaffected. The kinematics report describes final refinement at the requested
-angle. `Cadder.solve` remains the generic nonlinear solver.
+Both stages use `linear_solver="direct"` by default. Each tangent step and
+each step of the trust-region Gauss-Newton refinement factorizes the sparse
+normal equations once. Pass `linear_solver="lsmr"` to `solve_kinematics` or
+`Cadder.solve` for the iterative LSMR solver instead (`atol=btol=1e-10`,
+`maxiter=5000`), which refines inside SciPy's trust-region solver; it is
+several times slower on large patterns and is also what a direct step falls
+back to if its factorization fails. Both stop on the same `tol=1e-10` tests by
+default, and final refinement owns the full `max_nfev` budget. The kinematics report describes
+final refinement at the requested angle. `Cadder.solve` remains the generic
+nonlinear solver.
 
 `Cadder.solve` and `solve_kinematics` use `x_scale="jac"` by default to scale
 coordinate updates using Jacobian column norms. Pass `x_scale=1.0` to disable
@@ -89,9 +94,7 @@ Consistent shared references are valid even with `strict_unique_edges=True`.
 Conflicting fold assignments or adjacent panels raise before constraints are
 added; strict mode also rejects missing geometry. `constraint_info` reports
 `num_shared_crease_references` and `shared_crease_references`, counting
-references beyond the first owner. The older
-duplicate-constraint fields remain available and are zero/empty because no
-duplicate equations are created. Local ownership is retained for cavity,
+references beyond the first owner. Local ownership is retained for cavity,
 hole-boundary, and insertion operations.
 
 Mountain/valley classifications come from the 2D builder's `triangle_kinds`
@@ -208,23 +211,31 @@ J_constraint = model.constraint_jacobian(constraint_id, sparse=False)
 
 Rows follow `residual_vector()` order. Columns follow the coordinate vector
 `[x0, y0, z0, x1, y1, z1, ...]`, including all model points for an individual
-constraint. The builder covers bar lengths, fixed coordinates, parallel lines
-and surfaces, all three dihedral residuals, coplanarity, horizontal surfaces,
-and surface heights. Fixed-point helpers create three fixed-coordinate rows.
+constraint. The constraint kinds are bar lengths, fixed coordinates, signed
+dihedral increments, horizontal surfaces, and surface heights. Fixed-point
+helpers create three fixed-coordinate rows.
 
-`Cadder.solve()` uses the sparse analytic Jacobian by default. Set
-`use_jac_sparsity=False` for dense derivatives or `use_analytic_jacobian=False`
-to use SciPy finite differences. `model.numerical_jacobian()` retains independent
-central differences for derivative checks. Rank and mobility diagnostics use
-the analytic Jacobian. Derivatives at degenerate geometry or the discontinuity
-of a wrapped angle residual raise `ValueError`; surface-normal derivatives
-assume the selected non-collinear vertex triplet stays the same locally.
+`Cadder.solve()` always uses the sparse analytic Jacobian, and so do the rank
+and mobility diagnostics. `Cadder.solve()` skips those diagnostics unless
+`compute_rank=True` is passed, because the dense rank is slow for large
+models. Derivatives at degenerate geometry or the discontinuity of a wrapped
+angle residual raise `ValueError`.
 
 Each solve compiles point indices and sparse assembly structure once. Residuals
-and Jacobians batch common constraint types and share geometry at identical trial
-coordinates, without writing those coordinates into the model. Other constraint
-types retain their scalar formulas. The plan is discarded after solving; public
-evaluations outside a solve observe direct edits to points and constraints.
+and Jacobians evaluate every constraint kind as one array operation and share
+geometry at identical trial coordinates, without writing those coordinates
+into the model. The plan is discarded after solving; public evaluations
+outside a solve observe direct edits to points and constraints.
+
+`minimum_panel_clearance(model)` returns the smallest gap between panels that
+do not share an edge, the pair it occurs at, and whether any panels pass
+through each other:
+
+```python
+from origamicad.patterns.hexagon import minimum_panel_clearance
+
+gap, closest_pair, clipping = minimum_panel_clearance(model)
+```
 
 Run the derivative and solver checks with:
 
@@ -239,10 +250,14 @@ origamicad/
   core/                 # generic 2D/3D models and constraint solver
     jacobian.py         # analytic per-constraint and assembled Jacobians
     _evaluation.py      # solve-scoped constraint batches and sparse assembly
+    _direct.py          # trust-region solver with sparse direct linear solves
+    clearance.py        # gaps and intersections between folded panels
   patterns/
     hexagon/
       layout.py         # hexagon geometry and metadata generation
       kinematics.py     # hexagon-specific constraint setup and solving
+      stacking.py       # layer stacks from solved models or 2D patterns
+      insertion_simulation.py  # contact/snap insertion folding
       metadata.py       # shared hexagon metadata types
   io/                   # JSON, DXF, STL, and STEP export
 ```

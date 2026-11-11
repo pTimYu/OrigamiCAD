@@ -1,18 +1,54 @@
-# two_d_drawer.py
-
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Literal
 import json
+import math
+from typing import Dict, List, Literal, Optional, Tuple
+
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.lines import Line2D as MplLine2D
 from matplotlib.patches import Circle
-import math
 
+from .._validation import finite, integer
 
 LineKind = Literal["valley", "mountain", "side", "rigid", "construction"]
+
+# Matplotlib style of every line kind, and the legend labels in legend order.
+LINE_STYLES = {
+    "valley": {"color": "blue", "linestyle": "--", "linewidth": 1.8},
+    "mountain": {"color": "red", "linestyle": "-.", "linewidth": 1.8},
+    "side": {"color": "black", "linestyle": "-", "linewidth": 2.2},
+    "rigid": {"color": "black", "linestyle": "-", "linewidth": 1.0},
+    "construction": {"color": "gray", "linestyle": ":", "linewidth": 1.0},
+}
+_LINE_LABELS = {
+    "side": "Side",
+    "valley": "Valley crease",
+    "mountain": "Mountain crease",
+    "rigid": "Rigid line",
+    "construction": "Construction line",
+}
+
+
+def line_style(kind: str) -> dict:
+    """Return the drawing style shared by the 2D and 3D previews."""
+    try:
+        return LINE_STYLES[kind]
+    except KeyError:
+        raise ValueError(f"Unknown line kind: {kind}") from None
+
+
+def add_line_legend(ax, kinds) -> None:
+    """Add a legend for the line kinds that are present."""
+    handles = [
+        MplLine2D([0], [0], label=label, **LINE_STYLES[kind])
+        for kind, label in _LINE_LABELS.items()
+        if kind in kinds
+    ]
+    if handles:
+        ax.legend(handles=handles, loc="best")
 
 
 @dataclass
@@ -197,13 +233,8 @@ class TwoDDrawer:
             raise ValueError(f"Point '{point_id}' does not exist.")
 
     def _check_line_kind(self, kind: str) -> None:
-        allowed = {"valley", "mountain", "side", "rigid", "construction"}
-        if kind not in allowed:
-            raise ValueError(f"Invalid line kind '{kind}'. Allowed: {allowed}")
-
-    @staticmethod
-    def _is_crease_kind(kind: LineKind) -> bool:
-        return kind in {"valley", "mountain"}
+        if kind not in LINE_STYLES:
+            raise ValueError(f"Invalid line kind '{kind}'. Allowed: {set(LINE_STYLES)}")
 
     @staticmethod
     def _canonical_line_key(start: str, end: str) -> Tuple[str, str]:
@@ -226,51 +257,30 @@ class TwoDDrawer:
         """
         return tuple(sorted(vertices))
 
+    @staticmethod
     def _resolve_overlapped_line_kind(
-        self,
         existing_kind: LineKind,
         new_kind: LineKind,
     ) -> LineKind:
         """
         Decide the final line kind when a new line overlaps an existing line.
 
-        Rules:
-            1. Same kind -> keep it.
-            2. Existing construction -> replace by new kind.
-            3. New construction -> keep existing kind.
-            4. Valley vs mountain conflict -> raise error.
-            5. Crease beats non-crease.
-            6. Non-crease vs non-crease -> keep existing kind.
+        Construction lines yield to every other kind, a crease replaces a
+        side or rigid line, and otherwise the existing kind stays. A valley
+        drawn over a mountain (or the reverse) is an error.
         """
-        if existing_kind == new_kind:
+        if existing_kind == new_kind or new_kind == "construction":
             return existing_kind
-
-        # Construction has the lowest priority.
         if existing_kind == "construction":
             return new_kind
 
-        if new_kind == "construction":
-            return existing_kind
-
-        existing_is_crease = self._is_crease_kind(existing_kind)
-        new_is_crease = self._is_crease_kind(new_kind)
-
-        # Valley/mountain conflict.
-        if existing_is_crease and new_is_crease and existing_kind != new_kind:
+        creases = {"valley", "mountain"}
+        if existing_kind in creases and new_kind in creases:
             raise ValueError(
                 f"Conflicting crease assignment: existing line is "
                 f"'{existing_kind}', but new line is '{new_kind}'."
             )
-
-        # Crease type has higher priority than side/rigid/construction.
-        if existing_is_crease and not new_is_crease:
-            return existing_kind
-
-        if new_is_crease and not existing_is_crease:
-            return new_kind
-
-        # Example: side vs rigid. Neither is a crease, so keep existing.
-        return existing_kind
+        return new_kind if new_kind in creases else existing_kind
 
     # ------------------------------------------------------------
     # Find existing objects
@@ -459,12 +469,9 @@ class TwoDDrawer:
 
         if existing_line_id is not None:
             existing_line = self.lines[existing_line_id]
-            resolved_kind = self._resolve_overlapped_line_kind(
-                existing_line.kind,
-                kind,
+            existing_line.kind = self._resolve_overlapped_line_kind(
+                existing_line.kind, kind,
             )
-
-            existing_line.kind = resolved_kind
             return existing_line_id
 
         if line_id is None:
@@ -615,16 +622,11 @@ class TwoDDrawer:
         The cut is represented by side lines around a regular polygon so it
         remains available to the existing 2D and CAD exporters. The hole
         metadata is also retained for drawing and JSON round-tripping.
-        Pass ``surface_id`` to attach the cut to a panel for folding and
-        export as an inner face boundary in 3D.
+        Pass ``surface_id`` to attach the cut to a panel for folding,
+        stacking, and export as an inner face boundary in 3D.
         """
-        if not math.isfinite(float(diameter)) or float(diameter) <= 0:
-            raise ValueError("diameter must be a finite positive value.")
-        if isinstance(segments, bool) or int(segments) != segments:
-            raise ValueError("segments must be an integer.")
-        segments = int(segments)
-        if segments < 8:
-            raise ValueError("segments must be at least 8.")
+        diameter = finite("diameter", diameter, positive=True)
+        segments = integer("segments", segments, minimum=8)
         if surface_id is not None and surface_id not in self.surfaces:
             raise ValueError(f"Surface '{surface_id}' does not exist.")
 
@@ -634,30 +636,22 @@ class TwoDDrawer:
             raise ValueError(f"Hole id '{hole_id}' already exists.")
 
         cx, cy = float(center[0]), float(center[1])
-        radius = float(diameter) / 2.0
-        point_ids: list[str] = []
-        for index in range(segments):
-            angle = 2.0 * math.pi * index / segments
-            point_ids.append(
-                self.add_point(
-                    cx + radius * math.cos(angle),
-                    cy + radius * math.sin(angle),
-                    point_id=f"{hole_id}_p{index}",
-                )
+        radius = diameter / 2.0
+        point_ids = [
+            self.add_point(
+                cx + radius * math.cos(2.0 * math.pi * index / segments),
+                cy + radius * math.sin(2.0 * math.pi * index / segments),
+                point_id=f"{hole_id}_p{index}",
             )
-
-        for index in range(segments):
-            self.add_line(
-                point_ids[index],
-                point_ids[(index + 1) % segments],
-                kind="side",
-            )
+            for index in range(segments)
+        ]
+        self._add_boundary_lines(point_ids, "side")
 
         self.hole_punches.append(
             {
                 "id": hole_id,
                 "center": [cx, cy],
-                "diameter": float(diameter),
+                "diameter": diameter,
                 "segments": segments,
             }
         )
@@ -670,30 +664,10 @@ class TwoDDrawer:
     # ------------------------------------------------------------
 
     def count_lines_by_kind(self) -> Dict[str, int]:
-        """
-        Count all line objects by their kind.
-
-        Returns:
-            Dictionary like:
-            {
-                "valley": 2,
-                "mountain": 3,
-                "side": 10,
-                "rigid": 1,
-                "construction": 0
-            }
-        """
-        counts = {
-            "valley": 0,
-            "mountain": 0,
-            "side": 0,
-            "rigid": 0,
-            "construction": 0,
-        }
-
+        """Count all line objects by kind, including kinds with no lines."""
+        counts = dict.fromkeys(LINE_STYLES, 0)
         for line in self.lines.values():
             counts[line.kind] += 1
-
         return counts
 
     def count_creases(self) -> int:
@@ -723,16 +697,11 @@ class TwoDDrawer:
         Return a compact summary of the current pattern.
         """
         line_counts = self.count_lines_by_kind()
-
         return {
             "num_points": len(self.points),
             "num_lines": len(self.lines),
             "num_surfaces": len(self.surfaces),
-            "num_creases": (
-                line_counts["valley"] + line_counts["mountain"]
-                if getattr(self.count_creases, "__func__", None) is TwoDDrawer.count_creases
-                else self.count_creases()
-            ),
+            "num_creases": line_counts["valley"] + line_counts["mountain"],
             "num_valley_creases": line_counts["valley"],
             "num_mountain_creases": line_counts["mountain"],
             "line_counts": line_counts,
@@ -809,49 +778,23 @@ class TwoDDrawer:
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
 
-    def to_dxf_string(
-        self,
-        include_creases: bool = True,
-        crease_style: (
-            Literal["solid", "dashed"] | list[object] | tuple[object, ...]
-        ) = "dashed",
-        include_construction: bool = False,
-        include_rigid: bool = True,
-        include_side: bool = True,
-        profile: Literal["solidworks"] = "solidworks",
-        connecting_dots: bool = False,
-    ) -> str:
-        """
-        Convert the current 2D metadata to an ASCII DXF string.
+    def to_dxf_string(self, **options) -> str:
+        """Convert the current pattern to an ASCII DXF string.
+
+        ``options`` are the keyword options of :meth:`save_dxf`.
         """
         from ..io.dxf_export import dxf_string_from_metadata
 
-        return dxf_string_from_metadata(
-            self.to_dict(),
-            include_creases=include_creases,
-            crease_style=crease_style,
-            include_construction=include_construction,
-            include_rigid=include_rigid,
-            include_side=include_side,
-            profile=profile,
-            connecting_dots=connecting_dots,
-        )
+        return dxf_string_from_metadata(self.to_dict(), **options)
 
-    def save_dxf(
-        self,
-        filename: str,
-        include_creases: bool = True,
-        crease_style: (
-            Literal["solid", "dashed"] | list[object] | tuple[object, ...]
-        ) = "dashed",
-        include_construction: bool = False,
-        include_rigid: bool = True,
-        include_side: bool = True,
-        profile: Literal["solidworks"] = "solidworks",
-        connecting_dots: bool = False,
-    ):
+    def save_dxf(self, filename: str, **options):
         """
         Save the current 2D pattern as a DXF file.
+
+        Options (see :func:`origamicad.io.dxf_string_from_metadata`):
+        ``include_creases=True``, ``crease_style="dashed"``,
+        ``include_construction=False``, ``include_rigid=True``,
+        ``include_side=True``, and ``connecting_dots=False``.
 
         Crease lines are exported on valley/mountain crease layers. Use
         crease_style="dashed" for a CAD linetype, or
@@ -867,17 +810,7 @@ class TwoDDrawer:
         """
         from ..io.dxf_export import save_dxf
 
-        return save_dxf(
-            self.to_dict(),
-            filename,
-            include_creases=include_creases,
-            crease_style=crease_style,
-            include_construction=include_construction,
-            include_rigid=include_rigid,
-            include_side=include_side,
-            profile=profile,
-            connecting_dots=connecting_dots,
-        )
+        return save_dxf(self.to_dict(), filename, **options)
 
     # ------------------------------------------------------------
     # Drawing
@@ -908,23 +841,28 @@ class TwoDDrawer:
         """
         fig, ax = plt.subplots(figsize=figsize)
 
-        # Draw surfaces first
-        for surface in self.surfaces.values():
-            coords = [self.points[pid] for pid in surface.vertices]
-            xs = [p.x for p in coords]
-            ys = [p.y for p in coords]
+        def xy(point_id):
+            point = self.points[point_id]
+            return point.x, point.y
 
-            # Close polygon
-            xs_closed = xs + [xs[0]]
-            ys_closed = ys + [ys[0]]
-
-            # Every surface is a rigid physical panel
-            ax.fill(xs, ys, alpha=0.15)
-            ax.plot(xs_closed, ys_closed, color="black", linewidth=0.8)
-
-            if show_surface_ids:
-                cx = sum(xs) / len(xs)
-                cy = sum(ys) / len(ys)
+        # Surfaces first: every surface is a rigid physical panel, tinted from
+        # the color cycle. Panels, outlines, and each line kind are drawn as
+        # one collection each instead of one artist per panel and line.
+        polygons = [
+            [xy(pid) for pid in surface.vertices] for surface in self.surfaces.values()
+        ]
+        if polygons:
+            ax.add_collection(PolyCollection(
+                polygons, alpha=0.15, edgecolors="none", zorder=1,
+                facecolors=[f"C{index % 10}" for index in range(len(polygons))],
+            ))
+            ax.add_collection(LineCollection(
+                [polygon + polygon[:1] for polygon in polygons],
+                colors="black", linewidths=0.8, zorder=2,
+            ))
+        if show_surface_ids:
+            for surface, polygon in zip(self.surfaces.values(), polygons):
+                cx, cy = (sum(values) / len(polygon) for values in zip(*polygon))
                 ax.text(cx, cy, surface.id, ha="center", va="center")
 
         # Mask the polygonal cut-line interiors so hole punches are visible
@@ -943,97 +881,43 @@ class TwoDDrawer:
             )
 
         # Draw lines
+        segments = {}
         for line in self.lines.values():
-            p0 = self.points[line.start]
-            p1 = self.points[line.end]
-
-            style = self._line_style(line.kind)
-            ax.plot([p0.x, p1.x], [p0.y, p1.y], **style)
-
+            p0, p1 = xy(line.start), xy(line.end)
+            segments.setdefault(line.kind, []).append((p0, p1))
             if show_line_ids:
-                mx = 0.5 * (p0.x + p1.x)
-                my = 0.5 * (p0.y + p1.y)
-                ax.text(mx, my, line.id, fontsize=8)
+                ax.text(0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1]), line.id, fontsize=8)
+        for kind, kind_segments in segments.items():
+            style = line_style(kind)
+            ax.add_collection(LineCollection(
+                kind_segments, colors=style["color"], linestyles=style["linestyle"],
+                linewidths=style["linewidth"], zorder=2,
+            ))
 
         # Draw points
-        if show_points:
-            for point in self.points.values():
-                ax.scatter(point.x, point.y, s=20, color="black")
-
-                if show_point_ids:
+        if show_points and self.points:
+            ax.scatter(
+                [point.x for point in self.points.values()],
+                [point.y for point in self.points.values()],
+                s=20, color="black",
+            )
+            if show_point_ids:
+                for point in self.points.values():
                     ax.text(
-                        point.x,
-                        point.y,
-                        f" {point.id}",
-                        fontsize=8,
-                        ha="left",
-                        va="bottom",
+                        point.x, point.y, f" {point.id}",
+                        fontsize=8, ha="left", va="bottom",
                     )
 
+        ax.autoscale_view()
         if equal_axis:
             ax.set_aspect("equal", adjustable="box")
 
         ax.set_xlabel(f"x [{self.unit}]")
         ax.set_ylabel(f"y [{self.unit}]")
         ax.grid(True, alpha=0.3)
-        self._add_line_legend(ax)
+        add_line_legend(ax, set(segments))
 
         if save_fig:
             plt.savefig(save_path, dpi=dpi)
 
         plt.show()
-
-    @staticmethod
-    def _line_style(kind: LineKind) -> dict:
-        """
-        Visual convention:
-            valley       -> blue dashed
-            mountain     -> red dash-dot
-            side         -> black solid thick
-            rigid        -> black solid thin
-            construction -> gray dotted
-        """
-        if kind == "valley":
-            return {"color": "blue", "linestyle": "--", "linewidth": 1.8}
-
-        if kind == "mountain":
-            return {"color": "red", "linestyle": "-.", "linewidth": 1.8}
-
-        if kind == "side":
-            return {"color": "black", "linestyle": "-", "linewidth": 2.2}
-
-        if kind == "rigid":
-            return {"color": "black", "linestyle": "-", "linewidth": 1.0}
-
-        if kind == "construction":
-            return {"color": "gray", "linestyle": ":", "linewidth": 1.0}
-
-        raise ValueError(f"Unknown line kind: {kind}")
-
-    def _add_line_legend(self, ax) -> None:
-        """
-        Add a legend for the line kinds present in the pattern.
-        """
-        labels = {
-            "side": "Side",
-            "valley": "Valley crease",
-            "mountain": "Mountain crease",
-            "rigid": "Rigid line",
-            "construction": "Construction line",
-        }
-        kind_order: Tuple[LineKind, ...] = (
-            "side",
-            "valley",
-            "mountain",
-            "rigid",
-            "construction",
-        )
-        present_kinds = {line.kind for line in self.lines.values()}
-        handles = [
-            MplLine2D([0], [0], label=labels[kind], **self._line_style(kind))
-            for kind in kind_order
-            if kind in present_kinds
-        ]
-
-        if handles:
-            ax.legend(handles=handles, loc="best")

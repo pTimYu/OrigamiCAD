@@ -42,7 +42,6 @@ def main() -> None:
         include_rigid=True,
         include_side=True,
         point_tol=1e-6,
-        profile="solidworks",
     )
     print(f"Saved insertion projection DXF to {saved_path}")
 
