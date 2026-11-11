@@ -211,14 +211,23 @@ class _HexagonKinematics:
         pinned_z = {}
         for tri_id in triangle_ids:
             if triangle_kinds[tri_id] == "valley":
+                constraint_id = f"valley_z_{tri_id}"
+                created = constraint_id not in self.constraints
                 cid = self.add_surface_z_value_constraint(
                     tri_id,
                     z_value=valley_z,
-                    constraint_id=f"valley_z_{tri_id}",
+                    constraint_id=constraint_id,
                 )
                 constraint = self.constraints[cid]
                 if (constraint.kind == "surface_z_value"
                         and constraint.data["surface"] == tri_id):
+                    if created:
+                        constraint.data["from_valley_z"] = True
+                    elif constraint.data.get("from_valley_z"):
+                        # Repeated setup: follow a changed valley_z. A height
+                        # constraint the caller added under this ID is theirs
+                        # and keeps its own value.
+                        constraint.data["z_value"] = float(valley_z)
                     # Equal absolute vertex heights already imply every
                     # horizontal-surface equation for this triangle.
                     for pid in self._surface_vertices(tri_id):
@@ -229,12 +238,13 @@ class _HexagonKinematics:
                 constraint_id=f"horizontal_{tri_id}",
             )
 
-        for cid in frame_constraint_ids:
+        for cid in [cid for cid in self.constraints if cid.startswith("hex_frame_")]:
             data = self.constraints[cid].data
-            if (data["axis"] == "z" and data["point"] in pinned_z
-                    and data["value"] == pinned_z[data["point"]]):
-                # Only remove exact duplicates created for this frame.
-                # Different target heights must retain their conflict.
+            if data["axis"] == "z" and data["point"] in pinned_z:
+                # The frame only removes rigid-body motion, and a pinned
+                # height already does that for this coordinate. Keeping the
+                # frame's own height as well would fight valley_z whenever
+                # the two differ.
                 del self.constraints[cid]
 
         dihedral_info = self._add_dihedral_constraints_from_metadata(
@@ -682,8 +692,11 @@ def solve_kinematics(
     time, and the tangent steps start from the angle the model is currently
     folded to rather than from 180 degrees. If the hinges of the starting
     coordinates are not at one common angle, prediction is skipped and
-    ``result["hybrid"]["fallback_reason"]`` says so. ``valley_z`` is fixed by
-    the first solve; later calls do not change it.
+    ``result["hybrid"]["fallback_reason"]`` says so.
+
+    ``valley_z`` is the height the valley panels are pinned to. It need not
+    match the pattern's current height, and a later call with a different
+    value moves the panels there.
 
     Hole contours move with their host panels and add no independent solver
     variables. ``report.x`` includes the restored hole points in the model's

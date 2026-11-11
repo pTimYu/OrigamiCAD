@@ -63,7 +63,7 @@ solve_kinematics(model, final_dihedral=120.0)   # continues from 150 degrees
 
 The second call retargets the existing constraints instead of adding them
 again, and its tangent steps start from the angle the model is currently
-folded to. `valley_z` is fixed by the first solve.
+folded to. A different `valley_z` moves the valley panels to the new height.
 
 Hexagon patterns store each physical hinge once in `pattern.hex_creases`
 (and `model.hex_creases` after conversion). Each unit's `local_creases` list
@@ -110,9 +110,12 @@ geometry or metadata trigger validation and rebuilding before reuse. Plan
 snapshots are private, derived data; JSON retains the existing metadata format.
 
 Valley triangles use absolute vertex-height constraints, which also enforce
-their horizontality. The solver omits the implied horizontal equations and any
-new reference-frame Z equations with exactly the same target. Existing user
-constraints and conflicting height targets are retained.
+their horizontality, at the height given by `valley_z` (default `0.0`). The
+solver omits the implied horizontal equations and the reference frame's Z
+equations for those vertices, so the valley height is set by `valley_z` alone
+and need not match the pattern's current height. Existing user constraints are
+retained, including a height constraint the caller added under a
+`valley_z_<triangle>` ID, which keeps its own value.
 
 `solve_kinematics` returns after folding, without calculating Jacobian rank or
 mobility. Its `result["report"].rank` and `.mobility` fields are `-1`, meaning
