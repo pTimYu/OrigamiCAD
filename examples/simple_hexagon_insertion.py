@@ -1,4 +1,8 @@
-"""Run the spatial multi-loop hexagon insertion simulation.
+"""Run the snap-through insertion simulation on a hexagon loop pattern.
+
+The pattern is folded to the cavity angle, the innermost unit chain is held
+at that angle, and a uniform pressure squeezes the outer boundary until the
+other panels snap through.
 
 Run from the project root:
 
@@ -14,7 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from origamicad.patterns.hexagon import (
     draw_insertion_simulation,
-    draw_insertion_stack_3d,
     print_insertion_report,
     simulate_insertion,
 )
@@ -22,47 +25,31 @@ from origamicad.patterns.hexagon import (
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 SIDE_LENGTH = 15.0
-# Exact contact-panel target; snap panels receive its supplementary angle.
-REQUESTED_INNER_DIHEDRAL_DEG = 135.0
+# Dihedral angle at which the held cavity panels stay for the whole simulation.
+INNER_DIHEDRAL_DEG = 135.0
 NUM_LOOPS = 2
 NUM_LAYERS = 4
 
 
 def main() -> None:
     result = simulate_insertion(
-        inner_dihedral_deg=REQUESTED_INNER_DIHEDRAL_DEG,
+        inner_dihedral_deg=INNER_DIHEDRAL_DEG,
         num_loops=NUM_LOOPS,
         num_layers=NUM_LAYERS,
         side_length=SIDE_LENGTH,
+        # Crease stiffness per unit length, and how stiff panels are relative
+        # to creases. Pressures in the report scale with the crease stiffness.
+        hinge_stiffness=1.0,
+        panel_stiffness_ratio=1e3,
         verbose=False,
     )
     print("")
     print_insertion_report(result)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # step_path = OUTPUT_DIR / "simple_hexagon_insertion_4layer_abaqus.step"
-    # result["assembly"].save_step(
-    #     str(step_path),
-    #     thickness=0.0,
-    #     separate_layer_parts=True,
-    # )
-    # print(f"Saved four-part Abaqus STEP:   {step_path}")
 
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     drawing_path = OUTPUT_DIR / "simple_hexagon_insertion_135.png"
-    draw_insertion_simulation(
-        result,
-        save_path=drawing_path,
-        show=True,
-    )
-    print(f"Saved drawing:                 {drawing_path}")
-    stack_drawing_path = (
-        OUTPUT_DIR / "simple_hexagon_insertion_4layer_3d.png"
-    )
-    draw_insertion_stack_3d(
-        result,
-        # save_path=stack_drawing_path,
-        show=False,
-    )
-    # print(f"Saved 3D stack drawing:        {stack_drawing_path}")
+    draw_insertion_simulation(result, save_path=drawing_path, show=True)
+    print(f"Saved drawing:                    {drawing_path}")
 
 
 if __name__ == "__main__":

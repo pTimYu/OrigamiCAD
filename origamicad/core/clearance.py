@@ -84,7 +84,7 @@ def _point_triangle_distance(point, a, b, c) -> float:
             _point_segment_distance(point, c, a),
         )
     inverse = 1.0 / denominator
-    return float(np.linalg.norm(point - (a + ab * (vb * inverse) + ac * (va * inverse))))
+    return float(np.linalg.norm(point - (a + ab * (vb * inverse) + ac * (vc * inverse))))
 
 
 def _segment_triangle_intersections(start, end, a, b, c, tolerance=1e-10):

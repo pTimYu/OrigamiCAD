@@ -1,33 +1,40 @@
-"""Sequential contact/snap insertion simulation for the hexagon pattern.
+"""Snap-through insertion simulation for the hexagon pattern.
 
-Physical parallelograms are labelled with insertion-only metadata.  The
-innermost ring is ``contact``.  Each later ring is processed once, from inner
-to outer: connection panels are ``snap``; panels sharing a connection panel's
-outward triangle are ``contact``; all remaining panels are ``snap``.  Contact
-panels use the requested inner dihedral and snap panels use its supplement.
+The structure starts folded uniformly at the cavity angle. Constraints hold
+the cavity while an evenly distributed in-plane pressure squeezes the outer
+boundary. Panels are slightly compliant, creases are rotational springs, and
+panels cannot pass through each other, so which panels snap through 90
+degrees, and where they come to rest, is the result of the mechanics.
 
-The returned state is checked for non-adjacent panel clipping.
+The model follows the bar-and-hinge formulation of Liu and Paulino and the
+rigid-panel, hinge-spring description of this pattern family by Jamalimehr
+et al.; holding selected panels while the rest snap follows Almessabi et al.
 """
 
 from __future__ import annotations
 
 import copy
-from collections import defaultdict, deque
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Callable, Iterable, Literal, Optional, TypedDict
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import PolyCollection
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from scipy.optimize import Bounds, LinearConstraint, milp
 
 from ..._validation import finite, integer
-from ...core.cadder import Cadder
+from ...core._evaluation import CompiledConstraints
+from ...core.cadder import Cadder, Constraint
 from ...core.clearance import minimum_panel_clearance
+from ...core.contact import ContactBarrier
+from ...core.equilibrium import LoadPath, lowest_modes, ramp_load, solve_equilibrium
+from ...core.mechanics import AreaPotential, MechanicalModel
+from ...core.panel_holes import hole_attachments, panel_only_geometry, place_holes
+from ...core.topology import boundary_loops, loop_area
 from ...core.two_d_drawer import TwoDDrawer
-from .kinematics import _HexagonKinematics, dihedral_constraint_id
+from .closure import close_open_pattern
+from .kinematics import dihedral_constraint_id, solve_kinematics
 from .layout import draw_hex_loops
 from .metadata import iter_local_creases
 from .stacking import stack_layers
@@ -37,65 +44,79 @@ DEFAULT_SIDE_LENGTH = 15.0
 DEFAULT_INNER_DIHEDRAL_DEG = 150.0
 DEFAULT_NUM_LOOPS = 2
 DEFAULT_NUM_LAYERS = 4
-_FIXED_TRIANGLE = "tri_0_1"
+_SIGNED = "dihedral_signed_increment"
 
-PanelState = Literal["contact", "snap"]
-PanelStateSource = Literal[
-    "inner",
-    "connection",
-    "same_outer_triangle",
-    "remaining",
-    "closure_adjustment",
-]
+PanelState = Literal["contact", "snap", "partial"]
 
 
 class InsertionPanelState(TypedDict):
-    """Insertion-only state assigned to one physical parallelogram."""
+    """Simulated state of one parallelogram.
+
+    ``contact`` panels kept their obtuse creases, ``snap`` panels passed
+    through 90 degrees on every crease, and ``partial`` panels did so on only
+    some. ``held`` panels belong to the constrained cavity.
+    """
 
     surface_id: str
-    ring_index: int
     state: PanelState
-    requested_state: PanelState
-    source: PanelStateSource
+    held: bool
+    dihedrals_deg: tuple[float, ...]
     adjacent_triangle_ids: tuple[str, ...]
 
 
-class LoopDihedralStats(TypedDict):
-    """Measured contact/snap dihedrals for one planar loop."""
+class SnapEvent(TypedDict):
+    """One change of the set of acute creases during the pressure ramp."""
 
-    loop_index: int
-    contact_mean_deg: float | None
-    snap_mean_deg: float | None
-    num_contact_hinges: int
-    num_snap_hinges: int
+    pressure: float
+    snapped_panel_ids: tuple[str, ...]
+    released_panel_ids: tuple[str, ...]
+    energy_released: float
+    area_before: float
+    area_after: float
+
+
+class PathPoint(TypedDict):
+    """One equilibrium of the pressure ramp."""
+
+    pressure: float
+    energy: float
+    elastic_energy: float
+    area: float
+    lowest_eigenvalue: float
+    num_acute_creases: int
 
 
 class InsertionSimulationResult(TypedDict):
     """Geometry and diagnostics returned by :func:`simulate_insertion`."""
 
     model: Cadder
-    assembly: Cadder
+    assembly: Optional[Cadder]
     pattern: TwoDDrawer
-    status: Literal["panel_contact", "compact_nonclipping"]
+    status: Literal["panel_contact", "compact_nonclipping", "no_snap"]
     reason: str
     contact_dihedral_deg: float
     snap_dihedral_deg: float
-    num_loops: int
     num_layers: int
     side_length: float
-    layer_height: float
-    max_interface_error: float
-    max_solve_residual: float
-    feasibility_tolerance: float
+    layer_height: Optional[float]
+    max_interface_error: Optional[float]
+    final_pressure: float
+    highest_pressure: float
+    stop_reason: str
+    snap_events: list[SnapEvent]
+    path: list[PathPoint]
+    rigid_compatible: bool
+    max_panel_strain: float
+    stable_without_load: Optional[bool]
     minimum_panel_gap: float
     closest_panel_pair: tuple[str, str] | None
     contact_detected: bool
     panel_states: dict[str, InsertionPanelState]
     contact_panel_ids: frozenset[str]
     snap_panel_ids: frozenset[str]
-    crease_ring_by_edge: dict[tuple[str, str], int]
-    crease_assignment_by_edge: dict[tuple[str, str], PanelState]
-    loop_dihedrals: list[LoopDihedralStats]
+    held_panel_ids: frozenset[str]
+    crease_assignment_by_edge: dict[tuple[str, str], str]
+    closed_model: Optional[Cadder]
 
 
 def _canonical_edge(point_a: str, point_b: str) -> tuple[str, str]:
@@ -109,467 +130,234 @@ def _angle(name: str, value: float, lower: float, upper: float) -> float:
     return angle
 
 
-def classify_insertion_panel_states(
-    pattern: TwoDDrawer,
-) -> dict[str, InsertionPanelState]:
-    """Propagate contact/snap parallelogram states from inner to outer.
-
-    This metadata belongs only to the insertion workflow.  Unit-chain rings
-    are found by breadth-first traversal from unit 0.  A physical surface is
-    owned by the innermost ring containing it, so processing a later ring can
-    never rewrite a state already assigned to an inner ring.
-
-    Ring 0 starts with every parallelogram in ``contact``.  In each later ring:
-
-    * a parallelogram adjacent to a triangle owned by an inner ring is a
-      ``snap`` connection panel;
-    * other panels sharing the connection panel's outward triangle are
-      ``contact`` panels;
-    * all remaining panels in that ring are ``snap`` panels.
-    """
-    if not pattern.hex_units:
-        raise ValueError(
-            "No hex-unit metadata found for insertion panel propagation."
-        )
-    units_by_count = {int(unit["count"]): unit for unit in pattern.hex_units}
-    if len(units_by_count) != len(pattern.hex_units):
-        raise ValueError("Hex-unit counts must be unique.")
-    if 0 not in units_by_count:
-        raise ValueError("Insertion propagation requires innermost unit 0.")
-
-    surface_units: dict[str, set[int]] = defaultdict(set)
-    for unit_count, unit in units_by_count.items():
-        for surface_id in unit["surfaces"]:
-            surface_units[surface_id].add(unit_count)
-    unit_neighbors: dict[int, set[int]] = defaultdict(set)
-    for unit_counts in surface_units.values():
-        for unit_count in unit_counts:
-            unit_neighbors[unit_count].update(unit_counts - {unit_count})
-
-    unit_ring = {0: 0}
-    queue: deque[int] = deque([0])
-    while queue:
-        unit_count = queue.popleft()
-        for neighbor in sorted(unit_neighbors[unit_count]):
-            if neighbor not in unit_ring:
-                unit_ring[neighbor] = unit_ring[unit_count] + 1
-                queue.append(neighbor)
-    missing_units = set(units_by_count) - set(unit_ring)
-    if missing_units:
-        raise ValueError(
-            "Hex-unit insertion topology is disconnected; unreachable units: "
-            f"{sorted(missing_units)}."
-        )
-
-    surface_ring = {
-        surface_id: min(unit_ring[unit_count] for unit_count in unit_counts)
-        for surface_id, unit_counts in surface_units.items()
-    }
-    parallelogram_ids = {
-        surface_id
-        for unit in pattern.hex_units
-        for surface_id in unit["parallelograms"]
-    }
-    quad_triangles: dict[str, set[str]] = defaultdict(set)
-    for unit in pattern.hex_units:
-        for crease in iter_local_creases(pattern, unit):
-            quad_triangles[crease["quad"]].add(crease["triangle"])
-
-    states: dict[str, InsertionPanelState] = {}
-
-    def assign(surface_ids, ring_index: int, state: PanelState, source: PanelStateSource):
-        for surface_id in sorted(surface_ids):
-            states[surface_id] = {
-                "surface_id": surface_id,
-                "ring_index": ring_index,
-                "state": state,
-                "requested_state": state,
-                "source": source,
-                "adjacent_triangle_ids": tuple(sorted(quad_triangles[surface_id])),
-            }
-
-    for ring_index in range(max(unit_ring.values()) + 1):
-        ring_panels = {
-            surface_id
-            for surface_id in parallelogram_ids
-            if surface_ring[surface_id] == ring_index
-        }
-        if ring_index == 0:
-            assign(ring_panels, 0, "contact", "inner")
-            continue
-        connection_panels = {
-            surface_id
-            for surface_id in ring_panels
-            if any(
-                surface_ring[triangle_id] < ring_index
-                for triangle_id in quad_triangles[surface_id]
-            )
-        }
-        if ring_panels and not connection_panels:
-            raise RuntimeError(
-                f"Insertion ring {ring_index} has no connection panels."
-            )
-        outward_triangles = {
-            triangle_id
-            for surface_id in connection_panels
-            for triangle_id in quad_triangles[surface_id]
-            if surface_ring[triangle_id] == ring_index
-        }
-        same_triangle_panels = {
-            surface_id
-            for surface_id in ring_panels - connection_panels
-            if quad_triangles[surface_id] & outward_triangles
-        }
-        assign(connection_panels, ring_index, "snap", "connection")
-        assign(same_triangle_panels, ring_index, "contact", "same_outer_triangle")
-        assign(
-            ring_panels - connection_panels - same_triangle_panels,
-            ring_index, "snap", "remaining",
-        )
-    return states
+def _infer_side_length(pattern: TwoDDrawer) -> float:
+    """Measure the hexagon side length from the crease pattern."""
+    lengths = [
+        float(np.hypot(
+            pattern.points[crease["edge"][1]].x - pattern.points[crease["edge"][0]].x,
+            pattern.points[crease["edge"][1]].y - pattern.points[crease["edge"][0]].y,
+        ))
+        for crease in pattern.hex_creases.values()
+    ]
+    if not lengths:
+        raise ValueError("The insertion model has no crease metadata.")
+    return float(np.mean(lengths))
 
 
-def _quad_crease_edges(pattern: TwoDDrawer) -> dict[str, dict[str, list[str]]]:
-    """Map every parallelogram to the crease edge it shares with each triangle."""
-    edges: dict[str, dict[str, list[str]]] = defaultdict(dict)
-    for unit in pattern.hex_units:
-        for crease in iter_local_creases(pattern, unit):
-            edges[crease["quad"]][crease["triangle"]] = crease["edge"]
-    return edges
-
-
-def _edge_midpoint(pattern: TwoDDrawer, edge) -> np.ndarray:
-    return np.mean(
-        [(pattern.points[pid].x, pattern.points[pid].y) for pid in edge], axis=0,
-    )
-
-
-def _panel_width_vectors(
-    pattern: TwoDDrawer,
-    quad_edges: dict[str, dict[str, list[str]]],
-) -> dict[int, dict[str, np.ndarray]]:
-    """Return, per unit, each panel's flat vector between its two triangle edges."""
-    return {
-        int(unit["count"]): {
-            surface_id: (
-                _edge_midpoint(
-                    pattern, quad_edges[surface_id][unit["triangles"][(index + 1) % 6]],
-                )
-                - _edge_midpoint(pattern, quad_edges[surface_id][unit["triangles"][index]])
-            )
-            for index, surface_id in enumerate(unit["parallelograms"])
-        }
-        for unit in pattern.hex_units
-    }
-
-
-def _state_sign(panel: InsertionPanelState) -> float:
-    return 1.0 if panel["state"] == "contact" else -1.0
-
-
-def _reconcile_panel_states(
-    pattern: TwoDDrawer,
-    panel_states: dict[str, InsertionPanelState],
-    panel_vectors: dict[int, dict[str, np.ndarray]],
-    tolerance: float,
-) -> None:
-    """Resolve ambiguous outer-corner peers without rewriting inner rings.
-
-    The first surrounding ring follows the literal connection/contact/remain
-    rule.  On every later ring, snap panels already fixed on the completed
-    inner boundary act as the physical connections.  A binary closure solve
-    therefore selects the most-contact outer state compatible with those
-    frozen rings.  Any panel whose propagated request must change is recorded
-    explicitly as a ``closure_adjustment`` in insertion-only metadata.
-    """
-    unit_ring = {
-        int(unit["count"]): max(
-            panel_states[surface_id]["ring_index"]
-            for surface_id in unit["parallelograms"]
-        )
-        for unit in pattern.hex_units
-    }
-    maximum_ring = max(panel["ring_index"] for panel in panel_states.values())
-
-    for ring_index in range(1, maximum_ring + 1):
-        variable_ids = [] if ring_index == 1 else sorted(
-            surface_id
-            for surface_id, panel in panel_states.items()
-            if panel["ring_index"] == ring_index
-        )
-        variable_index = {sid: index for index, sid in enumerate(variable_ids)}
-        rows: list[np.ndarray] = []
-        targets: list[float] = []
-
-        for unit in pattern.hex_units:
-            count = int(unit["count"])
-            if unit_ring[count] > ring_index:
-                continue
-            for axis in range(2):
-                row = np.zeros(len(variable_ids), dtype=float)
-                fixed_sum = unknown_flat_sum = 0.0
-                for surface_id in unit["parallelograms"]:
-                    component = float(panel_vectors[count][surface_id][axis])
-                    variable = variable_index.get(surface_id)
-                    if variable is None:
-                        fixed_sum += _state_sign(panel_states[surface_id]) * component
-                    else:
-                        row[variable] += 2.0 * component
-                        unknown_flat_sum += component
-                rows.append(row)
-                targets.append(-fixed_sum + unknown_flat_sum)
-
-        if not variable_ids:
-            if any(abs(target) > tolerance for target in targets):
-                raise RuntimeError(
-                    f"Insertion ring {ring_index} cannot close while "
-                    "preserving completed inner-ring panel states."
-                )
-            continue
-
-        target_vector = np.asarray(targets, dtype=float)
-        result = milp(
-            c=-np.ones(len(variable_ids), dtype=float),
-            integrality=np.ones(len(variable_ids), dtype=int),
-            bounds=Bounds(np.zeros(len(variable_ids)), np.ones(len(variable_ids))),
-            constraints=LinearConstraint(
-                np.asarray(rows, dtype=float), target_vector, target_vector,
-            ),
-            options={"presolve": True},
-        )
-        if not result.success or result.x is None:
-            raise RuntimeError(
-                "Could not reconcile insertion ring "
-                f"{ring_index} with rigid unit-cell closure: {result.message}"
-            )
-
-        for surface_id, value in zip(variable_ids, result.x):
-            panel = panel_states[surface_id]
-            panel["state"] = "contact" if value >= 0.5 else "snap"
-            if panel["state"] != panel["requested_state"]:
-                panel["source"] = "closure_adjustment"
-
-
-def _closure_errors(
-    pattern: TwoDDrawer,
-    panel_states: dict[str, InsertionPanelState],
-    panel_vectors: dict[int, dict[str, np.ndarray]],
-    tolerance: float,
-) -> list[tuple[int, float]]:
-    """Return unit cells whose prescribed contact/snap projections cannot close.
-
-    Contact and snap dihedrals are supplementary, so their projected panel
-    widths have equal magnitudes and opposite signs.  Each rigid unit cell
-    must therefore have a zero signed sum of its six flat panel-width vectors.
-    This inexpensive geometric condition catches an incompatible state
-    sequence before the nonlinear solver stalls while compromising rigidity.
-    """
-    errors: list[tuple[int, float]] = []
-    for unit in pattern.hex_units:
-        count = int(unit["count"])
-        closure = np.zeros(2, dtype=float)
-        for surface_id in unit["parallelograms"]:
-            closure += _state_sign(panel_states[surface_id]) * panel_vectors[count][surface_id]
-        closure_error = float(np.linalg.norm(closure))
-        if closure_error > tolerance:
-            errors.append((count, closure_error))
-    return errors
-
-
-def _constraint_panel_ids(model: Cadder, pattern: TwoDDrawer) -> dict[str, str]:
-    """Map each physical dihedral constraint to its parallelogram."""
-    panel_by_constraint: dict[str, str] = {}
-    for unit in pattern.hex_units:
-        for crease in iter_local_creases(pattern, unit):
+def _crease_panels(model: Cadder) -> dict[str, tuple[str, str]]:
+    """Map each crease constraint ID to its (parallelogram, triangle)."""
+    panels: dict[str, tuple[str, str]] = {}
+    for unit in model.hex_units:
+        for crease in iter_local_creases(model, unit):
             constraint_id = dihedral_constraint_id(
                 int(unit["count"]), crease["local_index"], crease["side"],
             )
             if constraint_id in model.constraints:
-                panel_by_constraint[constraint_id] = crease["quad"]
-
+                panels[constraint_id] = (crease["quad"], crease["triangle"])
     missing = sorted(
-        constraint_id
-        for constraint_id, constraint in model.constraints.items()
-        if constraint.kind == "dihedral_signed_increment"
-        and constraint_id not in panel_by_constraint
+        cid for cid, constraint in model.constraints.items()
+        if constraint.kind == _SIGNED and cid not in panels
     )
     if missing:
-        raise RuntimeError(
-            f"Could not associate every insertion crease with a panel: {missing}."
+        raise RuntimeError(f"Could not associate every crease with a panel: {missing}.")
+    return panels
+
+
+def cavity_panel_ids(pattern) -> set[str]:
+    """Return the panels that border a cavity of the pattern.
+
+    A cavity is an inner boundary loop that is not the hexagonal void of a
+    single unit chain. Patterns without one, such as complete loop patterns,
+    return an empty set.
+    """
+    xy = {pid: (point.x, point.y) for pid, point in pattern.points.items()}
+    void_points = [set(unit["mid"]) for unit in pattern.hex_units if len(unit["mid"]) == 6]
+    cavity_edges = set()
+    for loop in boundary_loops(pattern, xy):
+        if loop_area(loop, xy) > 0 or set(loop) in void_points:
+            continue
+        cavity_edges.update(
+            _canonical_edge(start, end) for start, end in zip(loop, loop[1:] + loop[:1])
         )
-    return panel_by_constraint
+    panels = set()
+    for surface_id, surface in pattern.surfaces.items():
+        vertices = list(surface.vertices)
+        if any(
+            _canonical_edge(start, end) in cavity_edges
+            for start, end in zip(vertices, vertices[1:] + vertices[:1])
+        ):
+            panels.add(surface_id)
+    return panels
 
 
-def _hinge_rings(
-    model: Cadder,
-    panel_states: dict[str, InsertionPanelState],
-    panel_by_constraint: dict[str, str],
-) -> dict[tuple[str, str], int]:
-    """Assign each physical hinge to its insertion panel's planar ring."""
-    ring_by_edge: dict[tuple[str, str], int] = {}
-    for constraint_id, surface_id in panel_by_constraint.items():
-        data = model.constraints[constraint_id].data
-        edge = _canonical_edge(data["edge_start"], data["edge_end"])
-        ring_index = panel_states[surface_id]["ring_index"]
-        if ring_by_edge.setdefault(edge, ring_index) != ring_index:
-            raise RuntimeError(
-                f"Physical hinge {edge} was assigned to insertion rings "
-                f"{ring_by_edge[edge]} and {ring_index}."
-            )
-    if 0 not in ring_by_edge.values():
-        raise RuntimeError("Insertion topology has no inner-loop hinges.")
-    return ring_by_edge
+def _held_panels(pattern: TwoDDrawer, held) -> set[str]:
+    """Resolve the ``held`` argument to a set of panel IDs."""
+    if held is None:
+        panels = cavity_panel_ids(pattern)
+        if panels:
+            return panels
+        inner = min(pattern.hex_units, key=lambda unit: int(unit["count"]))
+        return set(inner["parallelograms"])
+    units = {int(unit["count"]): unit for unit in pattern.hex_units}
+    panels = set()
+    for item in held:
+        if isinstance(item, str):
+            if item not in pattern.surfaces:
+                raise ValueError(f"Held panel '{item}' does not exist.")
+            panels.add(item)
+        elif int(item) in units:
+            panels.update(units[int(item)]["parallelograms"])
+        else:
+            raise ValueError(f"Held unit {item!r} does not exist.")
+    return panels
 
 
-def _set_panel_targets(
-    model: Cadder,
-    panel_states: dict[str, InsertionPanelState],
-    panel_by_constraint: dict[str, str],
-    contact_dihedral_deg: float,
-) -> None:
-    """Set contact/snap hinge targets from propagated panel metadata."""
-    for constraint_id, surface_id in panel_by_constraint.items():
-        data = model.constraints[constraint_id].data
-        target = (
-            contact_dihedral_deg
-            if panel_states[surface_id]["state"] == "contact"
-            else 180.0 - contact_dihedral_deg
-        )
-        data["target_increment"] = float(data["sign"] * np.deg2rad(180.0 - target))
-
-
-def _branch_guess(
+def _build_mechanics(
     model: Cadder,
     pattern: TwoDDrawer,
-    quad_edges: dict[str, dict[str, list[str]]],
-    panel_states: dict[str, InsertionPanelState],
-    contact_dihedral_deg: float,
-    tolerance: float,
-) -> np.ndarray:
-    """Construct an inside-out coordinate seed on the requested snap branch."""
-    fold_angle_rad = np.deg2rad(180.0 - contact_dihedral_deg)
-    contact_scale = float(np.cos(fold_angle_rad))
-    graph: dict[str, list[tuple[str, np.ndarray]]] = defaultdict(list)
-    crease_axis_distances: list[float] = []
-
-    for surface_id, triangle_edges in quad_edges.items():
-        if len(triangle_edges) != 2:
-            raise RuntimeError(
-                f"Insertion panel '{surface_id}' must connect two triangles."
+    held_panels: set[str],
+    extra_hard: set[str],
+    side_length: float,
+    hinge_stiffness: float,
+    rest_dihedral_deg: float,
+    panel_stiffness_ratio: float,
+    contact_distance: float,
+):
+    """Split the kinematic constraints into hard and elastic sets."""
+    crease_panels = _crease_panels(model)
+    triangle_pairs = set()
+    for surface_id in model.surfaces:
+        vertices = model._surface_vertices(surface_id)
+        if len(vertices) == 3:
+            triangle_pairs.update(
+                _canonical_edge(a, b) for a, b in zip(vertices, vertices[1:] + vertices[:1])
             )
-        (first_triangle, first_edge), (second_triangle, second_edge) = triangle_edges.items()
-        flat_vector = _edge_midpoint(pattern, second_edge) - _edge_midpoint(pattern, first_edge)
-        crease_axis_distances.append(float(np.linalg.norm(flat_vector)))
-        projected_scale = _state_sign(panel_states[surface_id]) * contact_scale
-        translation_delta = (projected_scale - 1.0) * flat_vector
-        graph[first_triangle].append((second_triangle, translation_delta))
-        graph[second_triangle].append((first_triangle, -translation_delta))
 
-    if _FIXED_TRIANGLE not in graph:
-        raise RuntimeError(
-            f"Fixed triangle '{_FIXED_TRIANGLE}' is not connected "
-            "to the insertion panel graph."
-        )
-    translations = {_FIXED_TRIANGLE: np.zeros(2, dtype=float)}
-    queue: deque[str] = deque([_FIXED_TRIANGLE])
-    while queue:
-        triangle_id = queue.popleft()
-        for neighbor_id, delta in graph[triangle_id]:
-            proposed = translations[triangle_id] + delta
-            previous = translations.get(neighbor_id)
-            if previous is None:
-                translations[neighbor_id] = proposed
-                queue.append(neighbor_id)
-            elif np.linalg.norm(previous - proposed) > tolerance:
-                raise RuntimeError(
-                    "Insertion branch construction found a non-closing "
-                    f"triangle path at '{neighbor_id}'."
-                )
-    if set(translations) != set(graph):
-        raise RuntimeError(
-            "Insertion triangle graph is disconnected: "
-            f"{sorted(set(graph) - set(translations))}."
-        )
-
-    mountain_height = float(np.mean(crease_axis_distances)) * float(np.sin(fold_angle_rad))
-    _, triangle_kinds = _HexagonKinematics(model)._triangle_metadata()
-    proposed_by_point: dict[str, list[np.ndarray]] = defaultdict(list)
-    for triangle_id, translation in translations.items():
-        z_value = 0.0 if triangle_kinds[triangle_id] == "valley" else mountain_height
-        for point_id in pattern.surfaces[triangle_id].vertices:
-            flat_point = pattern.points[point_id]
-            proposed_by_point[point_id].append(np.array(
-                [flat_point.x + translation[0], flat_point.y + translation[1], z_value],
-                dtype=float,
+    bar_stiffness = panel_stiffness_ratio * hinge_stiffness / side_length
+    rest_fold = np.deg2rad(180.0 - rest_dihedral_deg)
+    hard, elastic, stiffness, creases, held_creases = [], [], [], [], set()
+    for constraint_id, constraint in model.constraints.items():
+        data = constraint.data
+        if constraint_id in extra_hard:
+            hard.append(constraint)
+        elif constraint.kind == "bar_length":
+            if _canonical_edge(data["p1"], data["p2"]) in triangle_pairs:
+                hard.append(constraint)
+            else:
+                elastic.append(constraint)
+                stiffness.append(bar_stiffness * side_length / data["length"])
+        elif constraint.kind == _SIGNED and constraint_id in crease_panels:
+            creases.append(Constraint(
+                constraint_id, _SIGNED, {**data, "target_increment": 0.0},
             ))
+            quad, triangle = crease_panels[constraint_id]
+            if quad in held_panels or triangle in held_panels:
+                hard.append(constraint)
+                held_creases.add(constraint_id)
+            else:
+                length = float(np.linalg.norm(
+                    model.point_array(data["edge_end"]) - model.point_array(data["edge_start"])
+                ))
+                elastic.append(Constraint(constraint_id, _SIGNED, {
+                    **data, "target_increment": float(data["sign"] * rest_fold),
+                }))
+                stiffness.append(hinge_stiffness * length)
+        else:
+            hard.append(constraint)
 
-    coordinates = model.get_coordinate_vector().copy()
-    for point_index, point_id in enumerate(model.point_ids()):
-        proposals = proposed_by_point.get(point_id)
-        if not proposals:
-            continue
-        if any(
-            np.linalg.norm(proposal - proposals[0]) > tolerance
-            for proposal in proposals[1:]
-        ):
-            raise RuntimeError(
-                f"Insertion branch gives inconsistent coordinates for "
-                f"point '{point_id}'."
-            )
-        coordinates[3 * point_index: 3 * point_index + 3] = np.mean(proposals, axis=0)
-    return coordinates
-
-
-def _loop_dihedral_stats(
-    model: Cadder,
-    panel_states: dict[str, InsertionPanelState],
-    panel_by_constraint: dict[str, str],
-) -> list[LoopDihedralStats]:
-    values: dict[int, dict[PanelState, list[float]]] = defaultdict(
-        lambda: {"contact": [], "snap": []}
-    )
-    for constraint_id, surface_id in panel_by_constraint.items():
-        data = model.constraints[constraint_id].data
-        panel = panel_states[surface_id]
-        values[panel["ring_index"]][panel["state"]].append(abs(
-            model.signed_dihedral_angle(
-                data["edge_start"], data["edge_end"],
-                data["point_left"], data["point_right"], unit="deg",
-            )
+    xy = {pid: (point.x, point.y) for pid, point in pattern.points.items()}
+    outer = max(boundary_loops(pattern, xy), key=lambda loop: loop_area(loop, xy))
+    index = {pid: i for i, pid in enumerate(model.point_ids())}
+    start = model.get_coordinate_vector()
+    area = AreaPotential([index[pid] for pid in outer], model.num_variables(), start)
+    potentials = []
+    if contact_distance > 0:
+        potentials.append(ContactBarrier(
+            model, contact_distance, bar_stiffness * contact_distance**2,
         ))
-    return [
-        {
-            "loop_index": loop_index,
-            "contact_mean_deg": float(np.mean(angles["contact"])) if angles["contact"] else None,
-            "snap_mean_deg": float(np.mean(angles["snap"])) if angles["snap"] else None,
-            "num_contact_hinges": len(angles["contact"]),
-            "num_snap_hinges": len(angles["snap"]),
+    mechanics = MechanicalModel(model, hard, elastic, stiffness, [area], potentials)
+
+    angle_plan = CompiledConstraints(model, creases)
+    signs = np.array([crease.data["sign"] for crease in creases], dtype=float)
+
+    def dihedrals(X) -> np.ndarray:
+        """Unsigned dihedral angle of every crease, in degrees."""
+        return np.rad2deg(np.pi - signs * angle_plan.residual(X))
+
+    return mechanics, area, dihedrals, [crease.id for crease in creases], crease_panels, held_creases
+
+
+def _panel_states(crease_ids, crease_panels, angles, held_panels, pattern):
+    quad_angles: dict[str, list[float]] = {}
+    quad_triangles: dict[str, list[str]] = {}
+    for crease_id, angle in zip(crease_ids, angles):
+        quad, triangle = crease_panels[crease_id]
+        quad_angles.setdefault(quad, []).append(float(angle))
+        quad_triangles.setdefault(quad, []).append(triangle)
+    states: dict[str, InsertionPanelState] = {}
+    for quad, values in sorted(quad_angles.items()):
+        acute = [value < 90.0 for value in values]
+        states[quad] = {
+            "surface_id": quad,
+            "state": "snap" if all(acute) else "partial" if any(acute) else "contact",
+            "held": quad in held_panels,
+            "dihedrals_deg": tuple(values),
+            "adjacent_triangle_ids": tuple(sorted(quad_triangles[quad])),
         }
-        for loop_index, angles in sorted(values.items())
-    ]
+    return states
 
 
-def _infer_num_loops(pattern: TwoDDrawer) -> int:
-    """Infer the number of concentric loops from hex-unit metadata."""
-    num_units = len(pattern.hex_units)
-    if num_units < 1:
-        raise ValueError("The insertion model must contain at least one hex unit.")
+def _supplied_half(ring, model, pattern, closure, num_layers, geometry_tolerance):
+    """Cut the caller's half out of a simulated closed ring."""
+    solved = ring["model"]
+    attachments = hole_attachments(model)
+    for point_id in closure.pattern.points:
+        if point_id not in model.points:
+            continue
+        x, y, z = solved.point_array(point_id)
+        point = model.points[point_id]
+        point.x, point.y = map(float, closure.rotation @ np.array([x, y]) + closure.translation)
+        point.z = float(z)
+    place_holes(model, attachments)
 
-    # draw_hex_loops creates 1 + 6 * (1 + ... + (n - 1)) units.
-    discriminant = 1.0 + 4.0 * (num_units - 1) / 3.0
-    num_loops = int(round((1.0 + np.sqrt(discriminant)) / 2.0))
-    if 1 + 3 * num_loops * (num_loops - 1) != num_units:
-        raise ValueError(
-            "Could not infer a regular concentric-loop count from the model's "
-            f"{num_units} hex units."
+    panel_states = {
+        sid: state for sid, state in ring["panel_states"].items() if sid in model.surfaces
+    }
+    minimum_gap, closest_pair, _ = minimum_panel_clearance(model)
+    try:
+        stack = stack_layers(
+            model, num_layers=num_layers,
+            tolerance=geometry_tolerance * max(1.0, ring["side_length"]),
         )
-    return num_loops
-
-
-def _infer_side_length(pattern: TwoDDrawer) -> float:
-    """Infer the base hexagon side length from the innermost unit."""
-    first, second = (pattern.points[pid] for pid in pattern.hex_units[0]["mid"][:2])
-    return float(np.hypot(second.x - first.x, second.y - first.y))
+        assembly = stack["model"]
+        layer_height, interface_error = stack["layer_height"], stack["max_interface_error"]
+    except ValueError:
+        assembly = layer_height = interface_error = None
+    return {
+        **ring,
+        "model": model,
+        "assembly": assembly,
+        "pattern": pattern,
+        "layer_height": layer_height,
+        "max_interface_error": interface_error,
+        "minimum_panel_gap": minimum_gap,
+        "closest_panel_pair": closest_pair,
+        "panel_states": panel_states,
+        "contact_panel_ids": frozenset(
+            sid for sid, panel in panel_states.items() if panel["state"] == "contact"
+        ),
+        "snap_panel_ids": frozenset(
+            sid for sid, panel in panel_states.items() if panel["state"] == "snap"
+        ),
+        "held_panel_ids": frozenset(
+            sid for sid in ring["held_panel_ids"] if sid in model.surfaces
+        ),
+        "crease_assignment_by_edge": {
+            edge: state for edge, state in ring["crease_assignment_by_edge"].items()
+            if edge[0] in model.points and edge[1] in model.points
+        },
+        "closed_model": solved,
+    }
 
 
 def simulate_insertion(
@@ -579,62 +367,86 @@ def simulate_insertion(
     *,
     num_loops: int | None = None,
     model: Cadder | None = None,
-    start_dihedral_deg: float = 175.0,
-    branch_acute_start_deg: float = 88.0,
-    initial_steps: int = 12,
-    panel_sequence_steps: int = 12,
-    max_nfev_per_step: int = 6000,
-    solve_tolerance: float = 1e-10,
-    feasibility_tolerance: float = 1e-7,
+    held: Iterable[int | str] | None = None,
+    constraints: Callable[[Cadder], None] | None = None,
+    hinge_stiffness: float = 1.0,
+    rest_dihedral_deg: float = 180.0,
+    panel_stiffness_ratio: float = 1e3,
+    contact_distance: float | None = None,
+    pressure_max: float | None = None,
+    pressure_step: float | None = None,
+    hold_factor: float = 3.0,
+    strain_limit: float = 0.1,
+    check_unloaded: bool = True,
+    close_open_side: bool | Literal["auto"] = "auto",
+    solve_tolerance: float = 1e-9,
     geometry_tolerance: float = 1e-6,
     contact_tolerance: float | None = None,
     verbose: bool = False,
 ) -> InsertionSimulationResult:
-    """Fold concentric planar loops toward the requested insertion angle.
+    """Squeeze a folded pattern from all sides until its panels snap through.
 
-    The requested inner obtuse angle is the ``contact`` panel target.  A
-    ``snap`` panel receives its supplement ``180 degrees - contact``.  The
-    states follow the inner-to-outer propagation rule of
-    :func:`classify_insertion_panel_states` for all ``num_loops`` planar
-    loops.
+    The pattern is first folded uniformly to ``inner_dihedral_deg``. The
+    creases of the ``held`` panels are then fixed at that angle for the whole
+    simulation, and a uniform in-plane pressure on the outer boundary is
+    raised from zero. Triangles stay rigid and horizontal, each mountain
+    triangle at its own height; parallelograms can stretch slightly; the other
+    creases are springs; and panels cannot pass through each other. The
+    result is the stable state the structure settles in.
 
-    If ``model`` is supplied, it must be a ``Cadder`` built from a compatible
-    hexagon-loop pattern. Its points, lines, surfaces, and hex-unit metadata
-    are used as the insertion geometry template, and ``num_loops`` and
-    ``side_length`` may be omitted because they are inferred from it. The
-    supplied model is not modified; the returned ``result["model"]`` is a
-    solved deep copy.
+    ``held`` lists unit counts and/or panel IDs. A unit count holds that unit
+    chain's parallelograms, and a panel ID holds every crease of that panel.
+    By default the panels bordering the cavity are held, or the innermost
+    unit chain for a pattern without a cavity. ``constraints`` is called with the folded working model and may
+    add any further ``Cadder`` constraints; those are enforced exactly too.
 
-    One and two loops are folded uniformly from ``start_dihedral_deg`` to
-    ``180 - branch_acute_start_deg`` in ``initial_steps`` solves and then to
-    the contact/snap targets in ``panel_sequence_steps`` solves. Three or
-    more loops start from a constructed seed on the requested branch and are
-    solved once. A state that does not satisfy the constraints within
-    ``feasibility_tolerance``, or whose panels clip, raises RuntimeError.
+    ``hinge_stiffness`` is the crease stiffness per unit length and
+    ``rest_dihedral_deg`` the angle at which creases are relaxed.
+    ``panel_stiffness_ratio`` is the stiffness of a panel bar of one side
+    length times the side length squared, relative to the stiffness of a
+    crease of one side length. ``contact_distance`` is the gap at which panels
+    start to repel each other (default 3 % of the side length; 0 disables
+    contact). Pressures are forces per unit boundary length.
+
+    The pressure rises until ``pressure_max``. Without it the ramp stops once
+    the pressure reaches ``hold_factor`` times that of the last snap with no
+    further change. It always stops once a panel is strained beyond
+    ``strain_limit``, where the nearly rigid panels of this model stop being
+    meaningful. The returned state is the equilibrium right after the last
+    snap; ``result["snap_events"]`` lists every snap on the way.
+
+    If ``model`` is supplied it must be a flat ``Cadder`` built from a hexagon
+    pattern; it is used as a template and left unmodified. Otherwise a loop
+    pattern with ``num_loops`` and ``side_length`` is built.
+
+    A supplied pattern whose cavity is open on one side has no closed outer
+    boundary to press on. With ``close_open_side`` (``"auto"`` by default) it
+    is completed by the same lattice continued over its 180-degree rotation,
+    the closed ring is simulated, and the supplied half is returned with the
+    ring in ``result["closed_model"]``. ``held`` and ``constraints`` then
+    refer to the ring, in which the supplied panels keep their IDs. ``True``
+    raises if the pattern cannot be closed this way.
+
+    When the snapped state is an exact rigid folding, ``result["model"]``
+    holds that exact geometry and ``rigid_compatible`` is true. Otherwise the
+    panels are held in a strained state by contact; the model then holds the
+    elastic equilibrium and ``max_panel_strain`` reports its largest strain.
     """
     contact_deg = _angle("inner_dihedral_deg", inner_dihedral_deg, 90.0, 180.0)
-    start_dihedral_deg = _angle("start_dihedral_deg", start_dihedral_deg, 0.0, 180.0)
-    if start_dihedral_deg <= contact_deg:
-        raise ValueError(
-            "start_dihedral_deg must be greater than inner_dihedral_deg."
-        )
-    snap_deg = 180.0 - contact_deg
-    branch_acute_start_deg = _angle(
-        "branch_acute_start_deg", branch_acute_start_deg, 0.0, 90.0,
-    )
-    if branch_acute_start_deg <= snap_deg:
-        raise ValueError(
-            "branch_acute_start_deg must be greater than the final acute "
-            "dihedral."
-        )
+    rest_dihedral_deg = _angle("rest_dihedral_deg", rest_dihedral_deg, 0.0, 180.0 + 1e-9)
     if model is not None and not isinstance(model, Cadder):
         raise TypeError("model must be a Cadder instance or None.")
+    num_layers = integer("num_layers", num_layers, minimum=1)
+    hinge_stiffness = finite("hinge_stiffness", hinge_stiffness, positive=True)
+    panel_stiffness_ratio = finite("panel_stiffness_ratio", panel_stiffness_ratio, positive=True)
+    hold_factor = finite("hold_factor", hold_factor, positive=True)
+    strain_limit = finite("strain_limit", strain_limit, positive=True)
 
     if model is None:
-        if side_length is None:
-            side_length = DEFAULT_SIDE_LENGTH
-        if num_loops is None:
-            num_loops = DEFAULT_NUM_LOOPS
+        side_length = DEFAULT_SIDE_LENGTH if side_length is None else side_length
+        num_loops = integer(
+            "num_loops", DEFAULT_NUM_LOOPS if num_loops is None else num_loops, minimum=1,
+        )
         pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
         draw_hex_loops(pattern, n=num_loops, start_point=(0.0, 0.0), l=side_length)
         model = Cadder.from_drawer(pattern)
@@ -642,162 +454,248 @@ def simulate_insertion(
         if not model.hex_units:
             raise ValueError(
                 "The insertion model must contain hex-unit metadata. Build it "
-                "with draw_hex_loops() before calling simulate_insertion()."
+                "with a hexagon layout function before calling simulate_insertion()."
             )
+        heights = [point.z for point in model.points.values()]
+        if max(heights) - min(heights) > geometry_tolerance:
+            raise ValueError("The insertion model must be the flat, unfolded pattern.")
         pattern = model.to_2d_drawer(point_tol=1e-6)
-        inferred_num_loops = _infer_num_loops(pattern)
-        inferred_side_length = _infer_side_length(pattern)
-        if num_loops is None:
-            num_loops = inferred_num_loops
-        elif int(num_loops) != inferred_num_loops:
-            raise ValueError(
-                "num_loops does not match the supplied model: "
-                f"expected {inferred_num_loops}, got {num_loops}."
-            )
-        if side_length is None:
-            side_length = inferred_side_length
-        elif not np.isclose(side_length, inferred_side_length):
+        inferred = _infer_side_length(pattern)
+        if side_length is not None and not np.isclose(side_length, inferred):
             raise ValueError(
                 "side_length does not match the supplied model: "
-                f"expected {inferred_side_length:g}, got {side_length:g}."
+                f"expected {inferred:g}, got {side_length:g}."
             )
-        # The insertion solver owns the constraints it creates. Work on a
-        # copy so a model that is already solved or constrained remains intact.
+        side_length = inferred
+        # Work on a copy so the caller's model keeps its own state.
         model = copy.deepcopy(model)
         model.constraints = {}
         model._constraint_count = 0
 
+        closure = None
+        if close_open_side and not cavity_panel_ids(pattern):
+            try:
+                closure = close_open_pattern(pattern)
+            except ValueError:
+                if close_open_side is True:
+                    raise
+            if closure is None and close_open_side is True:
+                raise ValueError(
+                    "No half-turn continuation of this pattern encloses a cavity."
+                )
+        if closure is not None:
+            ring = simulate_insertion(
+                contact_deg, num_layers, model=Cadder.from_drawer(closure.pattern),
+                held=held, constraints=constraints, hinge_stiffness=hinge_stiffness,
+                rest_dihedral_deg=rest_dihedral_deg,
+                panel_stiffness_ratio=panel_stiffness_ratio,
+                contact_distance=contact_distance, pressure_max=pressure_max,
+                pressure_step=pressure_step, hold_factor=hold_factor,
+                strain_limit=strain_limit, check_unloaded=check_unloaded,
+                close_open_side=False, solve_tolerance=solve_tolerance,
+                geometry_tolerance=geometry_tolerance,
+                contact_tolerance=contact_tolerance, verbose=verbose,
+            )
+            return _supplied_half(ring, model, pattern, closure, num_layers, geometry_tolerance)
+
     side_length = finite("side_length", side_length, positive=True)
-    num_layers = integer("num_layers", num_layers, minimum=1)
-    num_loops = integer("num_loops", num_loops, minimum=1)
-    initial_steps = integer("initial_steps", initial_steps, minimum=2)
-    panel_sequence_steps = integer("panel_sequence_steps", panel_sequence_steps, minimum=2)
-    max_nfev_per_step = integer("max_nfev_per_step", max_nfev_per_step, minimum=1)
-    solve_tolerance = finite("solve_tolerance", solve_tolerance, positive=True)
-    feasibility_tolerance = finite("feasibility_tolerance", feasibility_tolerance, positive=True)
-    length_tolerance = finite(
-        "geometry_tolerance", geometry_tolerance, positive=True,
-    ) * max(1.0, side_length)
+    length_tolerance = finite("geometry_tolerance", geometry_tolerance, positive=True) * max(
+        1.0, side_length,
+    )
+    contact_distance = finite(
+        "contact_distance",
+        0.03 * side_length if contact_distance is None else contact_distance,
+        nonnegative=True,
+    )
     contact_tolerance = finite(
         "contact_tolerance",
-        length_tolerance if contact_tolerance is None else contact_tolerance,
+        max(contact_distance, length_tolerance) if contact_tolerance is None else contact_tolerance,
         positive=True,
     )
+    held_panels = _held_panels(pattern, held)
 
-    panel_states = classify_insertion_panel_states(pattern)
-    quad_edges = _quad_crease_edges(pattern)
-    panel_vectors = _panel_width_vectors(pattern, quad_edges)
-    _reconcile_panel_states(pattern, panel_states, panel_vectors, length_tolerance)
-    closure_errors = _closure_errors(pattern, panel_states, panel_vectors, length_tolerance)
-    if closure_errors:
-        details = ", ".join(
-            f"unit {unit_count}: {error:.6g} {pattern.unit}"
-            for unit_count, error in closure_errors[:12]
+    with panel_only_geometry(model):
+        solve_kinematics(model, final_dihedral=contact_deg, verbose=False)
+        folded = model.get_coordinate_vector()
+        kinematic_ids = set(model.constraints)
+        if constraints is not None:
+            constraints(model)
+        extra_hard = set(model.constraints) - kinematic_ids
+        mechanics, area, dihedrals, crease_ids, crease_panels, held_creases = _build_mechanics(
+            model, pattern, held_panels, extra_hard, side_length, hinge_stiffness,
+            rest_dihedral_deg, panel_stiffness_ratio, contact_distance,
         )
-        raise ValueError(
-            "The reconciled insertion panel sequence is internally "
-            f"inconsistent for num_loops={num_loops}: the signed "
-            "projected panel widths do not close for "
-            f"{len(closure_errors)} unit cells ({details}). Contact and "
-            "snap targets are supplementary, so a nonzero closure cannot "
-            "be removed without distorting rigid panels."
-        )
+        bars = mechanics.elastic.groups.get("bar_length")
 
-    kinematics = _HexagonKinematics(model)
-    kinematics._add_kinematic_constraints(
-        target_dihedral=start_dihedral_deg,
-        fixed_triangle_surface_id=_FIXED_TRIANGLE,
+        def strain(X) -> float:
+            if bars is None:
+                return 0.0
+            residual = mechanics.elastic.residual(X)[bars["rows"]]
+            return float(np.max(np.abs(residual) / bars["target"]))
+
+        last_change = {"load": None}
+
+        def stop(step):
+            if step.changed:
+                last_change["load"] = step.load
+            if strain(step.x) > strain_limit:
+                return "A panel was strained beyond the strain limit."
+            if pressure_max is None and last_change["load"] is not None and (
+                step.load >= hold_factor * last_change["load"]
+            ):
+                return "No further snap occurred while the pressure was raised."
+            return None
+
+        reference_pressure = hinge_stiffness / side_length
+        step_size = finite(
+            "pressure_step",
+            0.25 * reference_pressure if pressure_step is None else pressure_step,
+            positive=True,
+        )
+        load_max = finite(
+            "pressure_max",
+            1e3 * reference_pressure if pressure_max is None else pressure_max,
+            positive=True,
+        )
+        path: LoadPath = ramp_load(
+            mechanics, folded,
+            load_max=load_max, initial_step=min(step_size, load_max),
+            min_step=0.02 * step_size, max_step=None if pressure_max is None else load_max / 10,
+            signature=lambda X: tuple(dihedrals(X) < 90.0),
+            stop=stop, tol=solve_tolerance, verbose=verbose,
+        )
+        if not path.steps:
+            raise RuntimeError(f"The insertion simulation could not start: {path.stop_reason}")
+
+        events: list[SnapEvent] = []
+        final_index = 0
+        for index in range(1, len(path.steps)):
+            before, after = path.steps[index - 1], path.steps[index]
+            if not after.changed:
+                continue
+            final_index = index
+            old = _panel_states(crease_ids, crease_panels, dihedrals(before.x), held_panels, pattern)
+            new = _panel_states(crease_ids, crease_panels, dihedrals(after.x), held_panels, pattern)
+            events.append({
+                "pressure": after.load,
+                "snapped_panel_ids": tuple(sorted(
+                    q for q in new if new[q]["state"] == "snap" and old[q]["state"] != "snap"
+                )),
+                "released_panel_ids": tuple(sorted(
+                    q for q in new if old[q]["state"] == "snap" and new[q]["state"] != "snap"
+                )),
+                "energy_released": float(
+                    mechanics.energy(before.x, after.load) - after.energy
+                ),
+                "area_before": area.value(before.x),
+                "area_after": area.value(after.x),
+            })
+        final = path.steps[final_index] if events else path.final
+        angles = dihedrals(final.x)
+        panel_states = _panel_states(crease_ids, crease_panels, angles, held_panels, pattern)
+        max_strain = strain(final.x)
+
+        stable_without_load = None
+        if check_unloaded and events:
+            unloaded = solve_equilibrium(
+                mechanics, final.x, 0.0, multipliers=final.multipliers, tol=solve_tolerance,
+            )
+            stable_without_load = bool(
+                unloaded.converged
+                and np.array_equal(dihedrals(unloaded.x) < 90.0, angles < 90.0)
+                and lowest_modes(mechanics, unloaded.x, 0.0, unloaded.multipliers)[0][0] > 0
+            )
+
+        # The state is an exact rigid folding when every crease already sits
+        # near the held angle or its supplement and the rigid solver reaches
+        # those angles from here without clipping.
+        model.set_coordinate_vector(final.x)
+        rigid_compatible = False
+        nearest = np.where(angles < 90.0, 180.0 - contact_deg, contact_deg)
+        if events and float(np.max(np.abs(angles - nearest))) <= 10.0:
+            acute = dict(zip(crease_ids, angles < 90.0))
+            targets = {}
+            for constraint_id in crease_ids:
+                data = model.constraints[constraint_id].data
+                targets[constraint_id] = data["target_increment"]
+                target = 180.0 - contact_deg if acute[constraint_id] else contact_deg
+                data["target_increment"] = float(data["sign"] * np.deg2rad(180.0 - target))
+            try:
+                report = model.solve(X0=final.x, update_model=False, tol=1e-12, max_nfev=2000)
+                if report.max_abs_residual <= 1e-7:
+                    model.set_coordinate_vector(report.x)
+                    if minimum_panel_clearance(model)[2]:
+                        model.set_coordinate_vector(final.x)
+                    else:
+                        rigid_compatible = True
+                        angles = dihedrals(report.x)
+                        panel_states = _panel_states(
+                            crease_ids, crease_panels, angles, held_panels, pattern,
+                        )
+            except ValueError:
+                pass
+            if not rigid_compatible:
+                for constraint_id, target in targets.items():
+                    model.constraints[constraint_id].data["target_increment"] = target
+
+    minimum_gap, closest_pair, clipping = minimum_panel_clearance(model)
+    barrier_gap = (
+        mechanics.potentials[0].minimum_distance(final.x) if mechanics.potentials else np.inf
     )
-    panel_by_constraint = _constraint_panel_ids(model, pattern)
-    crease_ring_by_edge = _hinge_rings(model, panel_states, panel_by_constraint)
-    # Insertion-only metadata: deliberately kept out of the core model types.
-    pattern.insertion_panel_states = panel_states
-    model.insertion_panel_states = panel_states
+    contact_detected = bool(events) and min(minimum_gap, barrier_gap) <= contact_tolerance
+    try:
+        stack = stack_layers(model, num_layers=num_layers, tolerance=length_tolerance)
+        assembly = stack["model"]
+        layer_height, interface_error = stack["layer_height"], stack["max_interface_error"]
+    except ValueError:
+        # Layers only stack when all mountain triangles share one height.
+        assembly = layer_height = interface_error = None
 
-    def solve(start_coordinates):
-        return model.solve(
-            X0=start_coordinates, update_model=False,
-            max_nfev=max_nfev_per_step, tol=solve_tolerance,
-        )
-
-    if num_loops > 2:
-        coordinates = _branch_guess(
-            model, pattern, quad_edges, panel_states, contact_deg, length_tolerance,
-        )
-        contact_targets = [contact_deg]
+    if not events:
+        status, reason = "no_snap", f"No panel snapped through. {path.stop_reason}"
+    elif contact_detected:
+        status = "panel_contact"
+        reason = "Panels snapped through and came to rest against each other."
     else:
-        coordinates = kinematics._initial_guess(
-            mountain_height=max(1.0, 0.15 * side_length),
-        )
-        branch_deg = 180.0 - branch_acute_start_deg
-        for step_index, target in enumerate(
-            np.linspace(start_dihedral_deg, branch_deg, initial_steps), start=1,
-        ):
-            kinematics._update_dihedral_target(float(target))
-            report = solve(coordinates)
-            if report.max_abs_residual > feasibility_tolerance:
-                raise RuntimeError(
-                    "Could not reach the uniform starting configuration: "
-                    f"target={target:.9g} degrees, "
-                    f"residual={report.max_abs_residual:.3e}."
-                )
-            coordinates = report.x
-            model.set_coordinate_vector(coordinates)
-            if verbose:
-                print(
-                    f"[initial {step_index:02d}/{initial_steps}] "
-                    f"dihedral={target:.6f} deg, "
-                    f"residual={report.max_abs_residual:.3e}"
-                )
-        contact_targets = np.linspace(branch_deg, contact_deg, panel_sequence_steps)
+        status = "compact_nonclipping"
+        reason = "Panels snapped through and settled without touching."
+    if clipping:
+        reason += " Panels intersect in the returned state."
 
-    for target in contact_targets:
-        _set_panel_targets(model, panel_states, panel_by_constraint, float(target))
-        report = solve(coordinates)
-        coordinates = report.x
-
-    clipping = False
-    if report.max_abs_residual <= feasibility_tolerance:
-        model.set_coordinate_vector(coordinates)
-        minimum_gap, closest_pair, clipping = minimum_panel_clearance(model)
-    if verbose:
-        print(
-            f"[panel sequence] residual={report.max_abs_residual:.3e}, "
-            f"clipping={clipping}"
-        )
-    if report.max_abs_residual > feasibility_tolerance or clipping:
-        raise RuntimeError(
-            "The propagated contact/snap panel sequence did not produce a "
-            "valid non-clipping state: "
-            f"residual={report.max_abs_residual:.3e}, clipping={clipping}."
-        )
-
-    contact = minimum_gap <= contact_tolerance
-    stack = stack_layers(model, num_layers=num_layers, tolerance=length_tolerance)
+    snap_deg = 180.0 - contact_deg
     return {
         "model": model,
-        "assembly": stack["model"],
+        "assembly": assembly,
         "pattern": pattern,
-        "status": "panel_contact" if contact else "compact_nonclipping",
-        "reason": (
-            "The contact/snap sequence reaches non-adjacent panel contact "
-            "without proper panel intersection."
-            if contact else
-            "The inner-to-outer contact/snap sequence reached the requested "
-            "angle without panel clipping."
-        ),
+        "status": status,
+        "reason": reason,
         "contact_dihedral_deg": contact_deg,
         "snap_dihedral_deg": snap_deg,
-        "num_loops": num_loops,
         "num_layers": num_layers,
         "side_length": side_length,
-        "layer_height": stack["layer_height"],
-        "max_interface_error": stack["max_interface_error"],
-        "max_solve_residual": report.max_abs_residual,
-        "feasibility_tolerance": feasibility_tolerance,
+        "layer_height": layer_height,
+        "max_interface_error": interface_error,
+        "final_pressure": final.load,
+        "highest_pressure": path.final.load,
+        "stop_reason": path.stop_reason,
+        "snap_events": events,
+        "path": [
+            {
+                "pressure": step.load,
+                "energy": step.energy,
+                "elastic_energy": step.elastic_energy,
+                "area": step.load_potential,
+                "lowest_eigenvalue": step.lowest_eigenvalue,
+                "num_acute_creases": int(sum(step.signature)),
+            }
+            for step in path.steps
+        ],
+        "rigid_compatible": rigid_compatible,
+        "max_panel_strain": max_strain,
+        "stable_without_load": stable_without_load,
         "minimum_panel_gap": minimum_gap,
         "closest_panel_pair": closest_pair,
-        "contact_detected": contact,
+        "contact_detected": contact_detected,
         "panel_states": panel_states,
         "contact_panel_ids": frozenset(
             sid for sid, panel in panel_states.items() if panel["state"] == "contact"
@@ -805,72 +703,75 @@ def simulate_insertion(
         "snap_panel_ids": frozenset(
             sid for sid, panel in panel_states.items() if panel["state"] == "snap"
         ),
-        "crease_ring_by_edge": crease_ring_by_edge,
+        "held_panel_ids": frozenset(held_panels),
         "crease_assignment_by_edge": {
             _canonical_edge(
                 model.constraints[cid].data["edge_start"],
                 model.constraints[cid].data["edge_end"],
-            ): panel_states[surface_id]["state"]
-            for cid, surface_id in panel_by_constraint.items()
+            ): "snap" if angle < 90.0 else "contact"
+            for cid, angle in zip(crease_ids, angles)
         },
-        "loop_dihedrals": _loop_dihedral_stats(model, panel_states, panel_by_constraint),
+        "closed_model": None,
     }
 
 
 def print_insertion_report(result: InsertionSimulationResult) -> None:
-    """Print the solved state, the loop dihedrals, and the panel states."""
+    """Print the simulated state, the snap events, and the panel angles."""
     unit = result["model"].unit
-    title = f"Spatial {result['num_loops']}-loop contact/snap insertion simulation"
+    title = "Snap-through insertion simulation"
     print(title)
     print("-" * len(title))
+
+    def optional(value, form):
+        return "-" if value is None else form.format(value)
+
+    counts = {state: 0 for state in ("contact", "snap", "partial")}
+    for panel in result["panel_states"].values():
+        counts[panel["state"]] += 1
     for label, value in (
-        ("Contact / snap dihedral", f"{result['contact_dihedral_deg']:.6f} / "
-                                    f"{result['snap_dihedral_deg']:.6f} deg"),
-        ("Solve residual", f"{result['max_solve_residual']:.3e} "
-                           f"(tolerance {result['feasibility_tolerance']:.3e})"),
         ("Status", result["status"]),
         ("Reason", result["reason"]),
+        ("Held / nominal snap dihedral", f"{result['contact_dihedral_deg']:.3f} / "
+                                         f"{result['snap_dihedral_deg']:.3f} deg"),
+        ("Panels contact / snap / partial", f"{counts['contact']} / {counts['snap']} / "
+                                            f"{counts['partial']}"),
+        ("Held panels", len(result["held_panel_ids"])),
+        ("Pressure at returned state", f"{result['final_pressure']:.6g}"),
+        ("Highest pressure applied", f"{result['highest_pressure']:.6g}"),
+        ("Ramp ended because", result["stop_reason"]),
+        ("Exact rigid folding", "yes" if result["rigid_compatible"] else "no"),
+        ("Largest panel strain", f"{result['max_panel_strain']:.3%}"),
+        ("Stays snapped without load", optional(result["stable_without_load"], "{}")),
         ("Panel contact reached", "yes" if result["contact_detected"] else "no"),
         ("Minimum non-adjacent gap", f"{result['minimum_panel_gap']:.6e} {unit}"),
         ("Closest panel pair", result["closest_panel_pair"]),
-        ("Planar loops", result["num_loops"]),
         ("Stacked layers", result["num_layers"]),
-        ("Layer height", f"{result['layer_height']:.6f} {unit}"),
-        ("Maximum interface error", f"{result['max_interface_error']:.3e} {unit}"),
+        ("Layer height", optional(result["layer_height"], "{:.6f} " + unit)),
     ):
-        print(f"{label + ':':31s}{value}")
-
-    def mean(value):
-        return "-" if value is None else f"{value:.6f}"
+        print(f"{label + ':':34s}{value}")
 
     print("")
-    print(
-        f"{'loop':6s} {'contact mean':>14s} {'hinges':>8s} "
-        f"{'snap mean':>14s} {'hinges':>8s}"
-    )
-    for row in result["loop_dihedrals"]:
+    print(f"{'pressure':>12s} {'snapped':>8s} {'released':>9s} {'energy released':>16s} {'area':>22s}")
+    for event in result["snap_events"]:
         print(
-            f"{row['loop_index']:<6d} "
-            f"{mean(row['contact_mean_deg']):>14s} {row['num_contact_hinges']:8d} "
-            f"{mean(row['snap_mean_deg']):>14s} {row['num_snap_hinges']:8d}"
+            f"{event['pressure']:12.6g} {len(event['snapped_panel_ids']):8d} "
+            f"{len(event['released_panel_ids']):9d} {event['energy_released']:16.6g} "
+            f"{event['area_before']:10.1f} -> {event['area_after']:8.1f}"
         )
 
     print("")
-    print("Insertion parallelogram states")
-    print(f"{'ring':>6s} {'source':>22s} {'contact':>10s} {'snap':>10s}")
-    counts: dict[tuple[int, str], dict[str, int]] = defaultdict(
-        lambda: {"contact": 0, "snap": 0}
-    )
-    for panel in result["panel_states"].values():
-        counts[panel["ring_index"], panel["source"]][panel["state"]] += 1
-    sources = PanelStateSource.__args__
-    for (ring_index, source), count in sorted(
-        counts.items(), key=lambda item: (item[0][0], sources.index(item[0][1])),
-    ):
-        print(
-            f"{ring_index:6d} {source:>22s} "
-            f"{count['contact']:10d} {count['snap']:10d}"
-        )
+    print(f"{'state':>10s} {'creases':>8s} {'mean':>10s} {'min':>10s} {'max':>10s}   [deg]")
+    for state in ("contact", "snap"):
+        angles = [
+            angle for panel in result["panel_states"].values()
+            for angle in panel["dihedrals_deg"]
+            if (angle < 90.0) == (state == "snap")
+        ]
+        if angles:
+            print(
+                f"{state:>10s} {len(angles):8d} {np.mean(angles):10.3f} "
+                f"{np.min(angles):10.3f} {np.max(angles):10.3f}"
+            )
 
 
 def _finish_figure(figure, save_path, show: bool, dpi: int) -> Path | None:
@@ -895,12 +796,13 @@ def draw_insertion_simulation(
 ) -> Path | None:
     """Draw an orthographic top view of the selected one-layer state."""
     layer = result["model"]
-    inner_surfaces = set(result["pattern"].hex_units[0]["surfaces"])
+    inner_surfaces = result["held_panel_ids"]
     panel_edge = "#566568"
     # State -> (panel face color, crease color, crease line width).
     styles = {
         "contact": ("#f2a65a", "#c66b16", 1.15),
         "snap": ("#27c8ad", "#009d8f", 2.25),
+        "partial": ("#b79ad9", "#7a52b3", 1.6),
     }
     triangle_color = "#dbe7e9"
 
@@ -911,11 +813,11 @@ def draw_insertion_simulation(
             [layer.point_array(pid) for pid in layer._surface_vertices(surface_id)],
             dtype=float,
         )
-        if surface_id in result["panel_states"]:
+        if surface_id in inner_surfaces:
+            face_color, alpha = "#c7d9dc", 0.82
+        elif surface_id in result["panel_states"]:
             face_color = styles[result["panel_states"][surface_id]["state"]][0]
             alpha = 0.90
-        elif surface_id in inner_surfaces:
-            face_color, alpha = "#c7d9dc", 0.82
         else:
             face_color, alpha = triangle_color, 0.78
         surface_records.append(
@@ -967,12 +869,13 @@ def draw_insertion_simulation(
         handles=[
             Patch(
                 facecolor=styles["contact"][0], edgecolor=styles["contact"][1],
-                label=f"Contact parallelogram ({result['contact_dihedral_deg']:.1f}°)",
+                label="Parallelogram that kept its fold",
             ),
             Patch(
                 facecolor=styles["snap"][0], edgecolor=styles["snap"][1],
-                label=f"Snap parallelogram ({result['snap_dihedral_deg']:.1f}°)",
+                label="Parallelogram that snapped through",
             ),
+            Patch(facecolor="#c7d9dc", edgecolor=panel_edge, label="Held cavity panel"),
             Patch(facecolor=triangle_color, edgecolor=panel_edge, label="Triangular panel"),
         ],
         loc="lower center",
@@ -994,6 +897,10 @@ def draw_insertion_stack_3d(
 ) -> Path | None:
     """Draw the actual, non-exploded stacked assembly in isometric view."""
     assembly = result["assembly"]
+    if assembly is None:
+        raise ValueError(
+            "This state cannot be stacked: its mountain triangles do not share one height."
+        )
     num_layers = result["num_layers"]
     layer_colors = ("#75858b", "#9fbcc2", "#67aeb7", "#25c5aa")
     if num_layers > len(layer_colors):

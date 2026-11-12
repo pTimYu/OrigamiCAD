@@ -237,6 +237,69 @@ from origamicad.patterns.hexagon import minimum_panel_clearance
 gap, closest_pair, clipping = minimum_panel_clearance(model)
 ```
 
+Simulate the insertion snap-through of a folded pattern:
+
+```python
+from origamicad.patterns.hexagon import print_insertion_report, simulate_insertion
+
+result = simulate_insertion(inner_dihedral_deg=135.0, num_loops=2)
+print_insertion_report(result)
+```
+
+The pattern is folded uniformly to `inner_dihedral_deg`. The creases of the
+held cavity panels then stay at that angle while a uniform in-plane pressure
+on the outer boundary is raised from zero. Which panels snap through 90
+degrees, at which pressure, and where they come to rest is computed, not
+prescribed. The model is a bar-and-hinge model:
+
+- triangles are rigid and horizontal; valley triangles stay at one height and
+  each mountain triangle is free to rise on its own;
+- parallelograms can stretch slightly (`panel_stiffness_ratio`, default 1000,
+  is their stiffness relative to a crease);
+- every crease that is not held is a rotational spring of stiffness
+  `hinge_stiffness` per unit length, relaxed at `rest_dihedral_deg` (flat);
+- panels closer than `contact_distance` (default 3 % of the side length)
+  repel each other, so they cannot pass through one another;
+- the load is the potential `pressure * enclosed area` of the outer boundary,
+  which pushes every boundary edge inward with the same force per length.
+
+`held` selects what is held: unit counts hold that unit chain's
+parallelograms, and panel IDs hold every crease of that panel. By default it
+is the panels bordering the cavity, or the innermost unit chain when the
+pattern has no cavity. `constraints` takes a function that receives the folded
+working model and may add any other `Cadder` constraints, which are then
+enforced exactly as well.
+
+The pressure rises until `pressure_max`. Without it, the ramp ends when no
+panel snaps while the pressure triples (`hold_factor`), or when a panel is
+strained beyond `strain_limit`. `result["snap_events"]` lists every snap with
+its pressure, the panels involved, and the energy released; `result["path"]`
+holds the pressure, energy, enclosed area, and lowest stiffness eigenvalue of
+every equilibrium. `result["model"]` is the state right after the last snap.
+If that state is an exact rigid folding (`rigid_compatible`), the model holds
+the exact geometry; otherwise panels are held against each other in a strained
+state, and `max_panel_strain` reports the largest strain.
+`stable_without_load` tells whether the state stays snapped when the pressure
+is removed. Stacking needs all mountain triangles at one height, so
+`result["assembly"]` is `None` for a strained state.
+
+A pattern from `build_packaging` with one side open has no closed boundary to
+press on. Pass it as `model=`: it is completed with the same lattice continued
+over its 180-degree rotation, the closed ring is simulated, and the supplied
+half is returned (`result["closed_model"]` is the ring). A mirrored copy is
+not used because the lattice is chiral.
+
+Results depend on the stiffness ratio and on the contact distance, and more
+than one stable snapped state can exist for the same pressure. The simulation
+returns the state reached by raising the pressure quasi-statically from the
+uniformly folded pattern.
+
+The solver behind it is generic and can be used directly:
+`origamicad.core.mechanics.MechanicalModel` combines hard constraints, elastic
+elements, and load potentials; `origamicad.core.equilibrium.ramp_load` raises
+a load through stable equilibria and across snaps;
+`origamicad.core.contact.ContactBarrier` is the panel contact energy.
+
 Run the derivative and solver checks with:
 
 ```bash
@@ -252,12 +315,16 @@ origamicad/
     _evaluation.py      # solve-scoped constraint batches and sparse assembly
     _direct.py          # trust-region solver with sparse direct linear solves
     clearance.py        # gaps and intersections between folded panels
+    mechanics.py        # elastic energy, load potentials, hard constraints
+    equilibrium.py      # stable equilibria, snaps, and load ramps
+    contact.py          # barrier energy that keeps panels apart
   patterns/
     hexagon/
       layout.py         # hexagon geometry and metadata generation
       kinematics.py     # hexagon-specific constraint setup and solving
       stacking.py       # layer stacks from solved models or 2D patterns
-      insertion_simulation.py  # contact/snap insertion folding
+      insertion_simulation.py  # snap-through insertion under side pressure
+      closure.py        # half-turn closure of a pattern open on one side
       metadata.py       # shared hexagon metadata types
   io/                   # JSON, DXF, STL, and STEP export
 ```
