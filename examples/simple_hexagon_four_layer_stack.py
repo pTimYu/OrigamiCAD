@@ -12,8 +12,6 @@ triangle rests on a mountain triangle from the layer below.
 from pathlib import Path
 import sys
 
-import numpy as np
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -21,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from origamicad import Cadder, TwoDDrawer
 from origamicad.io.cad_export import save_cad
 from origamicad.patterns.hexagon import (
-    draw_hex_two_loops,
+    draw_hex_loops,
     solve_kinematics,
     stack_layers,
 )
@@ -35,55 +33,37 @@ NUM_LAYERS = 4
 
 def main() -> None:
     base_pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    draw_hex_two_loops(
+    draw_hex_loops(
         base_pattern,
+        n=3,
         start_point=(0.0, 0.0),
         l=SIDE_LENGTH,
         reverse=False,
+        enable_hole_punch_outer=2.5
     )
 
     base_model = Cadder.from_drawer(base_pattern)
     solve_kinematics(
         base_model,
         final_dihedral=TARGET_DIHEDRAL_DEG,
-        start_dihedral=175.0,
-        steps=4,
-        unit="deg",
-        fixed_triangle_surface_id="tri_0_1",
-        valley_z=0.0,
-        strict_unique_edges=False,
-        mountain_height=2.0,
-        valley_height=0.0,
-        max_nfev_per_step=8000,
         tol=1e-10,
-        verbose=True,
     )
 
-    # d is the perpendicular distance between the two parallel crease axes
-    # across a quadrilateral panel.
-    d = SIDE_LENGTH * np.sqrt(3.0) / 2.0
     stack = stack_layers(
         base_model,
         num_layers=NUM_LAYERS,
-        panel_distance=d,
-        dihedral_angle=TARGET_DIHEDRAL_DEG,
-        unit="deg",
         tolerance=1e-6 * max(1.0, SIDE_LENGTH),
     )
     assembly = stack["model"]
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     output_path = OUTPUT_DIR / "simple_hexagon_four_layer_stack.step"
-    save_cad(
-        assembly,
-        output_path,
-        separate_layer_parts=True,
-    )
+    # save_cad(
+    #     assembly,
+    #     output_path,
+    #     separate_layer_parts=True,
+    # )
 
-    print(
-        "Analytical layer height: "
-        f"{stack['expected_layer_height']:.6f} mm"
-    )
     print(f"Solved layer height:     {stack['layer_height']:.6f} mm")
     print(f"Maximum interface error: {stack['max_interface_error']:.3e} mm")
     print(f"Saved four-layer stack:  {output_path}")

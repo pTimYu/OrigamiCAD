@@ -1,0 +1,66 @@
+"""Generate 2D and folded 3D plots of a three-loop hexagon pattern.
+
+Run from the project root:
+
+    python -m examples.simple_hexagon_multi_loops
+
+You can also run this file directly from an IDE.
+"""
+
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from origamicad import Cadder, TwoDDrawer
+from origamicad.patterns.hexagon import draw_hex_loops, solve_kinematics
+
+
+N_LOOPS = 3
+CAVITY_LOOPS = 0  # Set to 1 or 2 to open an inner cavity.
+HOLE_PUNCH_DIAMETER = 0.0  # Set to e.g. 2.5 mm to punch outer side panels only.
+SIDE_LENGTH = 15.0
+
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+def main() -> None:
+    pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
+    units = draw_hex_loops(
+        pattern,
+        n=N_LOOPS,
+        start_point=(0.0, 0.0),
+        l=SIDE_LENGTH,
+        cavity_loops=CAVITY_LOOPS,
+        enable_hole_punch_outer=HOLE_PUNCH_DIAMETER,
+    )
+
+    expected_units = 1 + 3 * N_LOOPS * (N_LOOPS - 1)
+    if CAVITY_LOOPS:
+        expected_units -= 1 + 3 * CAVITY_LOOPS * (CAVITY_LOOPS - 1)
+    print(f"Generated {len(units)} unit cells (expected {expected_units}).")
+    pattern.print_summary()
+    cavity_suffix = f"_cavity{CAVITY_LOOPS}" if CAVITY_LOOPS else ""
+    pattern.save_dxf(
+            filename=f"{OUTPUT_DIR}/{N_LOOPS}loops{cavity_suffix}_dxf.dxf",
+            crease_style=["real dashed", 2, 2],
+    )
+    pattern.draw(figsize=(12, 12))
+
+    # model = Cadder.from_drawer(pattern)
+    # solve_kinematics(
+    #     model,
+    #     final_dihedral=150.0,
+    #     tol=1e-10,
+    # )
+
+    # model.draw(
+    #     show_surfaces=True,
+    #     figsize=(12, 12),
+    #     view=(25, -60),
+    # )
+
+
+if __name__ == "__main__":
+    main()

@@ -15,13 +15,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import TwoDDrawer
-from origamicad.patterns.hexagon import draw_hex_two_loops
+from origamicad.patterns.hexagon import draw_hex_loops
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    draw_hex_two_loops(pattern)
+    draw_hex_loops(pattern, n=2)
     pattern.print_summary()
     pattern.draw(
         # save_fig=True,

@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import Cadder, TwoDDrawer
-from origamicad.patterns.hexagon import build_packaging, solve_kinematics
+from origamicad.patterns.hexagon import build_packaging, solve_kinematics, analyze_kinematics
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -25,30 +25,26 @@ def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
     build_packaging(
         pattern,
-        start_point=(0, 0),
         l=15,
-        alpha=2,
-        beta=2,
-        gamma=3,
-        delta=4,
+        alpha=10,
+        beta=10,
+        gamma=10,
+        delta=10,
+        enable_left_open=True,
+        rotate_cavity_to_horizon=True,
+        fill_cavity=True
     )
 
     model = Cadder.from_drawer(pattern)
 
+    # analysis = analyze_kinematics(model)
+    # print(analysis["rank"], analysis["mobility"])
+
     solve_kinematics(
         model,
         final_dihedral=135.0,
-        start_dihedral=175.0,
-        steps=2,
-        unit="deg",
-        # Anchor a valley panel because all valley panels are constrained to z=0.
-        fixed_triangle_surface_id="tri_0_1",
-        valley_z=0.0,
-        strict_unique_edges=False,
-        mountain_height=2.0,
-        valley_height=0.0,
-        max_nfev_per_step=8000,
         tol=1e-10,
+        steps=0
     )
 
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -58,6 +54,7 @@ def main() -> None:
         # save_path=f"{OUTPUT_DIR}/3D_hexagon.png"
     )
 
+    # model.save_cad(filename=f"{OUTPUT_DIR}/3D_hexagon.step")
 
 if __name__ == "__main__":
     main()

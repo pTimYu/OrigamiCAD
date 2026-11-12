@@ -3,92 +3,72 @@
 from importlib import import_module
 from typing import TYPE_CHECKING
 
-from .kinematics import solve_kinematics, solve_simple_hexagon_kinematics
-from .layout import (
-    build_packaging,
-    draw_hex_two_loops,
-    hex_unit_chain,
-    hexagon_packaging,
-)
-from .metadata import HexUnit
+from ...core.clearance import minimum_panel_clearance
+from .cargo import CargoSize, calculate_cargo_height, calculate_cargo_size
+from .kinematics import analyze_kinematics, solve_kinematics
+from .layout import build_packaging, draw_hex_loops, hex_unit_chain
+from .metadata import HexUnit, iter_local_creases
 from .stacking import (
+    LayerInterfaceResult,
     LayerStackResult,
+    MixedLayerStackResult,
     layer_panel_levels,
     stack_layers,
-    stack_simple_hexagon_layers,
+    stack_mixed_layers,
 )
 
 if TYPE_CHECKING:
     from .insertion_simulation import (
-        CombinationAttempt,
-        DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG,
         DEFAULT_INNER_DIHEDRAL_DEG,
-        DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG,
-        HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG,
-        HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG,
+        DEFAULT_NUM_LOOPS,
         InsertionPanelState,
         InsertionSimulationResult,
         LoopDihedralStats,
         classify_insertion_panel_states,
         draw_insertion_simulation,
         draw_insertion_stack_3d,
-        minimum_panel_clearance,
         print_insertion_report,
         simulate_insertion,
     )
 
-_INSERTION_EXPORTS = {
-    "CombinationAttempt",
-    "DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG",
+# Loaded on first use, because the insertion module needs the plotting stack.
+_INSERTION_EXPORTS = [
     "DEFAULT_INNER_DIHEDRAL_DEG",
-    "DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG",
-    "HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG",
-    "HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG",
+    "DEFAULT_NUM_LOOPS",
     "InsertionPanelState",
     "InsertionSimulationResult",
     "LoopDihedralStats",
     "classify_insertion_panel_states",
     "draw_insertion_simulation",
     "draw_insertion_stack_3d",
-    "minimum_panel_clearance",
     "print_insertion_report",
     "simulate_insertion",
-}
+]
 
 
 def __getattr__(name: str):
-    """Load the executable insertion module only when one of its APIs is used."""
     if name in _INSERTION_EXPORTS:
-        module = import_module(f"{__name__}.insertion_simulation")
-        return getattr(module, name)
+        return getattr(import_module(f"{__name__}.insertion_simulation"), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = [
-    "CombinationAttempt",
-    "DEFAULT_ALL_ACUTE_PRECONTACT_INNER_DIHEDRAL_DEG",
-    "DEFAULT_INNER_DIHEDRAL_DEG",
-    "DEFAULT_MAX_NO_CLIPPING_INNER_DIHEDRAL_DEG",
-    "HEXAGON_LOCK_ACUTE_DIHEDRAL_DEG",
-    "HEXAGON_LOCK_OBTUSE_DIHEDRAL_DEG",
+__all__ = sorted([
+    "CargoSize",
     "HexUnit",
-    "InsertionPanelState",
-    "InsertionSimulationResult",
+    "LayerInterfaceResult",
     "LayerStackResult",
-    "LoopDihedralStats",
+    "MixedLayerStackResult",
+    "analyze_kinematics",
     "build_packaging",
-    "classify_insertion_panel_states",
-    "draw_hex_two_loops",
-    "draw_insertion_simulation",
-    "draw_insertion_stack_3d",
+    "calculate_cargo_height",
+    "calculate_cargo_size",
+    "draw_hex_loops",
     "hex_unit_chain",
-    "hexagon_packaging",
+    "iter_local_creases",
     "layer_panel_levels",
     "minimum_panel_clearance",
-    "print_insertion_report",
-    "simulate_insertion",
     "solve_kinematics",
-    "solve_simple_hexagon_kinematics",
     "stack_layers",
-    "stack_simple_hexagon_layers",
-]
+    "stack_mixed_layers",
+    *_INSERTION_EXPORTS,
+])

@@ -6,17 +6,18 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from origamicad import Cadder, TwoDDrawer
-from origamicad.patterns.hexagon import draw_hex_two_loops, solve_kinematics
+from origamicad.patterns.hexagon import draw_hex_loops, solve_kinematics
 
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
-DXF_PATH = OUTPUT_DIR / "simple_hexagon_projection.dxf"
+DXF_PATH = OUTPUT_DIR / "simple_hexagon_projection_120deg.dxf"
 
 
 def main() -> None:
     pattern = TwoDDrawer(unit="mm", point_tol=1e-6)
-    draw_hex_two_loops(
+    draw_hex_loops(
         pattern,
+        n=2,
         start_point=(0, 0),
         l=15,
     )
@@ -25,19 +26,8 @@ def main() -> None:
 
     solve_kinematics(
         model,
-        final_dihedral=150.0,
-        start_dihedral=175.0,
-        steps=4,
-        unit="deg",
-        # Anchor a valley panel because all valley panels are constrained to z=0.
-        fixed_triangle_surface_id="tri_0_1",
-        valley_z=0.0,
-        strict_unique_edges=False,
-        mountain_height=2.0,
-        valley_height=0.0,
-        max_nfev_per_step=8000,
+        final_dihedral=120,
         tol=1e-10,
-        verbose=True,
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,7 +39,6 @@ def main() -> None:
         include_rigid=True,
         include_side=True,
         point_tol=1e-6,
-        profile="solidworks",
     )
     print(f"Saved projected DXF to {saved_path}")
 

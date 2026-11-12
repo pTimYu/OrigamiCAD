@@ -9,6 +9,7 @@ description = "2D crease-pattern drawing, origami kinematics, and CAD export hel
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "ezdxf>=1.4,<2",
     "matplotlib",
     "numpy",
     "scipy",
