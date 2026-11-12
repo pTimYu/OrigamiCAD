@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-import copy
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import numpy as np
+from scipy.spatial import cKDTree
 
+from ..._validation import finite, integer
+from ...core.panel_holes import cut_point_ids, hole_attachments, place_holes
 from .metadata import CreaseKind
 
 if TYPE_CHECKING:
@@ -51,13 +53,6 @@ class LayerStackResult(TypedDict):
     max_interface_error: float
 
 
-def _validate_tolerance(tolerance: float) -> float:
-    tolerance = float(tolerance)
-    if not np.isfinite(tolerance) or tolerance <= 0.0:
-        raise ValueError("tolerance must be a finite positive value.")
-    return tolerance
-
-
 def _triangle_surface_ids(
     model: Cadder,
     kind: CreaseKind,
@@ -67,30 +62,12 @@ def _triangle_surface_ids(
             "No hex-unit metadata found. Build the model with a hexagon "
             "layout function before stacking it."
         )
-
-    surface_kinds: dict[str, CreaseKind] = {}
-    for unit_data in model.hex_units:
-        for triangle in unit_data.get("triangle_kinds", []):
-            surface_id = triangle["surface"]
-            triangle_kind = triangle["kind"]
-
-            if surface_id not in model.surfaces:
-                raise ValueError(
-                    f"Hex-unit metadata references missing surface '{surface_id}'."
-                )
-
-            previous_kind = surface_kinds.get(surface_id)
-            if previous_kind is not None and previous_kind != triangle_kind:
-                raise ValueError(
-                    f"Triangle '{surface_id}' is classified as both "
-                    f"'{previous_kind}' and '{triangle_kind}'."
-                )
-            surface_kinds[surface_id] = triangle_kind
-
+    # The labels were validated when the metadata was built or loaded.
     surface_ids = {
-        surface_id
-        for surface_id, triangle_kind in surface_kinds.items()
-        if triangle_kind == kind
+        triangle["surface"]
+        for unit_data in model.hex_units
+        for triangle in unit_data.get("triangle_kinds", [])
+        if triangle["kind"] == kind
     }
     if not surface_ids:
         raise ValueError(f"No {kind} triangle surfaces were found.")
@@ -134,55 +111,44 @@ def layer_panel_levels(
     tolerance: float = 1e-6,
 ) -> dict[CreaseKind, float]:
     """Return the common valley and mountain heights of a solved layer."""
-    tolerance = _validate_tolerance(tolerance)
-    valley_surfaces = _triangle_surface_ids(model, "valley")
-    mountain_surfaces = _triangle_surface_ids(model, "mountain")
-
+    tolerance = finite("tolerance", tolerance, positive=True)
     return {
-        "valley": _common_surface_level(
-            model,
-            valley_surfaces,
-            tolerance,
-            "valley",
-        ),
-        "mountain": _common_surface_level(
-            model,
-            mountain_surfaces,
-            tolerance,
-            "mountain",
-        ),
+        kind: _common_surface_level(
+            model, _triangle_surface_ids(model, kind), tolerance, kind,
+        )
+        for kind in ("valley", "mountain")
     }
 
 
-def _panel_model_from_pattern(pattern: TwoDDrawer) -> Cadder:
-    """Return a solve-ready model containing only panel-connected geometry.
+def _panel_model_from_pattern(pattern: TwoDDrawer, include_holes: bool) -> Cadder:
+    """Return a model of a pattern's panels and, optionally, their hole contours.
 
-    Hole-punch polygons are cut-line metadata rather than kinematic panels.
-    Removing their unconstrained points before solving makes large packaging
-    patterns substantially faster. Hole contours are restored internally by
-    :func:`stack_mixed_layers` after the reference solve.
+    Points and lines that belong to no panel, such as construction geometry
+    or hole punches added without a host ``surface_id``, are left out.
     """
     from ...core.cadder import Cadder
 
     model = Cadder.from_drawer(pattern)
-    panel_point_ids = {
+    kept_points = {
         point_id
         for surface_id in model.surfaces
         for point_id in model._surface_vertices(surface_id)
     }
+    if include_holes:
+        kept_points |= cut_point_ids(model)
+    else:
+        model.surface_holes = {}
 
     model.points = {
         point_id: point
         for point_id, point in model.points.items()
-        if point_id in panel_point_ids
+        if point_id in kept_points
     }
     model.lines = {
         line_id: line
         for line_id, line in model.lines.items()
-        if line["start"] in panel_point_ids
-        and line["end"] in panel_point_ids
+        if line["start"] in kept_points and line["end"] in kept_points
     }
-    model.surface_holes = {}
     return model
 
 
@@ -190,50 +156,55 @@ def _inherit_folded_geometry(
     subset_pattern: TwoDDrawer,
     reference_pattern: TwoDDrawer,
     reference_model: Cadder,
-    tolerance: float = 1e-6,
+    tolerance: float,
+    include_holes: bool,
 ) -> Cadder:
     """Create a folded subset model from an already solved reference pattern.
 
     Every panel vertex and surface in ``subset_pattern`` must also occur in
     ``reference_pattern``. Coordinates are copied from ``reference_model`` so
     common panels are exactly congruent and can serve as adhesive contacts.
-    This is useful for cavity/no-cavity variants generated from one layout.
+    Hole contours then follow their own panels. This is useful for
+    cavity/no-cavity variants generated from one layout.
     """
-    tolerance = _validate_tolerance(tolerance)
     if subset_pattern.unit != reference_pattern.unit:
         raise ValueError("The subset and reference patterns must use one unit.")
     if reference_model.unit != reference_pattern.unit:
         raise ValueError("The reference model and pattern must use one unit.")
 
-    subset_model = _panel_model_from_pattern(subset_pattern)
-    reference_surface_keys = {
-        frozenset(reference_model._surface_vertices(surface_id))
-        for surface_id in reference_model.surfaces
-    }
-    point_mapping: dict[str, str] = {}
+    subset_model = _panel_model_from_pattern(subset_pattern, include_holes)
+    holes = hole_attachments(subset_model)
+    hole_point_ids = cut_point_ids(subset_model)
+    panel_point_ids = [
+        point_id for point_id in subset_model.points
+        if point_id not in hole_point_ids
+    ]
+    reference_ids = list(reference_pattern.points)
+    distances, nearest = cKDTree(
+        [(point.x, point.y) for point in reference_pattern.points.values()]
+    ).query(
+        [
+            (subset_pattern.points[pid].x, subset_pattern.points[pid].y)
+            for pid in panel_point_ids
+        ]
+    )
 
-    for point_id, point in subset_model.points.items():
-        source_point = subset_pattern.points[point_id]
-        reference_point_id = reference_pattern.find_point_by_coordinate(
-            source_point.x,
-            source_point.y,
-            tol=tolerance,
-        )
-        if (
-            reference_point_id is None
-            or reference_point_id not in reference_model.points
-        ):
+    point_mapping: dict[str, str] = {}
+    for point_id, distance, index in zip(panel_point_ids, distances, nearest):
+        reference_point = reference_model.points.get(reference_ids[index])
+        if distance > tolerance or reference_point is None:
             raise ValueError(
                 "The subset pattern has no reference-panel match for point "
                 f"{point_id!r}."
             )
+        point_mapping[point_id] = reference_ids[index]
+        point = subset_model.points[point_id]
+        point.x, point.y, point.z = reference_point.x, reference_point.y, reference_point.z
 
-        point_mapping[point_id] = reference_point_id
-        reference_point = reference_model.points[reference_point_id]
-        point.x = reference_point.x
-        point.y = reference_point.y
-        point.z = reference_point.z
-
+    reference_surface_keys = {
+        frozenset(reference_model._surface_vertices(surface_id))
+        for surface_id in reference_model.surfaces
+    }
     for surface_id in subset_model.surfaces:
         mapped_vertices = frozenset(
             point_mapping[point_id]
@@ -245,138 +216,8 @@ def _inherit_folded_geometry(
                 f"{surface_id!r}."
             )
 
+    place_holes(subset_model, holes)
     return subset_model
-
-
-def _hole_host_quad(
-    pattern: TwoDDrawer,
-    hole: dict,
-    tolerance: float,
-) -> str:
-    """Return the parallelogram whose centroid defines a hole punch."""
-    hole_center = np.asarray(hole["center"], dtype=float)
-
-    for surface_id, surface in pattern.surfaces.items():
-        if len(surface.vertices) != 4:
-            continue
-        center = np.mean(
-            [
-                [pattern.points[point_id].x, pattern.points[point_id].y]
-                for point_id in surface.vertices
-            ],
-            axis=0,
-        )
-        if float(np.linalg.norm(center - hole_center)) <= tolerance:
-            return surface_id
-
-    raise ValueError(f"Could not find the host panel for hole {hole['id']!r}.")
-
-
-def _add_folded_hole_punches(
-    pattern: TwoDDrawer,
-    folded_model: Cadder,
-    tolerance: float = 1e-6,
-) -> int:
-    """Rigidly map a pattern's hole-punch cut lines onto folded panels.
-
-    Existing hole points and lines are updated, so the operation also works on
-    a model created directly with ``Cadder.from_drawer``. The return value is
-    the number of mapped hole punches.
-    """
-    tolerance = _validate_tolerance(tolerance)
-    if pattern.unit != folded_model.unit:
-        raise ValueError("The pattern and folded model must use one unit.")
-
-    source_lines = {
-        tuple(sorted((line.start, line.end))): (line_id, line)
-        for line_id, line in pattern.lines.items()
-    }
-
-    for hole in pattern.hole_punches:
-        host_surface_id = _hole_host_quad(pattern, hole, tolerance)
-        if host_surface_id not in folded_model.surfaces:
-            raise ValueError(
-                f"Folded model is missing hole host surface {host_surface_id!r}."
-            )
-        host_point_ids = pattern.surfaces[host_surface_id].vertices
-        if any(point_id not in folded_model.points for point_id in host_point_ids):
-            raise ValueError(
-                f"Folded model is missing vertices of {host_surface_id!r}."
-            )
-
-        planar_quad = np.asarray(
-            [
-                [pattern.points[point_id].x, pattern.points[point_id].y]
-                for point_id in host_point_ids
-            ],
-            dtype=float,
-        )
-        folded_quad = np.asarray(
-            [folded_model.point_array(point_id) for point_id in host_point_ids],
-            dtype=float,
-        )
-
-        planar_basis = np.column_stack(
-            (planar_quad[1] - planar_quad[0], planar_quad[3] - planar_quad[0])
-        )
-        if abs(float(np.linalg.det(planar_basis))) <= tolerance:
-            raise ValueError(
-                f"Hole host surface {host_surface_id!r} is degenerate."
-            )
-        folded_axis_a = folded_quad[1] - folded_quad[0]
-        folded_axis_b = folded_quad[3] - folded_quad[0]
-        hole_point_ids = [
-            f"{hole['id']}_p{index}"
-            for index in range(int(hole["segments"]))
-        ]
-
-        for point_id in hole_point_ids:
-            if point_id not in pattern.points:
-                raise ValueError(
-                    f"Pattern is missing point {point_id!r} for hole "
-                    f"{hole['id']!r}."
-                )
-            source_point = pattern.points[point_id]
-            local_coordinates = np.linalg.solve(
-                planar_basis,
-                np.asarray([source_point.x, source_point.y]) - planar_quad[0],
-            )
-            folded_point = (
-                folded_quad[0]
-                + local_coordinates[0] * folded_axis_a
-                + local_coordinates[1] * folded_axis_b
-            )
-            if point_id in folded_model.points:
-                target_point = folded_model.points[point_id]
-                target_point.x, target_point.y, target_point.z = map(
-                    float,
-                    folded_point,
-                )
-            else:
-                folded_model.add_point(point_id, *folded_point)
-
-        for index, point_id in enumerate(hole_point_ids):
-            next_point_id = hole_point_ids[(index + 1) % len(hole_point_ids)]
-            edge = tuple(sorted((point_id, next_point_id)))
-            if edge not in source_lines:
-                raise ValueError(
-                    f"Pattern is missing the cut-line edge {edge!r}."
-                )
-            line_id, line = source_lines[edge]
-            folded_model.lines[line_id] = {
-                "start": line.start,
-                "end": line.end,
-                "kind": line.kind,
-            }
-
-        surface_holes = folded_model.surface_holes.setdefault(
-            host_surface_id,
-            [],
-        )
-        if hole_point_ids not in surface_holes:
-            surface_holes.append(hole_point_ids)
-
-    return len(pattern.hole_punches)
 
 
 def _surface_coordinates(model: Cadder, surface_id: str) -> np.ndarray:
@@ -514,69 +355,41 @@ def _prepare_layer_models(
                 "reference_model and solve_options apply only when layers "
                 "contains TwoDDrawer patterns."
             )
-        return list(layers)
+        return layers
 
     if not all(isinstance(layer, TwoDDrawer) for layer in layers):
         raise ValueError(
             "layers must contain either only Cadder models or only "
             "TwoDDrawer patterns."
         )
-    if (
-        isinstance(reference_layer, bool)
-        or int(reference_layer) != reference_layer
-    ):
-        raise ValueError("reference_layer must be an integer.")
-    reference_layer = int(reference_layer)
+    reference_layer = integer("reference_layer", reference_layer)
     if not 0 <= reference_layer < len(layers):
         raise ValueError(
             f"reference_layer must be between 0 and {len(layers) - 1}."
         )
 
-    patterns = list(layers)
-    reference_pattern = patterns[reference_layer]
+    reference_pattern = layers[reference_layer]
+    prepared: dict[int, Cadder] = {}
     if reference_model is None:
         from .kinematics import solve_kinematics
 
-        prepared_reference = _panel_model_from_pattern(reference_pattern)
-        solve_result = solve_kinematics(
-            prepared_reference,
-            **dict(solve_options or {}),
+        reference_model = _panel_model_from_pattern(
+            reference_pattern, include_hole_punches,
         )
-        if not solve_result["report"].success:
-            raise RuntimeError(solve_result["report"].message)
-    else:
-        if solve_options is not None:
-            raise ValueError(
-                "solve_options cannot be supplied with reference_model."
-            )
-        prepared_reference = copy.deepcopy(reference_model)
+        report = solve_kinematics(reference_model, **(solve_options or {}))["report"]
+        if not report.success:
+            raise RuntimeError(report.message)
+        prepared[id(reference_pattern)] = reference_model
+    elif solve_options is not None:
+        raise ValueError("solve_options cannot be supplied with reference_model.")
 
-    prepared_by_pattern_id: dict[int, Cadder] = {
-        id(reference_pattern): prepared_reference,
-    }
-    for pattern in patterns:
-        pattern_id = id(pattern)
-        if pattern_id not in prepared_by_pattern_id:
-            prepared_by_pattern_id[pattern_id] = _inherit_folded_geometry(
-                pattern,
-                reference_pattern,
-                prepared_reference,
-                tolerance=tolerance,
+    for pattern in layers:
+        if id(pattern) not in prepared:
+            prepared[id(pattern)] = _inherit_folded_geometry(
+                pattern, reference_pattern, reference_model,
+                tolerance, include_hole_punches,
             )
-
-    if include_hole_punches:
-        unique_patterns = {id(pattern): pattern for pattern in patterns}
-        for pattern_id, pattern in unique_patterns.items():
-            _add_folded_hole_punches(
-                pattern,
-                prepared_by_pattern_id[pattern_id],
-                tolerance=tolerance,
-            )
-    else:
-        for model in prepared_by_pattern_id.values():
-            model.surface_holes = {}
-
-    return [prepared_by_pattern_id[id(pattern)] for pattern in patterns]
+    return [prepared[id(pattern)] for pattern in layers]
 
 
 def stack_mixed_layers(
@@ -616,26 +429,19 @@ def stack_mixed_layers(
     if layer_counts is None:
         raw_layers = source_layers
     else:
-        counts = list(layer_counts)
+        counts = [integer("layer_counts value", count, minimum=1) for count in layer_counts]
         if len(counts) != len(source_layers):
             raise ValueError("layer_counts must have one value per layer entry.")
-        if any(
-            isinstance(count, bool)
-            or int(count) != count
-            or int(count) < 1
-            for count in counts
-        ):
-            raise ValueError("Every layer_counts value must be a positive integer.")
         raw_layers = [
             layer
             for layer, count in zip(source_layers, counts)
-            for _ in range(int(count))
+            for _ in range(count)
         ]
     if not isinstance(require_upper_support, bool):
         raise ValueError("require_upper_support must be a boolean.")
     if not isinstance(include_hole_punches, bool):
         raise ValueError("include_hole_punches must be a boolean.")
-    tolerance = _validate_tolerance(tolerance)
+    tolerance = finite("tolerance", tolerance, positive=True)
     models = _prepare_layer_models(
         raw_layers,
         reference_layer=reference_layer,
@@ -779,18 +585,9 @@ def stack_layers(
     num_layers: int = 4,
     tolerance: float = 1e-6,
 ) -> LayerStackResult:
-    """Build a static assembly by repeating one solved hexagon layer.
-
-    This compatibility API delegates to :func:`stack_mixed_layers`.
-    """
-    if isinstance(num_layers, bool) or int(num_layers) != num_layers:
-        raise ValueError("num_layers must be an integer.")
-    num_layers = int(num_layers)
-    if num_layers < 1:
-        raise ValueError("num_layers must be at least 1.")
-
+    """Build a static assembly by repeating one solved hexagon layer."""
     mixed_result = stack_mixed_layers(
-        [model] * num_layers,
+        [model] * integer("num_layers", num_layers, minimum=1),
         tolerance=tolerance,
     )
     return {
@@ -801,6 +598,3 @@ def stack_layers(
         "max_interface_error": mixed_result["max_interface_error"],
     }
 
-
-# Explicit pattern-specific alias for callers that prefer a descriptive name.
-stack_simple_hexagon_layers = stack_layers

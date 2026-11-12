@@ -39,7 +39,7 @@ def main() -> None:
         # save_fig=True,
         # save_path=f"{OUTPUT_DIR}/2D_hexagon_2by3.png"
     )
-    pattern.save_dxf(f"{OUTPUT_DIR}/2D_hexagon_2by3_solid.dxf", crease_style=["real dashed", 1.5, 1.5], connecting_dots=True, profile="solidworks");
+    pattern.save_dxf(f"{OUTPUT_DIR}/2D_hexagon_2by3_solid.dxf", crease_style=["real dashed", 1.5, 1.5], connecting_dots=True);
 
 if __name__ == "__main__":
     main()

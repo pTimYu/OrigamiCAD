@@ -5,6 +5,53 @@ from contextlib import contextmanager
 import numpy as np
 
 
+def cut_point_ids(model) -> set:
+    """Return the cutout vertices: hole-loop points that are on no panel boundary."""
+    panel_points = {
+        pid for sid in model.surfaces for pid in model._surface_vertices(sid)
+    }
+    return {
+        pid for loops in model.surface_holes.values() for loop in loops for pid in loop
+    } - panel_points
+
+
+def hole_attachments(model) -> list:
+    """Express every cutout vertex in the frame of its host panel.
+
+    Each record holds the three panel vertices that span the frame, the
+    cutout point IDs, and their two in-plane coordinates. Record them before
+    the panels move and pass them to :func:`place_holes` afterward.
+    """
+    cut_points = cut_point_ids(model)
+    attachments = []
+    for surface_id, loops in model.surface_holes.items():
+        point_ids = list(dict.fromkeys(
+            pid for loop in loops for pid in loop if pid in cut_points
+        ))
+        if not point_ids:
+            continue
+        vertices = model._surface_vertices(surface_id)
+        anchors = (vertices[0], vertices[1], vertices[-1])
+        origin, first, second = [model.point_array(pid) for pid in anchors]
+        basis = np.column_stack((first - origin, second - origin))
+        coordinates = np.array([model.point_array(pid) for pid in point_ids])
+        local, _, rank, _ = np.linalg.lstsq(basis, (coordinates - origin).T, rcond=None)
+        if rank != 2:
+            raise ValueError(f"Hole host surface '{surface_id}' is degenerate.")
+        attachments.append((anchors, point_ids, local))
+    return attachments
+
+
+def place_holes(model, attachments) -> None:
+    """Move recorded cutout vertices to where their host panels are now."""
+    for anchors, point_ids, local in attachments:
+        origin, first, second = [model.point_array(pid) for pid in anchors]
+        basis = np.column_stack((first - origin, second - origin))
+        for pid, coordinate in zip(point_ids, origin + (basis @ local).T):
+            point = model.points[pid]
+            point.x, point.y, point.z = map(float, coordinate)
+
+
 @contextmanager
 def panel_only_geometry(model):
     """Temporarily omit cutout vertices and restore them in their panel frames.
@@ -18,29 +65,8 @@ def panel_only_geometry(model):
         yield None
         return
 
-    panel_points = {
-        pid for sid in model.surfaces for pid in model._surface_vertices(sid)
-    }
-    cut_points = {
-        pid for loops in model.surface_holes.values() for loop in loops for pid in loop
-    } - panel_points
-    attachments = []
-    for surface_id, loops in model.surface_holes.items():
-        vertices = model._surface_vertices(surface_id)
-        anchors = (vertices[0], vertices[1], vertices[-1])
-        origin, first, second = [model.point_array(pid) for pid in anchors]
-        basis = np.column_stack((first - origin, second - origin))
-        point_ids = list(dict.fromkeys(
-            pid for loop in loops for pid in loop if pid in cut_points
-        ))
-        if not point_ids:
-            continue
-        coordinates = np.array([model.point_array(pid) for pid in point_ids])
-        local, _, rank, _ = np.linalg.lstsq(basis, (coordinates - origin).T, rcond=None)
-        if rank != 2:
-            raise ValueError(f"Hole host surface '{surface_id}' is degenerate.")
-        attachments.append((anchors, point_ids, local))
-
+    cut_points = cut_point_ids(model)
+    attachments = hole_attachments(model)
     original_points = model.points
     original_lines = model.lines
     original_holes = model.surface_holes
@@ -66,10 +92,4 @@ def panel_only_geometry(model):
         model.points = original_points
         model.lines = original_lines
         model.surface_holes = original_holes
-        for anchors, point_ids, local in attachments:
-            origin, first, second = [model.point_array(pid) for pid in anchors]
-            basis = np.column_stack((first - origin, second - origin))
-            coordinates = origin + (basis @ local).T
-            for pid, coordinate in zip(point_ids, coordinates):
-                point = model.points[pid]
-                point.x, point.y, point.z = map(float, coordinate)
+        place_holes(model, attachments)

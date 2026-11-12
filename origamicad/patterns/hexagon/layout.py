@@ -6,6 +6,7 @@ from functools import wraps
 
 import numpy as np
 
+from ..._validation import finite, integer
 from ...core.two_d_drawer import LineKind, TwoDDrawer
 from .metadata import (
     Coordinate,
@@ -92,187 +93,75 @@ def hex_unit_chain(
     Output:
         Dictionary containing point IDs and surface IDs.
     """
-
     mid_coords, side_coords = _unit_coordinates(start_point, l)
-    even_kind: CreaseKind = "valley" if reverse else "mountain"
-    odd_kind: CreaseKind = "mountain" if reverse else "valley"
+    even_kind, odd_kind = ("valley", "mountain") if reverse else ("mountain", "valley")
     crease_kinds: list[CreaseKind] = [
-        even_kind if i % 2 == 0 else odd_kind
-        for i in range(6)
+        even_kind if i % 2 == 0 else odd_kind for i in range(6)
     ]
 
-    # ------------------------------------------------------------
-    # Inner hexagonal void points
-    # ------------------------------------------------------------
-
-    mid_ids: list[PointID] = []
-    for i, (x, y) in enumerate(mid_coords):
-        pid = pattern.add_point(x, y, f"p{i}_{count}_mid")
-        mid_ids.append(pid)
-
-    # Inner hexagon boundary
+    # Inner hexagonal void and its boundary.
+    mid_ids: list[PointID] = [
+        pattern.add_point(x, y, f"p{i}_{count}_mid")
+        for i, (x, y) in enumerate(mid_coords)
+    ]
     for i in range(6):
-        pattern.add_line(
-            mid_ids[i],
-            mid_ids[(i + 1) % 6],
-            kind="side",
-        )
+        pattern.add_line(mid_ids[i], mid_ids[(i + 1) % 6], kind="side")
 
-    # ------------------------------------------------------------
-    # Outer points
-    # ------------------------------------------------------------
-
-    side_ids: list[PointID] = []
-    for i, (x, y) in enumerate(side_coords):
-        pid = pattern.add_point(x, y, f"p{i}_{count}_side")
-        side_ids.append(pid)
-
-    # ------------------------------------------------------------
-    # Outer side lines + crease lines
-    # ------------------------------------------------------------
-
+    # Outer points: a short boundary segment at each corner with two creases
+    # running to the void, then the longer boundary segments between corners.
+    side_ids: list[PointID] = [
+        pattern.add_point(x, y, f"p{i}_{count}_side")
+        for i, (x, y) in enumerate(side_coords)
+    ]
     for i in range(6):
-        # Small outer boundary segment around each corner
-        pattern.add_line(
-            side_ids[2 * i],
-            side_ids[2 * i + 1],
-            kind="side",
-        )
+        pattern.add_line(side_ids[2 * i], side_ids[2 * i + 1], kind="side")
+        pattern.add_line(side_ids[2 * i], mid_ids[i], kind=crease_kinds[i])
+        pattern.add_line(side_ids[2 * i + 1], mid_ids[i], kind=crease_kinds[i])
+    for i in range(6):
+        pattern.add_line(side_ids[2 * i + 1], side_ids[(2 * i + 2) % 12], kind="side")
 
-        # Creases from outer points to inner void point
-        crease_kind = crease_kinds[i]
-
-        pattern.add_line(
-            side_ids[2 * i],
-            mid_ids[i],
-            kind=crease_kind,
-        )
-
-        pattern.add_line(
-            side_ids[2 * i + 1],
-            mid_ids[i],
-            kind=crease_kind,
-        )
-
-    # Longer outer boundary segments
-    for i in range(5):
-        pattern.add_line(
-            side_ids[2 * i + 1],
-            side_ids[2 * (i + 1)],
-            kind="side",
-        )
-
-    pattern.add_line(
-        side_ids[11],
-        side_ids[0],
-        kind="side",
-    )
-
-    # ------------------------------------------------------------
-    # Add rigid panels / planes
-    # ------------------------------------------------------------
-    #
-    # Each unit chain has:
-    #   6 triangular panels
-    #   6 parallelogram panels
-    #
-    # The inner hexagon is a void, so no surface is added there.
-    #
-    # Do NOT use auto_boundary=True here because the side/crease
-    # lines have already been explicitly assigned above.
-    # ------------------------------------------------------------
-
+    # Six triangular panels around the void's vertices and six parallelogram
+    # panels along its edges. The void itself has no surface. Boundary lines
+    # were assigned explicitly above, so none are generated here.
     triangle_ids: list[SurfaceID] = []
     parallelogram_ids: list[SurfaceID] = []
-
     for i in range(6):
-        # Triangle panel around each inner hexagon vertex
-        tri_id = pattern.add_triangle(
-            mid_ids[i],
-            side_ids[2 * i],
-            side_ids[2 * i + 1],
+        triangle_ids.append(pattern.add_triangle(
+            mid_ids[i], side_ids[2 * i], side_ids[2 * i + 1],
             surface_id=f"tri_{count}_{i}",
-            auto_boundary=False,
-        )
-        triangle_ids.append(tri_id)
-
-        # Parallelogram panel along each inner hexagon edge
-        #
-        # Inner edge:
-        #   mid_ids[i] ---- mid_ids[i+1]
-        #
-        # Outer corresponding edge:
-        #   side_ids[2*i+1] ---- side_ids[2*i+2]
-        #
-        # Use modulo indexing for the closing panel.
-        j = (i + 1) % 6
-
-        quad_id = pattern.add_parallelogram(
-            mid_ids[i],
-            mid_ids[j],
-            side_ids[(2 * i + 2) % 12],
-            side_ids[2 * i + 1],
+        ))
+        parallelogram_ids.append(pattern.add_parallelogram(
+            mid_ids[i], mid_ids[(i + 1) % 6],
+            side_ids[(2 * i + 2) % 12], side_ids[2 * i + 1],
             surface_id=f"quad_{count}_{i}",
-            auto_boundary=False,
-        )
-        parallelogram_ids.append(quad_id)
+        ))
 
-    # ------------------------------------------------------------
-    # Local unit-chain topology for kinematic solver
-    # ------------------------------------------------------------
-    #
-    # Each triangle tri_i has two crease edges:
-    #
-    #   edge A: mid_i -- side_{2i}
-    #       adjacent to quad_{i-1}
-    #
-    #   edge B: mid_i -- side_{2i+1}
-    #       adjacent to quad_i
-    #
-    # This explicit local metadata avoids ambiguous global adjacency
-    # when several unit chains overlap.
-    # ------------------------------------------------------------
-
-    local_creases: list[LocalCrease] = []
-    triangle_kinds: list[TriangleKind] = []
-
-    for i in range(6):
-        crease_kind = crease_kinds[i]
-
-        triangle_kinds.append(
-            {
-                "surface": triangle_ids[i],
-                "kind": crease_kind,
-                "local_index": i,
-                "unit": count,
-            }
-        )
-
-        # Previous quad side
-        local_creases.append(
-            {
-                "unit": count,
-                "local_index": i,
-                "edge": [mid_ids[i], side_ids[2 * i]],
-                "triangle": triangle_ids[i],
-                "quad": parallelogram_ids[(i - 1) % 6],
-                "kind": crease_kind,
-                "side": "previous_quad",
-            }
-        )
-
-        # Current quad side
-        local_creases.append(
-            {
-                "unit": count,
-                "local_index": i,
-                "edge": [mid_ids[i], side_ids[2 * i + 1]],
-                "triangle": triangle_ids[i],
-                "quad": parallelogram_ids[i],
-                "kind": crease_kind,
-                "side": "current_quad",
-            }
-        )
+    # Local topology for the kinematic solver. Triangle i has two creases:
+    # mid_i--side_2i borders the previous quad and mid_i--side_(2i+1) borders
+    # quad i. Recording this avoids ambiguous global adjacency when several
+    # unit chains overlap.
+    triangle_kinds: list[TriangleKind] = [
+        {
+            "surface": triangle_ids[i],
+            "kind": crease_kinds[i],
+            "local_index": i,
+            "unit": count,
+        }
+        for i in range(6)
+    ]
+    local_creases: list[LocalCrease] = [
+        {
+            "unit": count,
+            "local_index": i,
+            "edge": [mid_ids[i], side_ids[2 * i + offset]],
+            "triangle": triangle_ids[i],
+            "quad": parallelogram_ids[(i - 1 + offset) % 6],
+            "kind": crease_kinds[i],
+            "side": side,
+        }
+        for i in range(6)
+        for offset, side in ((0, "previous_quad"), (1, "current_quad"))
+    ]
 
     return {
         "count": count,
@@ -303,28 +192,12 @@ def _quad_coordinate_signatures(
     ]
 
 
-def _quad_coordinate_signature(
-    start_point: Coordinate,
-    l: float,
-    index: int,
-) -> tuple[tuple[float, float], ...]:
-    """Return a rounded coordinate signature for one unit-chain quad."""
-    return _quad_coordinate_signatures(start_point, l)[index]
-
-
 def _validate_hole_punch_diameter(
     name: str,
     diameter: float,
     l: float,
 ) -> float:
-    try:
-        value = float(diameter)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a finite non-negative diameter.") from exc
-
-    if not np.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be a finite non-negative diameter.")
-
+    value = finite(name, diameter, nonnegative=True)
     maximum = float(l * np.sqrt(3) / 2)
     if value > maximum:
         raise ValueError(
@@ -428,7 +301,7 @@ def _rotate_packaging_to_horizon(
 
 
 @_indexed_layout
-def hexagon_packaging(
+def build_packaging(
     pattern: TwoDDrawer,
     l: float = 15.0,
     alpha: int = 2,
@@ -478,18 +351,12 @@ def hexagon_packaging(
         l,
     )
 
-    dimensions = {
-        "alpha": alpha,
-        "beta": beta,
-        "gamma": gamma,
-        "delta": delta,
-    }
-    for name, value in dimensions.items():
-        if int(value) != value:
-            raise ValueError(f"{name} must be an integer.")
-        if value < 0:
-            raise ValueError(f"{name} must be non-negative.")
-
+    alpha, beta, gamma, delta = (
+        integer(name, value, minimum=0)
+        for name, value in (
+            ("alpha", alpha), ("beta", beta), ("gamma", gamma), ("delta", delta),
+        )
+    )
     for name, enabled in {
         "enable_left_open": enable_left_open,
         "enable_right_open": enable_right_open,
@@ -501,11 +368,6 @@ def hexagon_packaging(
     }.items():
         if not isinstance(enabled, bool):
             raise ValueError(f"{name} must be a boolean.")
-
-    alpha = int(alpha)
-    beta = int(beta)
-    gamma = int(gamma)
-    delta = int(delta)
 
     if alpha == 0 or beta == 0:
         raise ValueError("alpha and beta must be positive wall thicknesses.")
@@ -590,11 +452,6 @@ def hexagon_packaging(
     pattern.hex_units = units
     normalize_hex_creases(pattern)
     return pattern.hex_units
-
-
-# Clearer public name. Keep ``hexagon_packaging`` as a compatibility alias for
-# existing callers and for readers familiar with the original API.
-build_packaging = hexagon_packaging
 
 
 def _remove_loop_panels(
@@ -699,31 +556,15 @@ def draw_hex_loops(
         pattern.hex_units
     """
 
-    try:
-        integer_n = int(n)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("n must be a positive integer.") from exc
-    if isinstance(n, bool) or integer_n != n or integer_n < 1:
-        raise ValueError("n must be a positive integer.")
-    cavity_error = "cavity_loops must be an integer with 0 <= cavity_loops < n."
-    try:
-        integer_cavity = int(cavity_loops)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(cavity_error) from exc
-    if (
-        isinstance(cavity_loops, bool)
-        or integer_cavity != cavity_loops
-        or not 0 <= integer_cavity < integer_n
-    ):
-        raise ValueError(cavity_error)
-    if not np.isfinite(l) or l <= 0:
-        raise ValueError("l must be a finite positive value.")
+    n = integer("n", n, minimum=1)
+    cavity_loops = integer("cavity_loops", cavity_loops, minimum=0)
+    if cavity_loops >= n:
+        raise ValueError("cavity_loops must be an integer with 0 <= cavity_loops < n.")
+    finite("l", l, positive=True)
     outer_hole_diameter = _validate_hole_punch_diameter(
         "enable_hole_punch_outer", enable_hole_punch_outer, l,
     )
 
-    n = integer_n
-    cavity_loops = integer_cavity
     if cavity_loops:
         original_points = set(pattern.points)
         original_lines = {lid: line.kind for lid, line in pattern.lines.items()}
