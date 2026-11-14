@@ -29,7 +29,7 @@ def main() -> None:
         model=model,
         inner_dihedral_deg=120,
         num_layers=4,
-        # num_loops and side_length are inferred from model.
+        # The side length is measured from the model.
         verbose=False,
     )
 

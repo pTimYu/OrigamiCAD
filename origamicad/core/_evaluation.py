@@ -26,6 +26,52 @@ def _wrap(angle):
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
 
+def _analytic_unit(v):
+    # Unlike np.linalg.norm, this stays differentiable for complex input.
+    length = np.sqrt(_dot(v, v))
+    return v / length[:, None], length
+
+
+def _dihedral_point_gradient(points):
+    """Gradient of the signed dihedral angle for ``(n, 4, 3)`` point sets.
+
+    The rows are ordered as edge start, edge end, left point, right point.
+    Every operation is complex-differentiable, so a complex step through this
+    function gives the second derivatives to machine precision.
+    """
+    a, b, c, d = np.moveaxis(points, 1, 0)
+    axis, edge_length = _analytic_unit(b - a)
+    p, q = c - a, d - a
+    along_p, along_q = _dot(p, axis), _dot(q, axis)
+    u, left_length = _analytic_unit(p - along_p[:, None] * axis)
+    v, right_length = _analytic_unit(q - along_q[:, None] * axis)
+    cross = np.cross(u, v)
+    sine, cosine = _dot(axis, cross), _dot(u, v)
+    denominator = (sine**2 + cosine**2)[:, None]
+    gu = (cosine[:, None] * np.cross(v, axis) - sine[:, None] * v) / denominator
+    gv = (cosine[:, None] * np.cross(axis, u) - sine[:, None] * u) / denominator
+    ge = cosine[:, None] * cross / denominator
+    gp_perp = (gu - u * _dot(u, gu)[:, None]) / left_length[:, None]
+    gq_perp = (gv - v * _dot(v, gv)[:, None]) / right_length[:, None]
+    pe, qe = _dot(gp_perp, axis), _dot(gq_perp, axis)
+    gp = gp_perp - axis * pe[:, None]
+    gq = gq_perp - axis * qe[:, None]
+    ge = ge - along_p[:, None] * gp_perp - p * pe[:, None] - along_q[:, None] * gq_perp - q * qe[:, None]
+    edge = (ge - axis * _dot(axis, ge)[:, None]) / edge_length[:, None]
+    return np.concatenate((-(edge + gp + gq), edge, gp, gq), axis=1)
+
+
+def _dihedral_point_hessian(points):
+    """Second derivatives of the signed dihedral angle, shape ``(n, 12, 12)``."""
+    step = 1e-30
+    hessian = np.empty((len(points), 12, 12), dtype=float)
+    for column in range(12):
+        shifted = points.astype(complex)
+        shifted[:, column // 3, column % 3] += 1j * step
+        hessian[:, :, column] = _dihedral_point_gradient(shifted).imag / step
+    return 0.5 * (hessian + hessian.transpose(0, 2, 1))
+
+
 class CompiledConstraints:
     """Compile point indices and sparse assembly once for a solver invocation.
 
@@ -200,6 +246,54 @@ class CompiledConstraints:
         result = csr_matrix((data, indices.copy(), indptr.copy()), shape=(self.n_rows, self.n_vars))
         result.eliminate_zeros()
         return result if sparse else result.toarray()
+
+    def weighted_hessian(self, weights, X=None):
+        """Return the sparse ``sum_i weights[i] * Hessian(residual_i)``.
+
+        ``weights`` holds one value per scalar residual, in row order. This is
+        the geometric stiffness of elastic elements (weights ``k * residual``)
+        and the curvature term of hard constraints (weights = multipliers).
+        Coordinate rows are linear and contribute nothing.
+        """
+        X = self._coordinates(X)
+        points = X.reshape(-1, 3)
+        weights = np.asarray(weights, dtype=float)
+        if weights.shape != (self.n_rows,):
+            raise ValueError(f"Expected {self.n_rows} weights, one per residual row.")
+        offsets = np.arange(3)
+        rows, columns, values = [], [], []
+        for kind, group in self.groups.items():
+            if kind not in {"bar_length", _SIGNED}:
+                continue
+            weight = weights[group["rows"]]
+            active = np.flatnonzero(weight)
+            if not active.size:
+                continue
+            indices = group["indices"][active]
+            dofs = (3 * indices[:, :, None] + offsets).reshape(len(indices), -1)
+            if kind == "bar_length":
+                delta, length = self._bar_geometry(points, group)
+                delta, length = delta[active], length[active]
+                if np.any(length == 0.0):
+                    raise ValueError("Bar-length Hessian is undefined for coincident points.")
+                direction = delta / length[:, None]
+                block = (
+                    np.eye(3) - direction[:, :, None] * direction[:, None, :]
+                ) / length[:, None, None]
+                blocks = np.block([[block, -block], [-block, block]])
+            else:
+                blocks = _dihedral_point_hessian(points[indices])
+            blocks = blocks * weight[active][:, None, None]
+            size = dofs.shape[1]
+            rows.append(np.repeat(dofs, size, axis=1).ravel())
+            columns.append(np.tile(dofs, (1, size)).ravel())
+            values.append(blocks.ravel())
+        if not rows:
+            return csr_matrix((self.n_vars, self.n_vars))
+        return csr_matrix(
+            (np.concatenate(values), (np.concatenate(rows), np.concatenate(columns))),
+            shape=(self.n_vars, self.n_vars),
+        )
 
     def _dihedral_gradient(self, group, points):
         (axis, edge_length, p, q, along_p, along_q, u, v,

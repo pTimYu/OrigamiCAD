@@ -237,6 +237,114 @@ from origamicad.patterns.hexagon import minimum_panel_clearance
 gap, closest_pair, clipping = minimum_panel_clearance(model)
 ```
 
+Find the snapped state of a folded pattern that is squeezed from all sides:
+
+```python
+from origamicad.patterns.hexagon import print_insertion_report, simulate_insertion
+
+result = simulate_insertion(inner_dihedral_deg=135.0, num_loops=2)
+print_insertion_report(result)
+```
+
+Two facts about rigid folds of this pattern make this fast.
+
+- **Snap lines.** Triangles stay horizontal and can only translate, and a
+  parallelogram moves its two triangles apart by its width times the cosine of
+  its fold angle. Snapping a parallelogram through 90 degrees gives it the
+  supplementary angle, so the same distance with the opposite sign. Around a
+  unit chain the six contributions must cancel, which they do when opposite
+  parallelograms of the unit are in the same state. Opposite parallelograms
+  are parallel and each is shared with the next unit, so the state runs on:
+  all parallelograms across one row of unit chains snap together.
+  `snap_lines(model)` lists these sets. The one exception is a unit whose six
+  parallelograms alternate between the two states; every line through such a
+  unit changes state there.
+- **Closed-form fold.** For any compatible choice of snapped parallelograms
+  `fold_with_snapped_panels(model, dihedral_deg, snapped)` returns the exact
+  folded coordinates without solving anything.
+
+Squeezing drives the pattern towards the fold that takes the least room, and
+every snapped parallelogram pulls two triangles together by the same amount.
+The default `method="compact"` therefore looks for the rigid fold with the
+most snapped parallelograms that closes everywhere, keeps the cargo where it
+is, and lets no panels pass through each other (`most_compact_fold`). The
+first two conditions are linear, so this is a small mixed-integer program;
+intersections are checked on the exact fold, and each one found excludes the
+panel states that cause it before the program is solved again. Two loops take
+0.1 s and a 2-2-3-4 package about 1 s.
+
+For a `build_packaging` pattern the cargo is the rectangle that rests on the
+vertices of the cavity in the unsnapped fold (`cargo_rectangle`; its size
+equals `calculate_cargo_size`). The vertices it rests on keep resting on the
+same face of the cargo and no other point may enter the rectangle. By default
+they may slide along that face (`cargo_contact="slide"`), which lets a wall
+shorten along the cargo so that it snaps along its whole length;
+`cargo_contact="fixed"` keeps them exactly in place, and then nothing can
+snap between two of them. `whole_lines=True` allows only complete snap lines
+and no alternating units, which shears the walls instead. A side on which the
+cavity is open is left free, so an open package needs no second half. For a
+pattern without a cavity, or when `held` is given, the held parallelograms
+keep the fold angle instead (by default those of the innermost unit chain).
+The result is an exact rigid fold, so `result["assembly"]` stacks it.
+
+`method="pressure"` follows the squeeze itself and returns where a given
+pressure leaves the structure. It is far slower, and walls snap one after
+another, so a low `pressure_max` leaves some sides unsnapped.
+
+In the pressure method the pattern is folded uniformly to `inner_dihedral_deg`. The creases of the
+held cavity panels then stay at that angle while a uniform in-plane pressure
+on the outer boundary is raised from zero. Which panels snap through 90
+degrees, at which pressure, and where they come to rest is computed, not
+prescribed. The model is a bar-and-hinge model:
+
+- triangles are rigid and horizontal; valley triangles stay at one height and
+  each mountain triangle is free to rise on its own;
+- parallelograms can stretch slightly (`panel_stiffness_ratio`, default 1000,
+  is their stiffness relative to a crease);
+- every crease that is not held is a rotational spring of stiffness
+  `hinge_stiffness` per unit length, relaxed at `rest_dihedral_deg` (flat);
+- panels closer than `contact_distance` (default 3 % of the side length)
+  repel each other, so they cannot pass through one another;
+- the load is the potential `pressure * enclosed area` of the outer boundary,
+  which pushes every boundary edge inward with the same force per length.
+
+`held` selects what is held: unit counts hold that unit chain's
+parallelograms, and panel IDs hold every crease of that panel. By default it
+is the panels bordering the cavity, or the innermost unit chain when the
+pattern has no cavity. `constraints` takes a function that receives the folded
+working model and may add any other `Cadder` constraints, which are then
+enforced exactly as well.
+
+The pressure rises until `pressure_max`. Without it, the ramp ends when no
+panel snaps while the pressure triples (`hold_factor`), or when a panel is
+strained beyond `strain_limit`. `result["snap_events"]` lists every snap with
+its pressure, the panels involved, and the energy released; `result["path"]`
+holds the pressure, energy, enclosed area, and lowest stiffness eigenvalue of
+every equilibrium. `result["model"]` is the state right after the last snap.
+If that state is an exact rigid folding (`rigid_compatible`), the model holds
+the exact geometry; otherwise panels are held against each other in a strained
+state, and `max_panel_strain` reports the largest strain.
+`stable_without_load` tells whether the state stays snapped when the pressure
+is removed. Stacking needs all mountain triangles at one height, so
+`result["assembly"]` is `None` for a strained state.
+
+In the pressure method a pattern from `build_packaging` with one side open
+has no closed boundary to press on. Pass it as `model=`: it is completed with the same lattice continued
+over its 180-degree rotation, the closed ring is simulated, and the supplied
+half is returned (`result["closed_model"]` is the ring). A mirrored copy is
+not used because the lattice is chiral.
+
+Results depend on the stiffness ratio and on the contact distance, and more
+than one stable snapped state can exist for the same pressure. The simulation
+returns the state reached by raising the pressure quasi-statically from the
+uniformly folded pattern.
+
+The solver behind it is generic and can be used directly:
+`origamicad.core.mechanics.MechanicalModel` combines hard constraints, elastic
+elements, and load potentials; `origamicad.core.equilibrium.ramp_load` raises
+a load through stable equilibria and across snaps;
+`origamicad.core.contact.ContactBarrier` is the panel contact energy.
+
 Run the derivative and solver checks with:
 
 ```bash
@@ -252,12 +360,18 @@ origamicad/
     _evaluation.py      # solve-scoped constraint batches and sparse assembly
     _direct.py          # trust-region solver with sparse direct linear solves
     clearance.py        # gaps and intersections between folded panels
+    mechanics.py        # elastic energy, load potentials, hard constraints
+    equilibrium.py      # stable equilibria, snaps, and load ramps
+    contact.py          # barrier energy that keeps panels apart
   patterns/
     hexagon/
       layout.py         # hexagon geometry and metadata generation
       kinematics.py     # hexagon-specific constraint setup and solving
       stacking.py       # layer stacks from solved models or 2D patterns
-      insertion_simulation.py  # contact/snap insertion folding
+      insertion_simulation.py  # snap-through insertion under side pressure
+      closure.py        # half-turn closure of a pattern open on one side
+      snap_lines.py     # snap lines and the closed-form rigid fold
+      compact_fold.py   # most compact rigid fold around a cargo
       metadata.py       # shared hexagon metadata types
   io/                   # JSON, DXF, STL, and STEP export
 ```
