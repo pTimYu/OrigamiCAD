@@ -34,9 +34,11 @@ from ...core.panel_holes import hole_attachments, panel_only_geometry, place_hol
 from ...core.topology import boundary_loops, loop_area
 from ...core.two_d_drawer import TwoDDrawer
 from .closure import close_open_pattern
+from .compact_fold import CargoRectangle, cargo_rectangle, most_compact_fold
 from .kinematics import dihedral_constraint_id, solve_kinematics
 from .layout import draw_hex_loops
 from .metadata import iter_local_creases
+from .snap_lines import fold_with_snapped_panels
 from .stacking import stack_layers
 
 
@@ -117,6 +119,8 @@ class InsertionSimulationResult(TypedDict):
     held_panel_ids: frozenset[str]
     crease_assignment_by_edge: dict[tuple[str, str], str]
     closed_model: Optional[Cadder]
+    method: Literal["compact", "pressure"]
+    cargo: Optional[CargoRectangle]
 
 
 def _canonical_edge(point_a: str, point_b: str) -> tuple[str, str]:
@@ -367,6 +371,9 @@ def simulate_insertion(
     *,
     num_loops: int | None = None,
     model: Cadder | None = None,
+    method: Literal["compact", "pressure"] = "compact",
+    cargo_contact: Literal["slide", "fixed"] = "slide",
+    whole_lines: bool = False,
     held: Iterable[int | str] | None = None,
     constraints: Callable[[Cadder], None] | None = None,
     hinge_stiffness: float = 1.0,
@@ -384,11 +391,36 @@ def simulate_insertion(
     contact_tolerance: float | None = None,
     verbose: bool = False,
 ) -> InsertionSimulationResult:
-    """Squeeze a folded pattern from all sides until its panels snap through.
+    """Find the snapped state of a folded pattern squeezed from all sides.
 
-    The pattern is first folded uniformly to ``inner_dihedral_deg``. The
-    creases of the ``held`` panels are then fixed at that angle for the whole
-    simulation, and a uniform in-plane pressure on the outer boundary is
+    The pattern is folded uniformly to ``inner_dihedral_deg`` around its
+    cargo and then squeezed evenly from all sides.
+
+    ``method="compact"`` (the default) returns the state the squeeze ends in:
+    the rigid fold that takes the least room. Every parallelogram is either
+    at ``inner_dihedral_deg`` or snapped to its supplement, the triangles
+    close around every unit chain, panels do not pass through each other, and
+    the cargo is not squeezed. For a packaging pattern the cargo is the
+    rectangle that rests on the vertices of the cavity in the unsnapped fold.
+    Those vertices keep resting on the same face of the cargo: with
+    ``cargo_contact="slide"`` they may move along it, so a wall can shorten
+    along the cargo and snaps along its whole length; ``"fixed"`` keeps them
+    exactly in place, which stops every snap between two of them. A side the
+    cavity is open on is left free, so nothing needs to be added there.
+    ``whole_lines=True`` only lets complete snap lines snap (see
+    :func:`snap_lines`); by default a unit chain may also alternate. For a
+    pattern without a cavity, or when ``held`` is given, the held
+    parallelograms keep their angle instead. This takes seconds; see
+    :func:`most_compact_fold`. Of the remaining arguments only ``held`` and
+    the geometry arguments apply to it.
+
+    ``method="pressure"`` follows the squeeze itself with slightly compliant
+    panels, as described next, and returns where a given pressure leaves the
+    structure. It is much slower, and the walls snap one after another, so a
+    low pressure leaves some sides unsnapped.
+
+    In the pressure method the creases of the ``held`` panels are fixed at
+    the fold angle, and a uniform in-plane pressure on the outer boundary is
     raised from zero. Triangles stay rigid and horizontal, each mountain
     triangle at its own height; parallelograms can stretch slightly; the other
     creases are springs; and panels cannot pass through each other. The
@@ -433,6 +465,8 @@ def simulate_insertion(
     elastic equilibrium and ``max_panel_strain`` reports its largest strain.
     """
     contact_deg = _angle("inner_dihedral_deg", inner_dihedral_deg, 90.0, 180.0)
+    if method not in ("compact", "pressure"):
+        raise ValueError("method must be 'compact' or 'pressure'.")
     rest_dihedral_deg = _angle("rest_dihedral_deg", rest_dihedral_deg, 0.0, 180.0 + 1e-9)
     if model is not None and not isinstance(model, Cadder):
         raise TypeError("model must be a Cadder instance or None.")
@@ -473,7 +507,7 @@ def simulate_insertion(
         model._constraint_count = 0
 
         closure = None
-        if close_open_side and not cavity_panel_ids(pattern):
+        if method == "pressure" and close_open_side and not cavity_panel_ids(pattern):
             try:
                 closure = close_open_pattern(pattern)
             except ValueError:
@@ -512,6 +546,11 @@ def simulate_insertion(
         max(contact_distance, length_tolerance) if contact_tolerance is None else contact_tolerance,
         positive=True,
     )
+    if method == "compact":
+        return _compact_insertion(
+            model, pattern, contact_deg, num_layers, side_length, held,
+            length_tolerance, contact_tolerance, cargo_contact, whole_lines,
+        )
     held_panels = _held_panels(pattern, held)
 
     with panel_only_geometry(model):
@@ -712,6 +751,109 @@ def simulate_insertion(
             for cid, angle in zip(crease_ids, angles)
         },
         "closed_model": None,
+        "method": "pressure",
+        "cargo": None,
+    }
+
+
+def _compact_insertion(
+    model, pattern, contact_deg, num_layers, side_length, held, length_tolerance,
+    contact_tolerance, cargo_contact, whole_lines,
+):
+    """Return the most compact rigid fold in the result format of the simulation."""
+    with panel_only_geometry(model):
+        cargo = None
+        if held is None:
+            try:
+                cargo = cargo_rectangle(
+                    model, fold_with_snapped_panels(model, contact_deg),
+                )
+            except ValueError:
+                # No rectangular cavity: hold the innermost panels instead.
+                cargo = None
+        quads = {
+            crease["quad"] for unit in model.hex_units
+            for crease in iter_local_creases(model, unit)
+        }
+        held_panels = set() if cargo is not None else _held_panels(pattern, held) & quads
+        fold = most_compact_fold(
+            model, contact_deg, held=held_panels, cargo=cargo,
+            cargo_contact=cargo_contact, whole_lines=whole_lines,
+        )
+        model.set_coordinate_vector(fold.coordinates)
+
+    snap_deg = 180.0 - contact_deg
+    panel_states: dict[str, InsertionPanelState] = {}
+    assignment: dict[tuple[str, str], str] = {}
+    for unit in model.hex_units:
+        for crease in iter_local_creases(model, unit):
+            quad = crease["quad"]
+            state = "snap" if quad in fold.snapped else "contact"
+            angle = snap_deg if quad in fold.snapped else contact_deg
+            assignment[_canonical_edge(*crease["edge"])] = state
+            panel = panel_states.setdefault(quad, {
+                "surface_id": quad, "state": state, "held": quad in held_panels,
+                "dihedrals_deg": (), "adjacent_triangle_ids": (),
+            })
+            if crease["triangle"] not in panel["adjacent_triangle_ids"]:
+                panel["dihedrals_deg"] += (angle,)
+                panel["adjacent_triangle_ids"] += (crease["triangle"],)
+
+    minimum_gap, closest_pair, clipping = minimum_panel_clearance(model)
+    try:
+        stack = stack_layers(model, num_layers=num_layers, tolerance=length_tolerance)
+        assembly = stack["model"]
+        layer_height, interface_error = stack["layer_height"], stack["max_interface_error"]
+    except ValueError:
+        assembly = layer_height = interface_error = None
+    contact_detected = minimum_gap <= contact_tolerance
+    if not fold.snapped:
+        status, reason = "no_snap", "No panel can snap without squeezing the cargo or clipping."
+    else:
+        status = "panel_contact" if contact_detected else "compact_nonclipping"
+        reason = "Most compact rigid fold around the " + (
+            "cargo." if cargo is not None else "held panels."
+        )
+    if clipping or fold.clipping:
+        reason += " Panels intersect in the returned state."
+    if fold.cargo_overlap > length_tolerance:
+        reason += f" The structure reaches {fold.cargo_overlap:.3g} into the cargo."
+    return {
+        "model": model,
+        "assembly": assembly,
+        "pattern": pattern,
+        "status": status,
+        "reason": reason,
+        "contact_dihedral_deg": contact_deg,
+        "snap_dihedral_deg": snap_deg,
+        "num_layers": num_layers,
+        "side_length": side_length,
+        "layer_height": layer_height,
+        "max_interface_error": interface_error,
+        "final_pressure": 0.0,
+        "highest_pressure": 0.0,
+        "stop_reason": (
+            f"Solved in {fold.rounds} rounds; "
+            f"{fold.excluded_combinations} clipping combinations excluded."
+        ),
+        "snap_events": [],
+        "path": [],
+        "rigid_compatible": True,
+        "max_panel_strain": 0.0,
+        "stable_without_load": None,
+        "minimum_panel_gap": minimum_gap,
+        "closest_panel_pair": closest_pair,
+        "contact_detected": contact_detected,
+        "panel_states": panel_states,
+        "contact_panel_ids": frozenset(
+            sid for sid, panel in panel_states.items() if panel["state"] == "contact"
+        ),
+        "snap_panel_ids": frozenset(fold.snapped),
+        "held_panel_ids": frozenset(held_panels),
+        "crease_assignment_by_edge": assignment,
+        "closed_model": None,
+        "method": "compact",
+        "cargo": cargo,
     }
 
 
@@ -736,9 +878,14 @@ def print_insertion_report(result: InsertionSimulationResult) -> None:
         ("Panels contact / snap / partial", f"{counts['contact']} / {counts['snap']} / "
                                             f"{counts['partial']}"),
         ("Held panels", len(result["held_panel_ids"])),
+        ("Method", result["method"]),
+        ("Cargo size", "-" if result["cargo"] is None else " x ".join(
+            "open" if not np.isfinite(size) else f"{size:.3f}"
+            for size in result["cargo"].high - result["cargo"].low
+        )),
         ("Pressure at returned state", f"{result['final_pressure']:.6g}"),
         ("Highest pressure applied", f"{result['highest_pressure']:.6g}"),
-        ("Ramp ended because", result["stop_reason"]),
+        ("Search or ramp ended", result["stop_reason"]),
         ("Exact rigid folding", "yes" if result["rigid_compatible"] else "no"),
         ("Largest panel strain", f"{result['max_panel_strain']:.3%}"),
         ("Stays snapped without load", optional(result["stable_without_load"], "{}")),
@@ -859,6 +1006,20 @@ def draw_insertion_simulation(
         [layer.point_array(point_id)[:2] for point_id in layer.points], dtype=float,
     )
     xy_min, xy_max = np.min(points_xy, axis=0), np.max(points_xy, axis=0)
+    cargo = result.get("cargo")
+    if cargo is not None:
+        normal = np.array([-cargo.axis[1], cargo.axis[0]])
+        along = cargo.coordinates(points_xy)
+        low = np.where(np.isfinite(cargo.low), cargo.low, along.min(axis=0))
+        high = np.where(np.isfinite(cargo.high), cargo.high, along.max(axis=0))
+        outline = [
+            u * cargo.axis + v * normal
+            for u, v in ((low[0], low[1]), (high[0], low[1]), (high[0], high[1]), (low[0], high[1]))
+        ]
+        axis.add_patch(plt.Polygon(
+            outline, closed=True, fill=False, edgecolor="#c0392b", linewidth=1.6,
+            linestyle="--", zorder=500.0,
+        ))
     center = 0.5 * (xy_min + xy_max)
     half_span = (0.5 + 0.075) * float(np.max(xy_max - xy_min))
     axis.set_xlim(center[0] - half_span, center[0] + half_span)
