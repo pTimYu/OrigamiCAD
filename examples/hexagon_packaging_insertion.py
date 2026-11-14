@@ -40,6 +40,9 @@ def main() -> None:
         inner_dihedral_deg=135.0,
         num_layers=2,
         model=model,
+        # Only the pressure method closes the open side into a ring; the
+        # default compact method leaves it free and has no closed_model.
+        method="pressure",
         # The pressure the package is squeezed to. Without it the ramp
         # continues until no panel snaps while the pressure triples.
         pressure_max=0.6,

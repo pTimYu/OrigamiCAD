@@ -516,7 +516,7 @@ def simulate_insertion(
         if closure is not None:
             ring = simulate_insertion(
                 contact_deg, num_layers, model=Cadder.from_drawer(closure.pattern),
-                held=held, constraints=constraints, hinge_stiffness=hinge_stiffness,
+                method=method, held=held, constraints=constraints, hinge_stiffness=hinge_stiffness,
                 rest_dihedral_deg=rest_dihedral_deg,
                 panel_stiffness_ratio=panel_stiffness_ratio,
                 contact_distance=contact_distance, pressure_max=pressure_max,
