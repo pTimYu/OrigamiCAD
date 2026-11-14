@@ -17,11 +17,7 @@ import copy
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Optional, TypedDict
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.collections import PolyCollection
-from matplotlib.patches import Patch
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from ..._validation import finite, integer
 from ...core._evaluation import CompiledConstraints
@@ -520,7 +516,7 @@ def simulate_insertion(
         if closure is not None:
             ring = simulate_insertion(
                 contact_deg, num_layers, model=Cadder.from_drawer(closure.pattern),
-                held=held, constraints=constraints, hinge_stiffness=hinge_stiffness,
+                method=method, held=held, constraints=constraints, hinge_stiffness=hinge_stiffness,
                 rest_dihedral_deg=rest_dihedral_deg,
                 panel_stiffness_ratio=panel_stiffness_ratio,
                 contact_distance=contact_distance, pressure_max=pressure_max,
@@ -922,6 +918,8 @@ def print_insertion_report(result: InsertionSimulationResult) -> None:
 
 
 def _finish_figure(figure, save_path, show: bool, dpi: int) -> Path | None:
+    import matplotlib.pyplot as plt
+
     resolved_path = None
     if save_path is not None:
         resolved_path = Path(save_path).expanduser().resolve()
@@ -942,6 +940,12 @@ def draw_insertion_simulation(
     dpi: int = 240,
 ) -> Path | None:
     """Draw an orthographic top view of the selected one-layer state."""
+    # Matplotlib is imported here so that the simulation itself does not
+    # load the plotting stack.
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import PolyCollection
+    from matplotlib.patches import Patch
+
     layer = result["model"]
     inner_surfaces = result["held_panel_ids"]
     panel_edge = "#566568"
@@ -1057,6 +1061,10 @@ def draw_insertion_stack_3d(
     dpi: int = 240,
 ) -> Path | None:
     """Draw the actual, non-exploded stacked assembly in isometric view."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
     assembly = result["assembly"]
     if assembly is None:
         raise ValueError(

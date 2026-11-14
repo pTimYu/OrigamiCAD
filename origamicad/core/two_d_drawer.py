@@ -4,14 +4,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import math
-from typing import Dict, List, Literal, Optional, Tuple
-
-import matplotlib.pyplot as plt
-from matplotlib.collections import LineCollection, PolyCollection
-from matplotlib.lines import Line2D as MplLine2D
-from matplotlib.patches import Circle
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 from .._validation import finite, integer
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+
+# Matplotlib is imported inside the drawing functions, so that importing
+# origamicad does not load the plotting stack.
 
 LineKind = Literal["valley", "mountain", "side", "rigid", "construction"]
 
@@ -42,6 +44,8 @@ def line_style(kind: str) -> dict:
 
 def add_line_legend(ax, kinds) -> None:
     """Add a legend for the line kinds that are present."""
+    from matplotlib.lines import Line2D as MplLine2D
+
     handles = [
         MplLine2D([0], [0], label=label, **LINE_STYLES[kind])
         for kind, label in _LINE_LABELS.items()
@@ -827,18 +831,27 @@ class TwoDDrawer:
         save_fig: bool = False,
         save_path: str = "pattern.png",
         dpi: int = 300,
-    ) -> None:
+        show: bool = True,
+    ) -> Tuple["Figure", "Axes"]:
         """
-        Draw the 2D pattern using matplotlib.
+        Draw the 2D pattern using matplotlib and return ``(fig, ax)``.
 
         Args:
             save_fig:
-                If True, save the figure with plt.savefig().
+                If True, save the figure with fig.savefig().
             save_path:
                 Output path used when save_fig is True.
             dpi:
                 Image resolution used when save_fig is True.
+            show:
+                If True, call plt.show(). Pass False to keep the figure open
+                for further changes, or to draw without a display; the caller
+                then owns the figure and closes it with plt.close(fig).
         """
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection, PolyCollection
+        from matplotlib.patches import Circle
+
         fig, ax = plt.subplots(figsize=figsize)
 
         def xy(point_id):
@@ -918,6 +931,8 @@ class TwoDDrawer:
         add_line_legend(ax, set(segments))
 
         if save_fig:
-            plt.savefig(save_path, dpi=dpi)
+            fig.savefig(save_path, dpi=dpi)
 
-        plt.show()
+        if show:
+            plt.show()
+        return fig, ax
