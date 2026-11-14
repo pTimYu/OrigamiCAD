@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.path import Path
-from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
 from .two_d_drawer import add_line_legend, line_style
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
+    from mpl_toolkits.mplot3d import Axes3D
 
 
 class CadVisualizationMixin:
@@ -26,7 +27,25 @@ class CadVisualizationMixin:
         save_fig: bool = False,
         save_path: str = "model.png",
         dpi: int = 300,
-    ) -> None:
+        show: bool = True,
+    ) -> Tuple["Figure", "Axes3D"]:
+        """
+        Draw the 3D model using matplotlib and return ``(fig, ax)``.
+
+        Args:
+            save_fig:
+                If True, save the figure to save_path at dpi.
+            show:
+                If True, call plt.show(). Pass False to keep the figure open
+                for further changes, or to draw without a display; the caller
+                then owns the figure and closes it with plt.close(fig).
+        """
+        # Imported here so that importing origamicad does not load the
+        # plotting stack.
+        import matplotlib.pyplot as plt
+        from matplotlib.path import Path
+        from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
+
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection="3d")
         coordinates = {pid: self.point_array(pid) for pid in self.points}
@@ -96,9 +115,11 @@ class CadVisualizationMixin:
         add_line_legend(ax, set(segments))
 
         if save_fig:
-            plt.savefig(save_path, dpi=dpi)
+            fig.savefig(save_path, dpi=dpi)
 
-        plt.show()
+        if show:
+            plt.show()
+        return fig, ax
 
     def _set_axes_equal_3d(self, ax) -> None:
         coords = np.array([[p.x, p.y, p.z] for p in self.points.values()], dtype=float)

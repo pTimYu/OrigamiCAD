@@ -383,3 +383,9 @@ python -m examples.hexagon_example_2d
 python -m examples.hexagon_example_3d
 python -m examples.simple_hexagon_insertion_projection_dxf
 ```
+
+`TwoDDrawer.draw()` and `Cadder.draw()` open the figure with `plt.show()` and
+return `(fig, ax)`. Pass `show=False` to keep editing the figure, or to draw
+without a display; the figure is then yours to close with `plt.close(fig)`.
+Matplotlib is imported only when something is drawn, so `import origamicad`
+does not load it.
