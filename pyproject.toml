@@ -1,12 +1,14 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "origamicad"
-version = "0.1.0"
+dynamic = ["version"]
 description = "2D crease-pattern drawing, origami kinematics, and CAD export helpers."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "ezdxf>=1.4,<2",
@@ -14,6 +16,10 @@ dependencies = [
     "numpy",
     "scipy",
 ]
+
+[tool.setuptools.dynamic]
+# The version is written only in origamicad/__init__.py.
+version = {attr = "origamicad.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["origamicad*"]

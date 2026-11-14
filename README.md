@@ -376,7 +376,14 @@ origamicad/
   io/                   # JSON, DXF, STL, and STEP export
 ```
 
-Run the 2D and 3D examples from the project root with:
+The examples import the installed package. Install it once from the project
+root in editable mode, so that code changes take effect without reinstalling:
+
+```bash
+python -m pip install -e .
+```
+
+Then run the 2D and 3D examples from the project root with:
 
 ```bash
 python -m examples.hexagon_example_2d
@@ -389,3 +396,5 @@ return `(fig, ax)`. Pass `show=False` to keep editing the figure, or to draw
 without a display; the figure is then yours to close with `plt.close(fig)`.
 Matplotlib is imported only when something is drawn, so `import origamicad`
 does not load it.
+
+OrigamiCAD is released under the MIT License; see `LICENSE`.
