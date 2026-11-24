@@ -10,6 +10,7 @@ exporting JSON, DXF, STL, or STEP files.
 - [Quick start](#quick-start)
 - [Examples](#examples)
 - [Crease patterns](#crease-patterns)
+- [Laser-cut sheet layouts](#laser-cut-sheet-layouts)
 - [Folding kinematics](#folding-kinematics)
 - [Cargo dimensions](#cargo-dimensions)
 - [Panel clearance](#panel-clearance)
@@ -24,7 +25,7 @@ exporting JSON, DXF, STL, or STEP files.
 ## Installation
 
 OrigamiCAD needs Python 3.10 or newer and git. pip installs its dependencies
-(NumPy, SciPy, Matplotlib, and ezdxf) automatically.
+(NumPy, SciPy, Matplotlib, ezdxf, and Shapely) automatically.
 
 ### Install from GitHub
 
@@ -131,6 +132,56 @@ When using `Cadder.from_drawer(pattern)` and `solve_kinematics`, hole contours
 move with their panels without adding folding degrees of freedom. The 3D
 preview and zero-thickness STEP export preserve the openings, including in
 stacked layers.
+
+## Laser-cut sheet layouts
+
+Nest multiple pattern variants on one sheet and export a DXF. Supply sheet
+dimensions, margins, and spacing in millimetres. This example uses a 558.8 mm
+by 711.2 mm sheet with a 2 mm edge margin.
+
+```python
+from origamicad import TwoDDrawer
+from origamicad.io import SheetPattern, save_sheet_dxf
+from origamicad.patterns.hexagon import draw_hex_loops
+
+plain = TwoDDrawer(unit="mm")
+punched = TwoDDrawer(unit="mm")
+draw_hex_loops(plain, n=2, l=15)
+draw_hex_loops(punched, n=2, l=15, enable_hole_punch_outer=2.5)
+
+layout = save_sheet_dxf(
+    [SheetPattern("plain", plain), SheetPattern("punched", punched)],
+    "mixed_pattern_sheet.dxf",
+    width_mm=558.8,
+    height_mm=711.2,
+    margin_mm=2.0,
+)
+print(layout.counts, f"{layout.utilization:.1%} footprint coverage")
+```
+
+Use `quantity=4` on a `SheetPattern` to request four copies or `quantity=0`
+to skip that pattern. Patterns with `quantity=None` take turns filling the
+available space after the numbered requests. For a placement preview in code,
+call `layout_sheet` with the same layout arguments and inspect
+`layout.placements` and `layout.unplaced` before calling `layout.save_dxf(...)`.
+Export requires all numbered requests to fit unless you pass `allow_partial=True`.
+
+The layout searches actual outer cut contours at the permitted `rotations_deg`
+and can mirror individual copies. Pass `allow_mirror=False` to keep the original
+handedness. A mirrored placement reports `mirrored=True` and reflects the
+source x coordinate before rotation. The search is heuristic, and the reported
+footprint coverage includes reserved holes and cavities.
+`spacing_mm` defaults to 0, so touching patterns can share a single cut.
+Positive spacing keeps the contours apart. The millimetre DXF puts outlines
+and hole cuts on `CUT_SIDE` and creases on `CREASE_MOUNTAIN` and `CREASE_VALLEY`.
+Creases default to separate 2 mm line segments with 2 mm gaps between them.
+Use `crease_style=("real dashed", dash_mm, gap_mm)` to set different lengths.
+For creases 2 mm or shorter, choose a shorter dash length so a full dash fits
+with clearance at both ends.
+The sheet boundary is implicit. Use `include_creases=False` for a cut-only file.
+
+Run `python -m examples.mixed_pattern_sheet_dxf` to write the example to
+`examples/output/mixed_pattern_sheet.dxf`.
 
 ## Folding kinematics
 
@@ -514,6 +565,7 @@ origamicad/
   io/                   # JSON, DXF, STL, and STEP export
     cad_export.py       # JSON, STL, and STEP export of 3D models
     dxf_export.py       # DXF export of 2D patterns
+    sheet_layout.py     # pattern nesting and sheet DXF export
 ```
 
 ### Version

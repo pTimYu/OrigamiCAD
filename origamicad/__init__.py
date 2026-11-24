@@ -5,7 +5,7 @@ from .core.jacobian import JacobianBuilder
 from .core.two_d_drawer import Line2D, Point2D, Surface2D, TwoDDrawer
 
 # The only place the version is written; pyproject.toml reads it from here.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Cadder",
