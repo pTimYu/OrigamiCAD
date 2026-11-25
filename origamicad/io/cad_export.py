@@ -1,12 +1,12 @@
 """File exporters used by :class:`origamicad.Cadder`.
 
-The exporters intentionally depend only on NumPy and the Python standard
-library.  STL is written as a triangle mesh.  STEP is written as faceted BREP
-geometry, which preserves each thickened origami panel as a separate solid.
+STL is written as a triangle mesh. STEP writes planar BREP faces as connected
+surface shells or as separate thickened panel solids, without a CAD kernel.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -24,6 +24,7 @@ PanelGeometry = tuple[
     np.ndarray,
     list[HoleLoopGeometry],
 ]
+_STEP_LENGTH_TOLERANCE = 1e-7
 
 
 def model_to_dict(model) -> dict:
@@ -116,12 +117,14 @@ def save_step(
 ) -> Path:
     """Write STEP surfaces or advanced BREP solids without a CAD kernel.
 
+    By default, zero-thickness exports join panels with shared model edges
+    into surface shells and merge adjacent coplanar panels into single faces.
     Set ``separate_layer_parts=True`` for a stacked model whose surface IDs
     use the ``layer_<index>::<surface_id>`` convention.  The resulting STEP
-    file contains one product definition per layer, allowing Abaqus/CAE to
-    import the layers as separate parts. Panel hole punches recorded in
-    ``model.surface_holes`` are exported as true inner face boundaries for
-    zero-thickness shell surfaces.
+    file contains one product definition per layer, with individual panel
+    faces, allowing Abaqus/CAE to import the layers as separate parts.
+    Hole punches in ``model.surface_holes`` become inner face boundaries
+    for zero-thickness surfaces.
     """
     thickness = finite("thickness", thickness, nonnegative=True)
     if separate_layer_parts and thickness != 0.0:
@@ -133,13 +136,19 @@ def save_step(
     path = Path(filename)
     step = _StepFile()
 
-    app = step.add(
-        "APPLICATION_CONTEXT(" 
-        "'configuration controlled 3d designs of mechanical parts and assemblies')"
-    )
+    # AP214 defines the manifold surface representation used by the sheet export.
+    use_ap214 = thickness == 0.0 and not separate_layer_parts
+    if use_ap214:
+        application = "core data for automotive mechanical design processes"
+        protocol = "'automotive_design',2000"
+        schema = "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }"
+    else:
+        application = "configuration controlled 3d designs of mechanical parts and assemblies"
+        protocol = "'config_control_design',1994"
+        schema = "CONFIG_CONTROL_DESIGN"
+    app = step.add(f"APPLICATION_CONTEXT('{application}')")
     step.add(
-        "APPLICATION_PROTOCOL_DEFINITION(" 
-        f"'international standard','config_control_design',1994,{app})"
+        f"APPLICATION_PROTOCOL_DEFINITION('international standard',{protocol},{app})"
     )
     product_context = step.add(f"PRODUCT_CONTEXT('',{app},'mechanical')")
     definition_context = step.add(
@@ -154,8 +163,8 @@ def save_step(
         "(NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT())"
     )
     uncertainty = step.add(
-        "UNCERTAINTY_MEASURE_WITH_UNIT(" 
-        f"LENGTH_MEASURE(1.E-7),{length_unit}," 
+        "UNCERTAINTY_MEASURE_WITH_UNIT("
+        f"LENGTH_MEASURE({_step_number(_STEP_LENGTH_TOLERANCE)}),{length_unit},"
         "'distance_accuracy_value','confusion accuracy')"
     )
     context = step.add(
@@ -185,10 +194,13 @@ def save_step(
             f"({product_context}))"
         )
         products.append(product)
-        formation = step.add(
-            "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE("
-            f"'','',{product},.NOT_KNOWN.)"
-        )
+        if use_ap214:
+            formation = step.add(f"PRODUCT_DEFINITION_FORMATION('','',{product})")
+        else:
+            formation = step.add(
+                "PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE("
+                f"'','',{product},.NOT_KNOWN.)"
+            )
         product_definition = step.add(
             f"PRODUCT_DEFINITION('design','',{formation},{definition_context})"
         )
@@ -202,7 +214,7 @@ def save_step(
             representation_name=part_name,
             placement=placement,
             context=context,
-            connected_open_shell=separate_layer_parts,
+            separate_layer_parts=separate_layer_parts,
         )
         step.add(
             f"SHAPE_DEFINITION_REPRESENTATION({product_shape},{representation})"
@@ -211,7 +223,7 @@ def save_step(
     step.add(
         f"PRODUCT_RELATED_PRODUCT_CATEGORY('part','',({_refs(products)}))"
     )
-    step.write(path, model_name)
+    step.write(path, model_name, schema)
     return path
 
 
@@ -338,49 +350,38 @@ def _step_panel_representation(
     representation_name: str,
     placement: str,
     context: str,
-    connected_open_shell: bool,
+    separate_layer_parts: bool,
 ) -> str:
     """Add one STEP shape representation containing the supplied panels."""
     escaped_name = _step_string(representation_name)
     panels = list(panels)
 
     if thickness == 0.0:
-        if connected_open_shell:
+        shells = []
+        groups = _panel_shell_groups(panels, require_single_shell=separate_layer_parts)
+        for group in groups:
             coordinates, face_indices, face_names, face_inner_indices = (
-                _connected_shell_geometry(panels)
+                _shell_geometry(group)
             )
+            if not separate_layer_parts and len(group) > 1:
+                face_indices, face_names, face_inner_indices = _merge_coplanar_faces(
+                    coordinates, face_indices, face_names, face_inner_indices
+                )
             faces = step.advanced_faces(
                 coordinates,
                 face_indices,
                 face_names,
                 face_inner_indices=face_inner_indices,
             )
-            shells = [step.add(f"OPEN_SHELL('',({_refs(faces)}))")]
-        else:
-            shells = []
-            for surface_id, _, polygon, hole_loops in panels:
-                coordinates = [*polygon]
-                inner_indices = []
-                for _, hole_polygon in hole_loops:
-                    if float(
-                        np.dot(
-                            _polygon_normal(hole_polygon),
-                            _polygon_normal(polygon),
-                        )
-                    ) < 0.0:
-                        hole_polygon = hole_polygon[::-1]
-                    start = len(coordinates)
-                    coordinates.extend(hole_polygon)
-                    inner_indices.append(
-                        list(range(start, start + len(hole_polygon)))
-                    )
-                faces = step.advanced_faces(
-                    np.asarray(coordinates, dtype=float),
-                    [list(range(len(polygon)))],
-                    [surface_id],
-                    face_inner_indices=[inner_indices],
-                )
-                shells.append(step.add(f"OPEN_SHELL('',({_refs(faces)}))"))
+            shell_type = "OPEN_SHELL"
+            if not separate_layer_parts and _is_closed_shell(face_indices, face_inner_indices):
+                shell_type = "CLOSED_SHELL"
+            shells.append(step.add(f"{shell_type}('',({_refs(faces)}))"))
+
+        if not shells:
+            return step.add(
+                f"SHAPE_REPRESENTATION('{escaped_name}',({placement}),{context})"
+            )
 
         surface_model = step.add(
             f"SHELL_BASED_SURFACE_MODEL('{escaped_name}',({_refs(shells)}))"
@@ -440,16 +441,11 @@ def _step_panel_representation(
     )
 
 
-def _connected_shell_geometry(
-    panels: list[PanelGeometry],
-) -> tuple[
-    np.ndarray,
-    list[list[int]],
-    list[str],
-    list[list[list[int]]],
-]:
-    """Build consistently oriented faces with shared vertices and edges."""
-    if not panels:
+def _panel_shell_groups(
+    panels: list[PanelGeometry], *, require_single_shell: bool,
+) -> list[list[PanelGeometry]]:
+    """Group panels with shared edges and orient them consistently."""
+    if require_single_shell and not panels:
         raise ValueError("A connected STEP shell requires at least one panel.")
 
     edge_occurrences: dict[
@@ -473,51 +469,89 @@ def _connected_shell_geometry(
                 (face_index, (start_id, end_id) == edge)
             )
 
-    adjacency: dict[int, list[tuple[int, bool]]] = {
-        face_index: []
-        for face_index in range(len(panels))
-    }
+    adjacency: list[list[tuple[int, bool]]] = [[] for _ in panels]
+    branch_faces = set()
     for edge, occurrences in edge_occurrences.items():
         if len(occurrences) > 2:
-            raise ValueError(
-                "Cannot create a manifold layer shell because edge "
-                f"{edge!r} belongs to {len(occurrences)} panels."
-            )
+            if require_single_shell:
+                raise ValueError(
+                    "Cannot create a manifold layer shell because edge "
+                    f"{edge!r} belongs to {len(occurrences)} panels."
+                )
+            branch_faces.update(index for index, _ in occurrences)
         if len(occurrences) == 2:
-            (first_face, first_direction), (
-                second_face,
-                second_direction,
-            ) = occurrences
+            (first_face, first_direction), (second_face, second_direction) = occurrences
             flip_relation = first_direction == second_direction
             adjacency[first_face].append((second_face, flip_relation))
             adjacency[second_face].append((first_face, flip_relation))
 
-    flips: dict[int, bool] = {0: False}
-    pending = [0]
-    while pending:
-        face_index = pending.pop()
-        for neighbor, flip_relation in adjacency[face_index]:
-            neighbor_flip = flips[face_index] ^ flip_relation
-            if neighbor in flips:
-                if flips[neighbor] != neighbor_flip:
-                    raise ValueError(
-                        "Layer panels do not form an orientable STEP shell."
-                    )
-                continue
-            flips[neighbor] = neighbor_flip
-            pending.append(neighbor)
+    groups = []
+    flips: dict[int, bool] = {}
+    for first_face in range(len(panels)):
+        if first_face in flips:
+            continue
+        if require_single_shell and groups:
+            disconnected = [
+                panel[0] for index, panel in enumerate(panels) if index not in flips
+            ]
+            raise ValueError(
+                "Each exported layer must be connected through shared panel "
+                f"edges; disconnected panels include {disconnected[:5]}."
+            )
 
-    if len(flips) != len(panels):
-        disconnected = [
-            panels[index][0]
-            for index in range(len(panels))
-            if index not in flips
-        ]
-        raise ValueError(
-            "Each exported layer must be connected through shared panel "
-            "edges; disconnected panels include "
-            f"{disconnected[:5]}."
-        )
+        flips[first_face] = False
+        pending = [first_face]
+        component = []
+        orientable = True
+        while pending:
+            face_index = pending.pop()
+            component.append(face_index)
+            for neighbor, flip_relation in adjacency[face_index]:
+                neighbor_flip = flips[face_index] ^ flip_relation
+                if neighbor not in flips:
+                    flips[neighbor] = neighbor_flip
+                    pending.append(neighbor)
+                elif flips[neighbor] != neighbor_flip:
+                    orientable = False
+
+        if not orientable or not branch_faces.isdisjoint(component):
+            if require_single_shell:
+                raise ValueError("Layer panels do not form an orientable STEP shell.")
+            # Preserve the panel surfaces when their shared edges cannot form a manifold.
+            groups.extend([panels[index]] for index in sorted(component))
+            continue
+
+        group = []
+        for index in sorted(component):
+            surface_id, point_ids, polygon, holes = panels[index]
+            if flips[index]:
+                point_ids = point_ids[::-1]
+                polygon = polygon[::-1]
+            group.append((surface_id, point_ids, polygon, holes))
+        groups.append(group)
+    return groups
+
+
+def _is_closed_shell(face_indices, face_inner_indices) -> bool:
+    """Check whether every edge has two incident face boundaries."""
+    edge_counts = Counter(
+        (min(start, end), max(start, end))
+        for outer, holes in zip(face_indices, face_inner_indices)
+        for loop in (outer, *holes)
+        for start, end in zip(loop, loop[1:] + loop[:1])
+    )
+    return all(count == 2 for count in edge_counts.values())
+
+
+def _shell_geometry(
+    panels: list[PanelGeometry],
+) -> tuple[
+    np.ndarray,
+    list[list[int]],
+    list[str],
+    list[list[list[int]]],
+]:
+    """Index the face boundaries, sharing vertices by model point ID."""
 
     point_indices: dict[str, int] = {}
     coordinates: list[np.ndarray] = []
@@ -540,16 +574,7 @@ def _connected_shell_geometry(
     face_names = []
     face_inner_indices = []
 
-    for face_index, (
-        surface_id,
-        point_ids,
-        polygon,
-        hole_loops,
-    ) in enumerate(panels):
-        if flips[face_index]:
-            point_ids = tuple(reversed(point_ids))
-            polygon = polygon[::-1]
-
+    for surface_id, point_ids, polygon, hole_loops in panels:
         face_indices.append(shared_indices(point_ids, polygon))
         face_names.append(surface_id)
 
@@ -574,6 +599,179 @@ def _connected_shell_geometry(
         face_inner_indices.append(inner_indices)
 
     return np.array(coordinates), face_indices, face_names, face_inner_indices
+
+
+def _merge_coplanar_faces(
+    coordinates: np.ndarray,
+    face_indices: list[list[int]],
+    face_names: list[str],
+    face_inner_indices: list[list[list[int]]],
+) -> tuple[list[list[int]], list[str], list[list[list[int]]]]:
+    """Remove shared seams between planar faces without changing fold edges."""
+    if len(face_indices) < 2:
+        return face_indices, face_names, face_inner_indices
+
+    face_edges = [list(zip(loop, loop[1:] + loop[:1])) for loop in face_indices]
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for index, edges in enumerate(face_edges):
+        for start, end in edges:
+            edge_faces.setdefault((min(start, end), max(start, end)), []).append(
+                index
+            )
+
+    neighbors: list[list[int]] = [[] for _ in face_indices]
+    for owners in edge_faces.values():
+        if len(owners) == 2:
+            first, second = owners
+            neighbors[first].append(second)
+            neighbors[second].append(first)
+
+    normals = [_polygon_normal(coordinates[loop]) for loop in face_indices]
+    all_vertices = [
+        coordinates[outer + [vertex for loop in holes for vertex in loop]]
+        for outer, holes in zip(face_indices, face_inner_indices)
+    ]
+    visited = set()
+    merged_faces = {}
+    removed = set()
+    for first, normal in enumerate(normals):
+        if first in visited:
+            continue
+        visited.add(first)
+        origin = all_vertices[first][0]
+        distances = (all_vertices[first] - origin) @ normal
+        if np.max(np.abs(distances)) > _STEP_LENGTH_TOLERANCE:
+            continue
+
+        region = [first]
+        pending = [first]
+        while pending:
+            for neighbor in neighbors[pending.pop()]:
+                if neighbor in visited:
+                    continue
+                # A folded-over face may be coplanar with the opposite normal.
+                if np.linalg.norm(normals[neighbor] - normal) > 1e-8:
+                    continue
+                distances = (all_vertices[neighbor] - origin) @ normal
+                if np.max(np.abs(distances)) > _STEP_LENGTH_TOLERANCE:
+                    continue
+                visited.add(neighbor)
+                region.append(neighbor)
+                pending.append(neighbor)
+
+        if len(region) == 1:
+            continue
+        boundary = _coplanar_region_boundaries(
+            coordinates,
+            normal,
+            region,
+            face_edges,
+            face_indices,
+            face_inner_indices,
+            edge_faces,
+        )
+        if boundary is None:
+            continue
+
+        # The STEP writer derives the merged face's plane from its outer loop.
+        polygon = coordinates[boundary[0]]
+        try:
+            merged_normal = _polygon_normal(polygon)
+        except ValueError:
+            continue
+        if any(
+            np.max(np.abs((all_vertices[index] - polygon[0]) @ merged_normal))
+            > _STEP_LENGTH_TOLERANCE
+            for index in region
+        ):
+            continue
+        merged_faces[first] = boundary
+        removed.update(region[1:])
+
+    outer_loops, names, inner_loops = [], [], []
+    for index, (outer, name, holes) in enumerate(
+        zip(face_indices, face_names, face_inner_indices)
+    ):
+        if index not in removed:
+            outer, holes = merged_faces.get(index, (outer, holes))
+            outer_loops.append(outer)
+            names.append(name)
+            inner_loops.append(holes)
+    return outer_loops, names, inner_loops
+
+
+def _coplanar_region_boundaries(
+    coordinates: np.ndarray,
+    normal: np.ndarray,
+    region: list[int],
+    face_edges: list[list[tuple[int, int]]],
+    face_indices: list[list[int]],
+    face_holes: list[list[list[int]]],
+    edge_faces: dict[tuple[int, int], list[int]],
+) -> tuple[list[int], list[list[int]]] | None:
+    """Trace a planar region's perimeter and retain every boundary vertex."""
+    from shapely.geometry import Polygon
+
+    region_indices = set(region)
+    next_vertex = {}
+    incoming = set()
+    for index in region:
+        for start, end in face_edges[index]:
+            owners = edge_faces[(min(start, end), max(start, end))]
+            if len(owners) == 2 and all(index in region_indices for index in owners):
+                continue
+            if start in next_vertex or end in incoming:
+                return None
+            next_vertex[start] = end
+            incoming.add(end)
+    if next_vertex.keys() != incoming:
+        return None
+
+    axis = int(np.argmax(np.abs(normal)))
+    projection_axes = ((axis + 1) % 3, (axis + 2) % 3)
+    origin = coordinates[face_indices[region[0]][0]]
+
+    def project(loop):
+        return (coordinates[loop] - origin)[:, projection_axes]
+
+    outer_loops = []
+    holes = [loop for index in region for loop in face_holes[index]]
+    while next_vertex:
+        start = next(iter(next_vertex))
+        loop = [start]
+        current = next_vertex.pop(start)
+        while current != start:
+            loop.append(current)
+            current = next_vertex.pop(current)
+        if len(loop) < 3:
+            return None
+
+        x, y = project(loop).T
+        area_twice = np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))
+        if area_twice * normal[axis] > 0.0:
+            outer_loops.append(loop)
+        else:
+            # STEP FACE_BOUND reverses the orientation of inner loops.
+            holes.append(loop[::-1])
+
+    if len(outer_loops) != 1:
+        return None
+    outer = outer_loops[0]
+    merged = Polygon(project(outer), [project(loop) for loop in holes])
+    if not merged.is_valid or not merged.boundary.is_simple:
+        return None
+    original_area = 0.0
+    for index in region:
+        original = Polygon(
+            project(face_indices[index]),
+            [project(hole) for hole in face_holes[index]],
+        )
+        if not original.is_valid:
+            return None
+        original_area += original.area
+    if not np.isclose(merged.area, original_area, rtol=1e-10, atol=0.0):
+        return None
+    return outer, holes
 
 
 def _mesh_triangles(model, thickness: float) -> list[np.ndarray]:
@@ -660,6 +858,14 @@ def _number(value: float) -> str:
     return f"{value:.15g}"
 
 
+def _step_number(value: float) -> str:
+    """Use the decimal point and uppercase exponent required by STEP REALs."""
+    mantissa, separator, exponent = _number(value).upper().partition("E")
+    if "." not in mantissa:
+        mantissa += "."
+    return mantissa + separator + exponent
+
+
 def _step_string(value: str) -> str:
     ascii_value = str(value).encode("ascii", errors="replace").decode("ascii")
     return ascii_value.replace("'", "''")
@@ -706,7 +912,7 @@ class _StepFile:
         key = tuple(float(value) for value in coordinates)
         if cache is not None and key in cache:
             return cache[key]
-        values = ",".join(_number(value) for value in key)
+        values = ",".join(_step_number(value) for value in key)
         reference = self.add(f"CARTESIAN_POINT('',({values}))")
         if cache is not None:
             cache[key] = reference
@@ -717,7 +923,7 @@ class _StepFile:
         magnitude = float(np.linalg.norm(vector))
         if magnitude < 1e-12:
             raise ValueError("Cannot create STEP geometry from a zero-length edge.")
-        values = ",".join(_number(value) for value in vector / magnitude)
+        values = ",".join(_step_number(value) for value in vector / magnitude)
         return self.add(f"DIRECTION('',({values}))")
 
     def advanced_faces(
@@ -736,11 +942,20 @@ class _StepFile:
         if len(face_inner_indices) != len(face_indices):
             raise ValueError("Each STEP face must have one inner-loop list.")
 
-        point_refs = [self.cartesian_point(point) for point in coordinates]
-        vertex_refs = [
-            self.add(f"VERTEX_POINT('',{point_ref})")
-            for point_ref in point_refs
-        ]
+        used_indices = {
+            index
+            for outer, holes in zip(face_indices, face_inner_indices)
+            for loop in (outer, *holes)
+            for index in loop
+        }
+        point_refs = {
+            index: self.cartesian_point(coordinates[index])
+            for index in sorted(used_indices)
+        }
+        vertex_refs = {
+            index: self.add(f"VERTEX_POINT('',{point_ref})")
+            for index, point_ref in point_refs.items()
+        }
         edge_cache = {}
         faces = []
 
@@ -755,7 +970,7 @@ class _StepFile:
                     edge_length = float(np.linalg.norm(edge_vector))
                     direction = self.direction(edge_vector)
                     vector = self.add(
-                        f"VECTOR('',{direction},{_number(edge_length)})"
+                        f"VECTOR('',{direction},{_step_number(edge_length)})"
                     )
                     line = self.add(
                         f"LINE('',{point_refs[start_index]},{vector})"
@@ -815,7 +1030,7 @@ class _StepFile:
 
         return faces
 
-    def write(self, path: Path, model_name: str) -> None:
+    def write(self, path: Path, model_name: str, schema: str) -> None:
         timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         timestamp = timestamp.replace("+00:00", "Z")
         filename = _step_string(path.name)
@@ -827,7 +1042,7 @@ class _StepFile:
                 f"FILE_NAME('{filename}','{timestamp}',(''),(''),"
                 f"'OrigamiCAD','OrigamiCAD','{name}');\n"
             )
-            file.write("FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\n")
+            file.write(f"FILE_SCHEMA(('{schema}'));\n")
             file.write("ENDSEC;\nDATA;\n")
             for index, entity in enumerate(self.entities, start=1):
                 file.write(f"#{index}={entity};\n")

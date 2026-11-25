@@ -765,10 +765,13 @@ class Cadder(CadVisualizationMixin):
         *,
         separate_layer_parts: bool = False,
     ) -> None:
-        """Save panel geometry as a faceted STEP surface or solid model.
+        """Save panel geometry as a STEP surface or solid model.
 
+        Zero-thickness panels share edges in connected shells, with adjacent
+        coplanar panels merged into one face.
         Use ``separate_layer_parts=True`` on a model returned by
-        ``stack_layers`` to create one importable STEP part per layer.
+        ``stack_layers`` to create one importable STEP part per layer and
+        retain the individual panel faces.
         """
         from ..io.cad_export import save_step
 

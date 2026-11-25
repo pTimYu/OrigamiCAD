@@ -92,6 +92,22 @@ python -m examples.simple_hexagon_insertion_projection_dxf
 
 The scripts write their files to `examples/output/`.
 
+## STEP surface export
+
+Use `model.save_step("folded.step")` or `model.save_cad("folded.step")` to
+export a zero-thickness surface model. Panels connected by shared model edges
+form one surface body per connected sheet. Adjacent coplanar panels merge into
+one selectable face. Fold edges and holes remain in the exported geometry.
+In SolidWorks, selecting a panel with **Up to Surface** uses that panel's
+face. To follow the folded sheet, use **Up to Body** and select the body
+under **Surface Bodies** in the FeatureManager tree. Along the extrusion
+direction, the full sketch profile must fit within the sheet's projected
+footprint and clear any openings.
+
+Use `separate_layer_parts=True` for Abaqus/CAE to export one part per stacked
+layer with its individual panel faces. A positive `thickness` exports
+a separate solid for each panel.
+
 ## Crease patterns
 
 Pass `reverse=True` to `build_packaging` to exchange all mountain and valley
