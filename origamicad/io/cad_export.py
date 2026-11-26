@@ -2,6 +2,7 @@
 
 STL is written as a triangle mesh. STEP writes planar BREP faces as connected
 surface shells or as separate thickened panel solids, without a CAD kernel.
+SAT writes one connected sheet of planar BREP faces.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable
 
 import numpy as np
@@ -233,13 +235,43 @@ def save_cad(
     thickness: float = 0.0,
     *,
     separate_layer_parts: bool = False,
+    solidworks_single_surface: bool = False,
 ) -> Path:
-    """Select JSON, STL, or STEP export from the filename extension.
+    """Select JSON, STL, STEP, or opt-in ACIS SAT export by extension.
 
     ``separate_layer_parts`` is available only for STEP output.
+    ``solidworks_single_surface=True`` writes a single connected,
+    zero-thickness sheet to an ACIS ``.sat`` file.
     """
     path = Path(filename)
     extension = path.suffix.lower()
+    if not isinstance(solidworks_single_surface, bool):
+        raise ValueError("solidworks_single_surface must be a boolean.")
+    if solidworks_single_surface:
+        if extension != ".sat":
+            raise ValueError("solidworks_single_surface=True requires a .sat filename.")
+        if finite("thickness", thickness, nonnegative=True) != 0 or separate_layer_parts:
+            raise ValueError(
+                "solidworks_single_surface=True requires thickness=0 "
+                "and separate_layer_parts=False."
+            )
+        from ._sat_surface import write_sat_surface
+
+        try:
+            (sheet,) = _panel_shell_groups(list(_panel_geometry(model)), require_single_shell=True)
+        except ValueError as exc:
+            raise ValueError(f"SAT export requires one connected manifold sheet. {exc}") from exc
+        coordinates, outer_loops, _, inner_loops = _shell_geometry(sheet)
+        if _is_closed_shell(outer_loops, inner_loops):
+            raise ValueError("Single-surface SAT export requires an open sheet.")
+        destination = path.absolute()
+        with TemporaryDirectory(prefix="origamicad_", dir=destination.parent) as directory:
+            result = Path(directory) / "surface.sat"
+            write_sat_surface(result, coordinates, outer_loops, inner_loops, model.unit)
+            result.replace(destination)
+        return path
+    if extension == ".sat":
+        raise ValueError("ACIS .sat export requires solidworks_single_surface=True.")
     if separate_layer_parts and extension not in {".step", ".stp"}:
         raise ValueError(
             "separate_layer_parts is supported only for STEP output."
@@ -255,7 +287,7 @@ def save_cad(
             thickness=thickness,
             separate_layer_parts=separate_layer_parts,
         )
-    raise ValueError("Output extension must be .json, .stl, .step, or .stp.")
+    raise ValueError("Output extension must be .json, .stl, .step, .stp, or .sat.")
 
 
 def _panel_geometry(

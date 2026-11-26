@@ -788,8 +788,13 @@ class Cadder(CadVisualizationMixin):
         thickness: float = 0.0,
         *,
         separate_layer_parts: bool = False,
+        solidworks_single_surface: bool = False,
     ) -> None:
-        """Export based on a .json, .stl, .step, or .stp extension."""
+        """Export JSON, STL, STEP, or a single ACIS SAT sheet.
+
+        Use ``solidworks_single_surface=True`` with a ``.sat`` filename to
+        export one connected, zero-thickness sheet for SOLIDWORKS.
+        """
         from ..io.cad_export import save_cad
 
         save_cad(
@@ -797,6 +802,7 @@ class Cadder(CadVisualizationMixin):
             filename,
             thickness=thickness,
             separate_layer_parts=separate_layer_parts,
+            solidworks_single_surface=solidworks_single_surface,
         )
 
     def save_xy_dxf(self, filename: str, point_tol: float = 1e-9, **dxf_options):

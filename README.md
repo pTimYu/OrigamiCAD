@@ -95,18 +95,36 @@ The scripts write their files to `examples/output/`.
 ## STEP surface export
 
 Use `model.save_step("folded.step")` or `model.save_cad("folded.step")` to
-export a zero-thickness surface model. Panels connected by shared model edges
-form one surface body per connected sheet. Adjacent coplanar panels merge into
-one selectable face. Fold edges and holes remain in the exported geometry.
-In SolidWorks, selecting a panel with **Up to Surface** uses that panel's
-face. To follow the folded sheet, use **Up to Body** and select the body
-under **Surface Bodies** in the FeatureManager tree. Along the extrusion
-direction, the full sketch profile must fit within the sheet's projected
-footprint and clear any openings.
+export a zero-thickness surface model. The STEP describes one shell per
+connected sheet. Adjacent coplanar panels merge into one selectable face.
+Fold edges and holes remain in the exported geometry. SolidWorks can import
+one shell as multiple surface bodies. When it imports the complete sheet as
+one body, select that body under **Surface Bodies** for **Up To Body**.
+If the STEP opens as separate panels, select the panels in one **Knit Surface**
+feature. Select the resulting sheet body for **Up To Body**.
+The same sheet can terminate a **Cut-Extrude** through an existing blank.
+Selecting a panel with **Up To Surface** uses that panel's face. Along the
+extrusion direction, the full sketch profile must fit within the sheet's
+projected footprint and clear any openings.
 
 Use `separate_layer_parts=True` for Abaqus/CAE to export one part per stacked
 layer with its individual panel faces. A positive `thickness` exports
 a separate solid for each panel.
+
+### Single SolidWorks surface export
+
+Export a folded model as one zero-thickness ACIS surface using OrigamiCAD's
+existing Python dependencies:
+
+```python
+model.save_cad("folded.sat", solidworks_single_surface=True)
+```
+
+SAT export requires one connected open sheet of planar panels with
+shared model edges. Open the file in SOLIDWORKS and select the sheet
+under **Surface Bodies** for **Up To Body**. For **Up To Surface**,
+select the imported surface feature in the feature tree to use the
+complete folded surface.
 
 ## Crease patterns
 
